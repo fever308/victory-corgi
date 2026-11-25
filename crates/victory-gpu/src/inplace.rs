@@ -394,20 +394,21 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
         v.sections.push((section, bytes, committed));
     }
     // A view of our own made on an earlier section that had this handle's
-    // number shows that section's pages, not this one's: it is forgotten
-    // (left mapped: nothing reads it any more) and the next store through
-    // a view of ours maps this section.
+    // number shows that section's pages, not this one's: evict it from `OWN`
+    // so `Own::drop` unmaps it once any active `read_own`/`write_own` caller
+    // finishes, and the next access maps the new section.
     let gone = OWN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
         .and_then(|own| own.remove(&section))
         .flatten();
-    if gone.is_some() {
+    if let Some(evicted) = gone {
         tracing::info!(
             section,
-            "a section handle's number came round again: our own view of the earlier section is forgotten"
+            "a section handle's number came round again: our own view of the earlier section is evicted"
         );
+        drop(evicted);
     }
     crate::shadow::stretch_section_reused(section);
 }
@@ -617,22 +618,40 @@ pub(crate) fn back_own() -> bool {
 
 /// A view of our own on a whole section of the title's physical pages:
 /// where it is, its bytes, and which of its 64 KiB blocks we have asked
-/// to be committed through it (a bit each).
+/// to be committed through it (a bit each). Wrapped in `Arc` inside [`OWN`]
+/// so eviction unmaps the view only after all active `read_own`/`write_own`
+/// callers finish.
 struct Own {
     base: usize,
     bytes: u64,
-    committed: Vec<u64>,
+    committed: Vec<AtomicU64>,
+}
+
+impl Drop for Own {
+    fn drop(&mut self) {
+        // SAFETY: our own view from `MapViewOfFile`, no longer referenced by
+        // `OWN` or any active `read_own`/`write_own` caller.
+        unsafe {
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.base as *mut c_void,
+            });
+        }
+    }
 }
 
 /// Our own views by section handle; `None` in a section's place if the
 /// host refused the view (not asked again).
-static OWN: std::sync::Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> =
+static OWN: std::sync::Mutex<Option<std::collections::HashMap<usize, Option<std::sync::Arc<Own>>>>> =
     std::sync::Mutex::new(None);
 
 /// Resolves `[at, at + len)` to a committed `PAGE_READWRITE` address in our own
-/// section view, the title views showing its 64 KiB page, and a guard keeping
-/// title mappings stable for the duration of the access.
-fn own_view_ptr(at: usize, len: usize) -> Option<(usize, Vec<usize>, crate::watch::Reading)> {
+/// section view, the title views showing its 64 KiB page, an `Arc<Own>` keeping
+/// our section view mapped across the copy, and a guard keeping title mappings
+/// stable for the duration of the access.
+fn own_view_ptr(
+    at: usize,
+    len: usize,
+) -> Option<(usize, Vec<usize>, std::sync::Arc<Own>, crate::watch::Reading)> {
     if len == 0 || at / K64 != (at + len - 1) / K64 {
         return None;
     }
@@ -656,14 +675,14 @@ fn own_view_ptr(at: usize, len: usize) -> Option<(usize, Vec<usize>, crate::watc
     if offset + len as u64 > section_bytes {
         return None;
     }
-    let ptr = {
+    let (ptr, view_arc) = {
         let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
         let view = own
             .get_or_insert_with(Default::default)
             .entry(section)
             .or_insert_with(|| {
                 // SAFETY: a section handle the runtime gave us, alive as long
-                // as the title's views of it are; the view is ours and stays.
+                // as the title's views of it are; unmapped on `Own::drop`.
                 let mapped = unsafe {
                     mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0)
                 };
@@ -680,18 +699,20 @@ fn own_view_ptr(at: usize, len: usize) -> Option<(usize, Vec<usize>, crate::watc
                     mb = section_bytes >> 20,
                     "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
                 );
-                Some(Own {
+                let words = (section_bytes as usize).div_ceil(K64).div_ceil(64);
+                Some(std::sync::Arc::new(Own {
                     base: mapped.Value as usize,
                     bytes: section_bytes,
-                    committed: vec![0; (section_bytes as usize).div_ceil(K64).div_ceil(64)],
-                })
+                    committed: (0..words).map(|_| AtomicU64::new(0)).collect(),
+                }))
             })
-            .as_mut()?;
+            .as_ref()?;
         if offset + len as u64 > view.bytes {
             return None;
         }
         let block = offset as usize / K64;
-        if (view.committed[block / 64] & (1u64 << (block % 64))) == 0 {
+        let mask = 1u64 << (block % 64);
+        if (view.committed[block / 64].load(Ordering::Relaxed) & mask) == 0 {
             // The title's view committed these pages of the section; asked
             // once more through ours, which changes nothing if they are.
             // SAFETY: a block inside our own view.
@@ -706,11 +727,11 @@ fn own_view_ptr(at: usize, len: usize) -> Option<(usize, Vec<usize>, crate::watc
             if there.is_null() {
                 return None;
             }
-            view.committed[block / 64] |= 1u64 << (block % 64);
+            view.committed[block / 64].fetch_or(mask, Ordering::Relaxed);
         }
-        view.base + offset as usize
+        (view.base + offset as usize, std::sync::Arc::clone(view))
     };
-    Some((ptr, shown, still))
+    Some((ptr, shown, view_arc, still))
 }
 
 /// Reads title physical bytes at `[at, at + dst.len())` through our own
@@ -721,12 +742,12 @@ pub(crate) fn read_own(at: usize, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
     }
-    let Some((src, _shown, _still)) = own_view_ptr(at, dst.len()) else {
+    let Some((src, _shown, _own, _still)) = own_view_ptr(at, dst.len()) else {
         return false;
     };
     // SAFETY: committed bytes inside our own `PAGE_READWRITE` section view
-    // (kept mapped even if the handle number is reused, and `_still` keeps the
-    // title view live); `dst` is a valid mutable slice of `dst.len()` bytes.
+    // (`_own` keeps it mapped until after the copy even if evicted, and `_still`
+    // keeps the title view live); `dst` is a valid mutable slice of `dst.len()` bytes.
     unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), dst.len()) };
     true
 }
@@ -738,10 +759,10 @@ pub(crate) fn read_own(at: usize, dst: &mut [u8]) -> bool {
 /// nothing written: not view memory, a page of very many views, the
 /// runtime changing mappings at this moment, or the host refusing.
 pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    let (dst, shown, _still) = own_view_ptr(at, bytes.len())?;
-    // SAFETY: committed bytes inside our own view (kept mapped even if the
-    // handle number is reused, and `_still` keeps the title view live); the
-    // source is the caller's slice.
+    let (dst, shown, _own, _still) = own_view_ptr(at, bytes.len())?;
+    // SAFETY: committed bytes inside our own view (`_own` keeps it mapped until
+    // after the copy even if evicted, and `_still` keeps the title view live);
+    // the source is the caller's slice.
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) };
     Some(shown)
 }
@@ -1812,6 +1833,79 @@ mod tests {
         unsafe {
             mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut c_void });
             mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: two as *mut c_void });
+            CloseHandle(section as *mut c_void);
+        }
+    }
+
+    /// Evicting an `Own` view on section handle reuse must keep the view mapped
+    /// until every active `own_view_ptr` caller drops its `Arc<Own>`, and then
+    /// unmap it cleanly via `Own::drop` without leaking virtual memory or UAF.
+    #[test]
+    fn own_view_eviction_unmaps_only_after_active_callers_drop() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        const SIZE: usize = K64;
+        // SAFETY: pagefile section mapped into a title view, cleaned up below.
+        let (section, title_view) = unsafe {
+            let section = mem::CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            assert_ne!(view, 0);
+            (section as usize, view)
+        };
+        title_memory_section(section, SIZE as u64, true);
+        title_memory_view(title_view, SIZE, section, 0);
+
+        let payload = [0x11u8, 0x22, 0x33, 0x44];
+        assert!(write_own(title_view + 64, &payload).is_some());
+
+        // Simulate an active caller holding `Arc<Own>` across eviction.
+        let (ptr, _shown, active_own, still) =
+            own_view_ptr(title_view + 64, payload.len()).expect("own_view_ptr should succeed");
+        let own_base = active_own.base;
+        drop(still);
+
+        // Evict `section` from `OWN` while `active_own` is still alive.
+        title_memory_section(section, SIZE as u64, true);
+        assert!(
+            !OWN.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|m| m.contains_key(&section)),
+            "section handle reuse must evict cached Own view"
+        );
+
+        // SAFETY: `active_own` keeps the evicted view mapped until dropped.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried = unsafe {
+            mem::VirtualQuery(own_base as *const c_void, &mut info, size_of_val(&info))
+        };
+        assert_ne!(queried, 0);
+        assert_eq!(info.State, mem::MEM_COMMIT, "evicted view must stay mapped while Arc<Own> is held");
+        let got = unsafe { std::slice::from_raw_parts(ptr as *const u8, payload.len()) };
+        assert_eq!(got, &payload, "active caller must still read valid bytes without UAF");
+
+        // Dropping the last `Arc<Own>` must unmap the view cleanly.
+        drop(active_own);
+        let mut after: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let queried_after = unsafe {
+            mem::VirtualQuery(own_base as *const c_void, &mut after, size_of_val(&after))
+        };
+        assert_ne!(queried_after, 0);
+        assert_eq!(after.State, mem::MEM_FREE, "Own::drop must unmap the evicted view");
+
+        crate::watch::title_memory_remapped(title_view, SIZE);
+        // SAFETY: unmap title view and close section handle created above.
+        unsafe {
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: title_view as *mut c_void,
+            });
             CloseHandle(section as *mut c_void);
         }
     }

@@ -2806,6 +2806,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     crate::lazy_back::discard_range(at, len);
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

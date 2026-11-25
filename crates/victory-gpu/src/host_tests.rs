@@ -197,6 +197,7 @@ mod late_tests {
             order: Vec::new(),
             card: None,
             back,
+            texture_back_ranges: Vec::new(),
             marks: None,
             _exec_epoch: ExecEpochGuard {
                 scope: None,
@@ -286,6 +287,7 @@ mod late_tests {
             order: Vec::new(),
             card: None,
             back: vec![(shadow.clone(), vec![range], Vec::new())],
+            texture_back_ranges: Vec::new(),
             marks: None,
             _exec_epoch: ExecEpochGuard {
                 scope: None,

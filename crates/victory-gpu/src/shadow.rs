@@ -6070,18 +6070,42 @@ fn through_another_view(
     device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
     address: u64,
     end: u64,
-) -> Option<Shadow> {
+) -> Option<(Shadow, crate::watch::Reading)> {
     use windows_sys::Win32::System::Memory::{
         FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
     };
-    let (start, stop, section, offset) =
+    let (mut start, mut stop, _, _) =
         crate::inplace::stretch(address as usize, end as usize, STRETCH_REACH)?;
-    let len = stop - start;
-    if len < STRETCH_LEAST {
+    if stop - start < STRETCH_LEAST {
         return None;
     }
-    // SAFETY: a section the runtime told us of, alive while it has views;
-    // the stretch is inside it.
+    // Hold `title_memory_reading(start, len)` across `inplace::stretch` +
+    // `MapViewOfFile` so a concurrent remap cannot unmap views, close the
+    // section handle, and reuse its number before `MapViewOfFile` completes.
+    let (reading, start, len, section, offset) = {
+        let mut attempts = 0;
+        loop {
+            let reading = crate::watch::title_memory_reading(start, stop - start);
+            let (s2, e2, section, offset) =
+                crate::inplace::stretch(address as usize, end as usize, STRETCH_REACH)?;
+            let len = e2 - s2;
+            if len < STRETCH_LEAST {
+                return None;
+            }
+            if s2 >= start && e2 <= stop {
+                break (reading, s2, len, section, offset);
+            }
+            drop(reading);
+            attempts += 1;
+            if attempts >= 4 {
+                return None;
+            }
+            start = s2;
+            stop = e2;
+        }
+    };
+    // SAFETY: a section the runtime told us of, kept alive by `reading` while
+    // its views in `[start, start + len)` stay mapped; the stretch is inside it.
     let view = unsafe {
         MapViewOfFile(
             section as _,
@@ -6134,7 +6158,7 @@ fn through_another_view(
             "title memory in place through a view of ours"
         );
     }
-    Some(shadow)
+    Some((shadow, reading))
 }
 
 fn stretch_create_in(
@@ -6147,8 +6171,16 @@ fn stretch_create_in(
     if !enabled {
         return None;
     }
+    if let Some(s) = stretch_find_in(stretches, address, end, unsized_ask) {
+        return Some(s);
+    }
     let h = host()?;
-    let (window, retired) = {
+    // Acquire `Reading` inside `through_another_view` BEFORE taking
+    // `stretches.write()` so lock order (`READING -> STRETCHES`) matches
+    // `REMAPPING -> title_memory_remapped -> in_place_let_go -> STRETCHES`.
+    let (created, reading) = through_another_view(&h.device, address, end)?;
+    let candidate = Arc::new(created);
+    let (window, retired, unused) = {
         let mut map = stretches.write().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = map
             .range(..=address)
@@ -6158,20 +6190,23 @@ fn stretch_create_in(
             .find(|s| s.start + s.len >= end)
         {
             note_window_use(s, address, end, unsized_ask);
-            return Some(s.clone());
+            (s.clone(), Vec::new(), Some(candidate))
+        } else {
+            note_window_use(&candidate, address, end, unsized_ask);
+            let (w_start, w_end) = (candidate.start, candidate.start + candidate.len);
+            let overlap: Vec<u64> = map
+                .range(..w_end)
+                .filter(|(_, s)| s.start + s.len > w_start)
+                .map(|(&k, _)| k)
+                .collect();
+            let retired: Vec<Arc<Shadow>> =
+                overlap.into_iter().filter_map(|k| map.remove(&k)).collect();
+            map.insert(w_start, candidate.clone());
+            (candidate, retired, None)
         }
-        let window = Arc::new(through_another_view(&h.device, address, end)?);
-        note_window_use(&window, address, end, unsized_ask);
-        let (w_start, w_end) = (window.start, window.start + window.len);
-        let overlap: Vec<u64> = map
-            .range(..w_end)
-            .filter(|(_, s)| s.start + s.len > w_start)
-            .map(|(&k, _)| k)
-            .collect();
-        let retired: Vec<Arc<Shadow>> = overlap.into_iter().filter_map(|k| map.remove(&k)).collect();
-        map.insert(w_start, window.clone());
-        (window, retired)
     };
+    drop(reading);
+    drop(unused);
     for old in retired {
         let born = old.born_seq;
         crate::host::retire_born(old, born);

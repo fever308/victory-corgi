@@ -2733,7 +2733,7 @@ struct Deferred {
     after: Vec<(usize, usize, usize)>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
-    back_wanted: Vec<usize>,
+    back_wanted: Vec<crate::texback::Target>,
     /// Those copies, whose texels go to title memory once the list has run.
     texture_backs: Vec<crate::texback::Back>,
     /// Whether a step zeroes the indirect-work budget.
@@ -3235,6 +3235,7 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    texture_back_ranges: Vec<(usize, usize)>,
     marks: Option<ViewMarksCapture>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3252,6 +3253,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    texture_back_ranges: Vec<(usize, usize)>,
     marks: Option<ViewMarksCapture>,
     _exec_epoch: ExecEpochGuard,
 }
@@ -5952,13 +5954,6 @@ impl Host {
                 self.relay_fetch_back(&plans, &back, &bitmaps, fetch);
                 relay_hand_back(&back, &bitmaps);
                 fill_ahead::landing(0);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges, _) in &flight.back {
-                        shadow.copy_back_done(ranges);
-                    }
-                }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -5967,6 +5962,9 @@ impl Host {
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
+        // Collect per-flight back ranges before consuming `items` so
+        // `copy_back_done` runs after `line.written` and `LINE_LANDED`.
+        let mut backs: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for item in items {
             match item {
                 Late::Run(flight) => {
@@ -5981,6 +5979,9 @@ impl Host {
                         marks.recycle();
                     }
                     landed.push((flight.lists, flight.order));
+                    for (shadow, ranges, _) in flight.back {
+                        backs.push((shadow, ranges));
+                    }
                 }
                 Late::Write(at, what, bytes) => {
                     // Remove this write from `in_hand` before making it visible
@@ -6030,6 +6031,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r, _)| r.iter().copied()));
+                    ranges.extend(flight.texture_back_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -6040,6 +6042,9 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        for (shadow, ranges) in &backs {
+            shadow.copy_back_done(ranges);
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
@@ -6209,7 +6214,13 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges, _)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges, _)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -6219,6 +6230,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
                 marks: sent.marks,
                 _exec_epoch: sent.exec_epoch,
             }));
@@ -6255,7 +6267,13 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges, _)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges, _)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -6265,6 +6283,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                texture_back_ranges: sent.texture_back_ranges,
                 marks: sent.marks,
                 _exec_epoch: sent.exec_epoch,
             }));
@@ -6669,6 +6688,15 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            let mut texture_back_ranges = Vec::new();
+            for list in runs {
+                texture_back_ranges.extend(
+                    list.deferred()
+                        .texture_backs
+                        .iter()
+                        .map(crate::texback::Back::range),
+                );
+            }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -6678,6 +6706,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                texture_back_ranges,
                 marks: marks_capture,
                 writes,
                 exec_epoch,
@@ -8194,8 +8223,10 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.contains(&(resource as usize)) {
-            deferred.back_wanted.push(resource as usize);
+        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
         }
     }
 
@@ -8204,13 +8235,9 @@ impl HostList {
     fn textures_back(&self) {
         const COPY_SOURCE: u32 = 0x800;
         let wanted = std::mem::take(&mut self.deferred().back_wanted);
-        for resource in wanted {
-            let resource = resource as crate::object::This;
-            let Some(copy) = crate::resource::host_copy(resource) else {
-                continue;
-            };
-            self.settle(&copy, COPY_SOURCE);
-            if let Some(back) = crate::texback::record(&self.list, resource, &copy.texture) {
+        for target in wanted {
+            self.settle(&target.copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
                 self.deferred().texture_backs.push(back);
             }
         }
