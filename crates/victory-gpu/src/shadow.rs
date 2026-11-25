@@ -27,8 +27,17 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 /// Total VRAM bytes currently allocated to ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
-/// shadow buffers across live [`Shadow`] instances.
+/// registered shadow buffers across live [`Shadow`] instances.
 static REBAR_SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Total VRAM bytes currently allocated to ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
+/// `LOOSE` window buffers across live [`Shadow`] instances.
+static REBAR_LOOSE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Current ReBAR VRAM bytes reserved by live `LOOSE` window [`Shadow`]s.
+pub(crate) fn rebar_loose_bytes() -> u64 {
+    REBAR_LOOSE_BYTES.load(Ordering::Relaxed)
+}
 
 /// Atomically reserves `size` bytes from `budget`, returning `false` if doing
 /// so would exceed `budget`.
@@ -180,6 +189,7 @@ struct RebarHashes {
 /// copy-back only DMAs 64 KiB pieces whose GPU hash actually changed.
 struct RebarShadow {
     bytes: u64,
+    is_loose: bool,
     mirror: Mutex<Option<Vec<u8>>>,
     /// Leaf lock: never acquired while holding `mirror`, `pending`, or `copied`,
     /// and never held across D3D12 or kernel calls.
@@ -377,17 +387,38 @@ pub(crate) fn cards() -> bool {
 /// run 20261124-235840 still snapshotted and compared 350-400 MB a frame
 /// of shader-written ranges on the CPU; with 1 and 1024 (run 20261125-
 /// 002550) 26 MB, the card finding the changed pieces itself.
+fn card_limits_for(
+    min_mb: Option<u64>,
+    max_mb: Option<u64>,
+    local_vram_budget: Option<u64>,
+) -> (u64, u64) {
+    let default_max_mb = if local_vram_budget.is_some_and(|b| b >= 24 * GIB) {
+        2048
+    } else {
+        1024
+    };
+    let min_bytes = min_mb.unwrap_or(1).max(1) << 20;
+    let max_bytes = max_mb.unwrap_or(default_max_mb) << 20;
+    (min_bytes, max_bytes)
+}
+
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
+        let parse = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
         };
-        // From 1 MiB up and 1,024 MB in all by default (it was 16 and 512):
+        // From 1 MiB up and 1,024 MiB (or 2,048 MiB on >= 24 GiB GPUs) by default:
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        card_limits_for(
+            parse("VICTORY_CARD_BUFFERS_MIN_MB"),
+            parse("VICTORY_CARD_BUFFERS_MB"),
+            host().and_then(|h| h.local_vram_budget()),
+        )
     })
 }
 
@@ -2552,7 +2583,11 @@ impl Drop for Shadow {
             }
         }
         if let Some(rebar) = &self.rebar {
-            REBAR_SHADOW_BYTES.fetch_sub(rebar.bytes, Ordering::Relaxed);
+            if rebar.is_loose {
+                REBAR_LOOSE_BYTES.fetch_sub(rebar.bytes, Ordering::Relaxed);
+            } else {
+                REBAR_SHADOW_BYTES.fetch_sub(rebar.bytes, Ordering::Relaxed);
+            }
         }
         if let Some(base) = self.marks {
             marks().give_back(base, mark_pages(self.start, self.len));
@@ -2915,6 +2950,22 @@ impl Shadow {
         Self::new_inner(buffer, data, gpu, start, len, rebar_bytes, view_marks_on())
     }
 
+    fn new_loose(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        rebar_bytes: Option<u64>,
+    ) -> Shadow {
+        let mut shadow = Self::new(buffer, data, gpu, start, len, rebar_bytes);
+        shadow.window = true;
+        if let Some(rebar) = &mut shadow.rebar {
+            rebar.is_loose = true;
+        }
+        shadow
+    }
+
     fn new_inner(
         buffer: ID3D12Resource,
         data: *mut u8,
@@ -2955,6 +3006,7 @@ impl Shadow {
             place: None,
             rebar: rebar_bytes.map(|bytes| RebarShadow {
                 bytes,
+                is_loose: false,
                 mirror: Mutex::new(None),
                 hashes: Mutex::new(None),
             }),
@@ -4490,7 +4542,9 @@ impl Shadow {
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if self.rebar.is_some()
+            || !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+        {
             return;
         }
         const SAMPLE: usize = 256;
@@ -5089,20 +5143,43 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// Reserves `size` bytes against `used` up to `budget` and allocates a ReBAR
+/// buffer, rolling back the reservation if D3D12 allocation fails.
+fn try_alloc_rebar_in(
+    used: &AtomicU64,
+    size: u64,
+    budget: u64,
+) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let h = host()?;
+    if try_reserve_rebar(used, size, budget) {
+        if let Some((buffer, data)) = h.try_rebar_shadow_buffer(size) {
+            return Some((buffer, data, size));
+        }
+        used.fetch_sub(size, Ordering::Relaxed);
+    }
+    None
+}
+
 /// Allocates a shadow backing buffer: prefers ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
 /// VRAM within the adapter's budget, falling back cleanly to system-RAM
 /// [`Host::shared_buffer`] when ReBAR is unavailable, disabled, or full.
 fn alloc_shadow_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8, Option<u64>)> {
     let h = host()?;
-    let budget = h.rebar_shadow_budget();
-    if try_reserve_rebar(&REBAR_SHADOW_BYTES, size, budget) {
-        if let Some((buffer, data)) = h.try_rebar_shadow_buffer(size) {
-            return Some((buffer, data, Some(size)));
-        }
-        REBAR_SHADOW_BYTES.fetch_sub(size, Ordering::Relaxed);
+    if let Some((buffer, data, bytes)) =
+        try_alloc_rebar_in(&REBAR_SHADOW_BYTES, size, h.rebar_shadow_budget())
+    {
+        return Some((buffer, data, Some(bytes)));
     }
     let (buffer, data) = h.shared_buffer(size)?;
     Some((buffer, data, None))
+}
+
+/// Allocates a ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) backing buffer for a
+/// `LOOSE` window from the dedicated [`REBAR_LOOSE_BYTES`] budget so `LOOSE`
+/// windows never starve registered `BUFFERS` out of [`REBAR_SHADOW_BYTES`].
+fn alloc_loose_rebar(size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let h = host()?;
+    try_alloc_rebar_in(&REBAR_LOOSE_BYTES, size, h.rebar_loose_budget())
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -5731,38 +5808,53 @@ fn loose_in(
         let shadow = if let Some(placed) = crate::inplace::place_for(start, len, true) {
             Arc::new(Shadow::placed(placed, start, len, true))
         } else {
-            // Keep unbounded loose 4 MiB windows in system memory (unless
-            // `window_card_for` places them on the card) so they cannot starve
-            // registered title buffers out of the bounded ReBAR budget.
-            let (buffer, data) = host()?.shared_buffer(len)?;
-            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-            // With room for windows on the card (`window_card_most`): shaders get a
-            // buffer there, and the one just made is the CPU's side.
-            let (buffer, card) = match window_card_for(len) {
+            // With room for windows on the card (`window_card_most`): shaders get
+            // a buffer there and the CPU's side lives in system memory. Otherwise
+            // prefer ReBAR VRAM from the dedicated `LOOSE` budget (read-only
+            // windows keep zero duplicate RAM mirror/hashes) and fall back to
+            // system memory when ReBAR is disabled or full.
+            let (buffer, data, card, rebar_bytes) = match window_card_for(len) {
                 Some(on_card) => {
+                    let Some((staging, data)) = host()?.shared_buffer(len) else {
+                        WINDOW_CARD_BYTES.fetch_sub(len, Ordering::Relaxed);
+                        return None;
+                    };
+                    crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
                     crate::host::name(&on_card, || {
                         format!("title memory {start:#x}+{len:#x} on the card")
                     });
                     let card = Card {
-                        staging: buffer,
+                        staging,
                         before: Mutex::default(),
                         dirty: Mutex::default(),
                         sent: Mutex::default(),
                         size: len,
                     };
-                    (on_card, Some(card))
+                    (on_card, data, Some(card), None)
                 }
-                None => (buffer, None),
+                None => match alloc_loose_rebar(len) {
+                    Some((buffer, data, rebar_bytes)) => {
+                        crate::host::name(&buffer, || {
+                            format!("title memory {start:#x}+{len:#x} (ReBAR loose)")
+                        });
+                        (buffer, data, None, Some(rebar_bytes))
+                    }
+                    None => {
+                        let (buffer, data) = host()?.shared_buffer(len)?;
+                        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+                        (buffer, data, None, None)
+                    }
+                },
             };
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             tracing::debug!(
                 start = format_args!("{start:#x}"),
                 len,
+                rebar = rebar_bytes.is_some(),
                 "loose memory copied to the host"
             );
-            let mut shadow = Shadow::new(buffer, data, gpu, start, len, None);
-            shadow.window = true;
+            let mut shadow = Shadow::new_loose(buffer, data, gpu, start, len, rebar_bytes);
             shadow.card = card;
             let shadow = Arc::new(shadow);
             if shadow.card.is_some() {
@@ -6454,6 +6546,124 @@ mod tests {
         assert!(!try_reserve_rebar(&used, 500, 1024));
         assert!(try_reserve_rebar(&used, 424, 1024));
         assert_eq!(used.load(Ordering::Relaxed), 1024);
+    }
+
+    #[test]
+    fn card_limits_scales_default_budget_for_high_vram_and_honors_override() {
+        assert_eq!(card_limits_for(None, None, None), (1 * MIB, 1024 * MIB));
+        assert_eq!(
+            card_limits_for(None, None, Some(16 * GIB)),
+            (1 * MIB, 1024 * MIB)
+        );
+        assert_eq!(
+            card_limits_for(None, None, Some(24 * GIB)),
+            (1 * MIB, 2048 * MIB)
+        );
+        assert_eq!(
+            card_limits_for(None, None, Some(32 * GIB)),
+            (1 * MIB, 2048 * MIB)
+        );
+        // Explicit `VICTORY_CARD_BUFFERS_MB` override always wins over VRAM scaling.
+        assert_eq!(
+            card_limits_for(Some(4), Some(512), Some(32 * GIB)),
+            (4 * MIB, 512 * MIB)
+        );
+        assert_eq!(
+            card_limits_for(Some(0), Some(0), Some(24 * GIB)),
+            (1 * MIB, 0)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rebar_loose_budget_is_isolated_and_releases_on_drop() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(h) = host() else {
+            return;
+        };
+        let before_shadow = REBAR_SHADOW_BYTES.load(Ordering::Relaxed);
+        let before_loose = rebar_loose_bytes();
+
+        // Verify drop accounting isolates `REBAR_LOOSE_BYTES` from `REBAR_SHADOW_BYTES`.
+        let (buf_a, ptr_a) = h.shared_buffer(4096).expect("shared_buffer a");
+        let (buf_b, ptr_b) = h.shared_buffer(4096).expect("shared_buffer b");
+        // SAFETY: live D3D12 buffers.
+        let gpu_a = unsafe { buf_a.GetGPUVirtualAddress() };
+        // SAFETY: live D3D12 buffers.
+        let gpu_b = unsafe { buf_b.GetGPUVirtualAddress() };
+
+        assert!(try_reserve_rebar(
+            &REBAR_LOOSE_BYTES,
+            4096,
+            before_loose + 4096
+        ));
+        assert_eq!(rebar_loose_bytes(), before_loose + 4096);
+        assert_eq!(REBAR_SHADOW_BYTES.load(Ordering::Relaxed), before_shadow);
+
+        let loose_shadow = Shadow::new_loose(buf_a, ptr_a, gpu_a, 0x2000_0000, 4096, Some(4096));
+        assert!(loose_shadow.is_rebar());
+        assert!(loose_shadow.window);
+        assert!(loose_shadow.rebar.as_ref().is_some_and(|r| r.is_loose));
+
+        assert!(try_reserve_rebar(
+            &REBAR_SHADOW_BYTES,
+            8192,
+            before_shadow + 8192
+        ));
+        let reg_shadow = Shadow::new(buf_b, ptr_b, gpu_b, 0x3000_0000, 8192, Some(8192));
+        assert!(reg_shadow.is_rebar());
+        assert!(!reg_shadow.window);
+        assert!(reg_shadow.rebar.as_ref().is_some_and(|r| !r.is_loose));
+        assert_eq!(rebar_loose_bytes(), before_loose + 4096);
+        assert_eq!(
+            REBAR_SHADOW_BYTES.load(Ordering::Relaxed),
+            before_shadow + 8192
+        );
+
+        drop(loose_shadow);
+        assert_eq!(rebar_loose_bytes(), before_loose);
+        assert_eq!(
+            REBAR_SHADOW_BYTES.load(Ordering::Relaxed),
+            before_shadow + 8192
+        );
+
+        drop(reg_shadow);
+        assert_eq!(rebar_loose_bytes(), before_loose);
+        assert_eq!(REBAR_SHADOW_BYTES.load(Ordering::Relaxed), before_shadow);
+
+        // When the live host enables ReBAR LOOSE windows, verify `loose_in` allocates
+        // a read-only ReBAR window (no RAM mirror/hashes) and releases it on eviction.
+        if h.rebar_loose_budget() >= WINDOW {
+            let cache = std::sync::RwLock::new(LooseCache::new());
+            let base = 0x2000_0000_0000_u64;
+            let s0 = loose_in(&cache, base, base + 64, false, false, WINDOW).expect("loose win 0");
+            assert!(s0.window);
+            assert!(s0.is_rebar());
+            let r0 = s0.rebar.as_ref().expect("rebar state");
+            assert!(r0.is_loose);
+            assert!(r0.mirror.lock().unwrap().is_none());
+            assert!(r0.hashes.lock().unwrap().is_none());
+            assert_eq!(rebar_loose_bytes(), before_loose + WINDOW);
+            assert_eq!(REBAR_SHADOW_BYTES.load(Ordering::Relaxed), before_shadow);
+            drop(s0);
+
+            // Inserting a second window evicts the first idle window and releases its ReBAR bytes.
+            let s1 = loose_in(
+                &cache,
+                base + WINDOW,
+                base + WINDOW + 64,
+                false,
+                false,
+                WINDOW,
+            )
+            .expect("loose win 1");
+            assert_eq!(rebar_loose_bytes(), before_loose + WINDOW);
+            assert_eq!(REBAR_SHADOW_BYTES.load(Ordering::Relaxed), before_shadow);
+            drop(s1);
+            drop(cache);
+            assert_eq!(rebar_loose_bytes(), before_loose);
+            assert_eq!(REBAR_SHADOW_BYTES.load(Ordering::Relaxed), before_shadow);
+        }
     }
 
     #[cfg(windows)]
