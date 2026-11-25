@@ -820,6 +820,19 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// Phase breakdown of [`PREPARING`]`[0]` (`preparing: copies`) since the last
+/// frame-rate window:
+/// `[watch_us, refresh_copy_us, fill_us, fill_count, fill_bytes, title_copy_us, title_copy_count]`.
+pub(crate) static PREPARING_COPIES: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+pub(crate) const PREP_WATCH_US: usize = 0;
+pub(crate) const PREP_REFRESH_COPY_US: usize = 1;
+const PREP_FILL_US: usize = 2;
+const PREP_FILL_COUNT: usize = 3;
+const PREP_FILL_BYTES: usize = 4;
+const PREP_TITLE_COPY_US: usize = 5;
+const PREP_TITLE_COPY_COUNT: usize = 6;
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -2270,16 +2283,164 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each.
+/// into title memory on several threads (`VICTORY_WIDE_MERGE=0` disables;
+/// `=1` forces; on by default on 4+ logical CPUs). Used by both synchronous
+/// [`Host::card_back`] and the relay thread's [`Host::relay_fetch_back`] /
+/// [`Host::relay_card_inflight`].
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        wide_merge_enabled(
+            std::env::var("VICTORY_WIDE_MERGE").ok().as_deref(),
+            std::thread::available_parallelism().ok().map(|n| n.get()),
+        )
+    })
+}
+
+fn wide_merge_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> bool {
+    match setting {
+        Some("1") => true,
+        Some("0") => false,
+        _ => logical_cpus.is_some_and(|n| n >= 4),
+    }
+}
+
+/// One fetched piece of a card-backed shadow ready to merge on the relay thread.
+struct RelayCardPiece {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    lo: usize,
+    hi: usize,
+    /// Pointer to `hi - lo` readable fetched GPU bytes, valid for the duration
+    /// of [`relay_merge_card_pieces`].
+    gpu_ptr: usize,
+    after: u64,
+    track_walls: bool,
+}
+
+/// Merges fetched card-copy pieces into title memory via
+/// [`crate::shadow::Shadow::card_merge_relay`], fanning out across
+/// [`crate::shadow::wide_run`] when `parallel` is enabled and there are either
+/// multiple distinct card shadows or at least 16 total pieces.
+///
+/// Any pieces whose title address ranges `[start + lo, start + hi)` overlap
+/// (for example, two in-flight plans touching the same 64 KiB piece) are placed
+/// in the same worker bucket in their original relative order so concurrent
+/// workers only ever mutate strictly disjoint slices of `Shadow::data` and
+/// title memory.
+fn relay_merge_card_pieces(pieces: Vec<RelayCardPiece>, parallel: bool) -> usize {
+    if pieces.is_empty() {
+        return 0;
+    }
+    let run_seq = |items: &[RelayCardPiece]| -> usize {
+        let mut title = Vec::new();
+        let mut written = 0usize;
+        for p in items {
+            // SAFETY: caller guarantees `p.gpu_ptr` points to `p.hi - p.lo`
+            // readable bytes that stay live until this function returns.
+            let gpu = unsafe { std::slice::from_raw_parts(p.gpu_ptr as *const u8, p.hi - p.lo) };
+            let merged = p.shadow.card_merge_relay(p.lo, gpu, p.after, &mut title);
+            if p.track_walls {
+                p.shadow.walls_merged(gpu.len(), merged);
+            }
+            written += merged;
+        }
+        written
+    };
+
+    let first_shadow = std::sync::Arc::as_ptr(&pieces[0].shadow) as usize;
+    let multi_shadow = pieces
+        .iter()
+        .skip(1)
+        .any(|p| std::sync::Arc::as_ptr(&p.shadow) as usize != first_shadow);
+    if !parallel || pieces.len() < 2 || (!multi_shadow && pieces.len() < 16) {
+        return run_seq(&pieces);
+    }
+
+    // Group overlapping title-address intervals `[start + lo, start + hi)`
+    // into disjoint units while preserving original order inside each unit.
+    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    order.sort_unstable_by_key(|&idx| {
+        let p = &pieces[idx];
+        ((p.shadow.span().0 as usize).saturating_add(p.lo), idx)
+    });
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut cur_end = 0usize;
+    for idx in order {
+        let p = &pieces[idx];
+        let base = p.shadow.span().0 as usize;
+        let t_lo = base.saturating_add(p.lo);
+        let t_hi = base.saturating_add(p.hi);
+        let bytes = p.hi - p.lo;
+        match groups.last_mut() {
+            Some((g_bytes, g_indices)) if t_lo < cur_end => {
+                g_indices.push(idx);
+                *g_bytes += bytes;
+                cur_end = cur_end.max(t_hi);
+            }
+            _ => {
+                groups.push((bytes, vec![idx]));
+                cur_end = t_hi;
+            }
+        }
+    }
+    if groups.len() < 2 {
+        return run_seq(&pieces);
+    }
+    for (_, g_indices) in &mut groups {
+        if g_indices.len() > 1 {
+            g_indices.sort_unstable();
+        }
+    }
+
+    // Pack disjoint groups into up to 16 balanced buckets (LPT by bytes) so
+    // large single-shadow megabuffer piece lists spread evenly across workers
+    // with dynamic work stealing.
+    groups.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let num_buckets = groups.len().min(16);
+    let mut bucket_load = vec![(0usize, 0usize); num_buckets];
+    let mut bucket_indices: Vec<Vec<usize>> = (0..num_buckets).map(|_| Vec::new()).collect();
+    for (g_bytes, g_indices) in groups {
+        let best = bucket_load
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &load)| load)
+            .map_or(0, |(i, _)| i);
+        bucket_load[best].0 += g_bytes;
+        bucket_load[best].1 += g_indices.len();
+        bucket_indices[best].extend(g_indices);
+    }
+
+    let mut slots: Vec<Option<RelayCardPiece>> = pieces.into_iter().map(Some).collect();
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = bucket_indices
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .map(|indices| {
+            let bucket: Vec<RelayCardPiece> = indices
+                .into_iter()
+                .filter_map(|idx| slots[idx].take())
+                .collect();
+            let written = written.clone();
+            Box::new(move || {
+                let mut title = Vec::new();
+                let mut local = 0usize;
+                for p in bucket {
+                    // SAFETY: caller guarantees `p.gpu_ptr` points to `p.hi - p.lo`
+                    // readable bytes that stay live until `wide_run` returns.
+                    let gpu =
+                        unsafe { std::slice::from_raw_parts(p.gpu_ptr as *const u8, p.hi - p.lo) };
+                    let merged = p.shadow.card_merge_relay(p.lo, gpu, p.after, &mut title);
+                    if p.track_walls {
+                        p.shadow.walls_merged(gpu.len(), merged);
+                    }
+                    local += merged;
+                }
+                written.fetch_add(local, Ordering::Relaxed);
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    written.load(Ordering::Relaxed)
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -4781,16 +4942,18 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
             }
-            let mut title = Vec::new();
-            let mut written = 0;
-            for (shadow, lo, hi, at) in &pieces {
-                // SAFETY: the mapping of the fetched bytes, `total` of them;
-                // the copy into it has run.
-                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-                shadow.walls_merged(gpu.len(), merged);
-                written += merged;
-            }
+            let merge_pieces: Vec<RelayCardPiece> = pieces
+                .into_iter()
+                .map(|(shadow, lo, hi, at)| RelayCardPiece {
+                    shadow,
+                    lo,
+                    hi,
+                    gpu_ptr: data + at as usize,
+                    after,
+                    track_walls: true,
+                })
+                .collect();
+            let written = relay_merge_card_pieces(merge_pieces, wide_merge());
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             // Sends up to `after` are of no use to any later merge; with the
             // fetch inside flights only those up to these plans' are
@@ -4864,8 +5027,7 @@ impl Host {
     /// left out.
     fn relay_card_inflight(&self, plans: &[&CardPlan]) -> bool {
         use std::sync::Arc;
-        type Piece = (Arc<crate::shadow::Shadow>, usize, usize, usize, u64);
-        let mut pieces: Vec<Piece> = Vec::new();
+        let mut pieces: Vec<RelayCardPiece> = Vec::new();
         {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             let Some(work) = work.as_ref() else {
@@ -4945,7 +5107,14 @@ impl Host {
                             .map(|b| (b.1, b.2))
                             .collect();
                         for (a, b) in crate::shadow::outside(lo, hi, newer) {
-                            pieces.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
+                            pieces.push(RelayCardPiece {
+                                shadow: r.shadow.clone(),
+                                lo: a,
+                                hi: b,
+                                gpu_ptr: slot + (a - from),
+                                after: plan.sent_as,
+                                track_walls: false,
+                            });
                         }
                     }
                 }
@@ -4953,22 +5122,16 @@ impl Host {
         }
         // Outside the lock: no slot of these plans is written over before
         // their tickets are landed (`inflight_tickets_landed`, after this).
-        let mut title = Vec::new();
-        let (mut written, mut bytes) = (0, 0u64);
-        for (shadow, lo, hi, at, after) in &pieces {
-            // SAFETY: inside the mapping of the slots (checked above); the
-            // copy into it ran in the plan's flight, which the card has run.
-            let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, *after, &mut title);
-            bytes += (hi - lo) as u64;
-        }
+        let piece_count = pieces.len() as u64;
+        let bytes: u64 = pieces.iter().map(|p| (p.hi - p.lo) as u64).sum();
+        let written = relay_merge_card_pieces(pieces, wide_merge());
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
             }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        INFLIGHT_STATS[0].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+        INFLIGHT_STATS[0].fetch_add(piece_count, Ordering::Relaxed);
         INFLIGHT_STATS[1].fetch_add(bytes, Ordering::Relaxed);
         // The next merge is of a later plan, or a fetch the old way sent now.
         if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
@@ -7170,7 +7333,7 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let mut started = std::time::Instant::now();
-            let copied = match step {
+            let (copied, is_fill) = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -7186,7 +7349,7 @@ impl HostList {
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     fill_taken(dst, src, len);
-                    len
+                    (len, false)
                 }
                 &Step::Fill(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7196,7 +7359,7 @@ impl HostList {
                     }
                     crate::shadow::copy_mapped_wide(dst as *mut u8, src as *const u8, len);
                     fill_taken(dst, src, len);
-                    len
+                    (len, true)
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7251,8 +7414,17 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let us = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            if is_fill {
+                PREPARING_COPIES[PREP_FILL_US].fetch_add(us, Ordering::Relaxed);
+                PREPARING_COPIES[PREP_FILL_COUNT].fetch_add(1, Ordering::Relaxed);
+                PREPARING_COPIES[PREP_FILL_BYTES].fetch_add(copied as u64, Ordering::Relaxed);
+            } else {
+                PREPARING_COPIES[PREP_TITLE_COPY_US].fetch_add(us, Ordering::Relaxed);
+                PREPARING_COPIES[PREP_TITLE_COPY_COUNT].fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -7388,6 +7560,194 @@ mod wide_refresh_tests {
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
     }
+
+    #[test]
+    fn wide_merge_is_default_on_multicore_and_respects_disable() {
+        use super::wide_merge_enabled;
+        assert!(wide_merge_enabled(None, Some(4)));
+        assert!(wide_merge_enabled(None, Some(16)));
+        assert!(!wide_merge_enabled(None, Some(2)));
+        assert!(!wide_merge_enabled(None, None));
+        assert!(wide_merge_enabled(Some("1"), Some(1)));
+        assert!(!wide_merge_enabled(Some("0"), Some(16)));
+        assert!(wide_merge_enabled(Some("auto"), Some(4)));
+    }
+
+    #[test]
+    fn wide_relay_card_merge_matches_sequential_across_pieces_and_shadows() {
+        use super::{RelayCardPiece, relay_merge_card_pieces, wide_merge_enabled};
+        use crate::shadow::Shadow;
+        const PIECE: usize = 64 << 10;
+
+        let run_case = |parallel: bool| -> Option<(usize, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+            // 3 card shadows:
+            // - Shadow 0: 24 pieces (1.5 MiB) -> tests partitioning one large shadow across workers (>= 16 pieces).
+            // - Shadow 1: 4 pieces (256 KiB) with dirty & sent ranges + overlapping plan-ordered pieces.
+            // - Shadow 2: 2 pieces (128 KiB) with unchanged and sparsely modified pieces.
+            let specs: &[(usize, Vec<(usize, usize)>, Vec<(usize, usize, u64)>)] = &[
+                (24 * PIECE, vec![], vec![(3 * PIECE + 128, 3 * PIECE + 256, 11)]),
+                (
+                    4 * PIECE,
+                    vec![(PIECE + 64, PIECE + 192)],
+                    vec![(16, 48, 8), (2 * PIECE + 32, 2 * PIECE + 96, 6)],
+                ),
+                (2 * PIECE, vec![], vec![]),
+            ];
+
+            let mut titles: Vec<Vec<u8>> = Vec::new();
+            let mut sides: Vec<Vec<u8>> = Vec::new();
+            let mut shadows: Vec<std::sync::Arc<Shadow>> = Vec::new();
+            for (s_idx, (len, dirty, sent)) in specs.iter().enumerate() {
+                let base: Vec<u8> = (0..*len)
+                    .map(|i| (((s_idx + 1) * 31 + i * 13 + (i >> 8)) & 0xff) as u8)
+                    .collect();
+                let mut title = base.clone();
+                let mut side = base;
+                // Simulate newer title CPU writes already staged into `side` for dirty/later-sent ranges.
+                for &(a, b) in dirty {
+                    for off in a..b {
+                        title[off] ^= 0x55;
+                        side[off] = title[off];
+                    }
+                }
+                for &(a, b, send_no) in sent {
+                    if send_no > 6 {
+                        for off in a..b {
+                            title[off] ^= 0x33;
+                            side[off] = title[off];
+                        }
+                    }
+                }
+                let shadow = Shadow::new_card_for_test(
+                    side.as_mut_ptr(),
+                    title.as_ptr() as u64,
+                    *len as u64,
+                    dirty.clone(),
+                    sent.clone(),
+                )?;
+                titles.push(title);
+                sides.push(side);
+                shadows.push(shadow);
+            }
+
+            // Build fetched GPU buffers (owned here until `relay_merge_card_pieces` returns).
+            let mut gpu_bufs: Vec<Vec<u8>> = Vec::new();
+            let mut meta: Vec<(usize, usize, usize, u64)> = Vec::new();
+
+            // Shadow 0: 24 disjoint pieces (even pieces modified by GPU, odd pieces unchanged except piece 3).
+            for p in 0..24usize {
+                let lo = p * PIECE;
+                let hi = lo + PIECE;
+                let mut buf = sides[0][lo..hi].to_vec();
+                if p % 2 == 0 {
+                    let start = 17 + (p * 19) % 512;
+                    let len = 1024 + p * 37;
+                    for b in &mut buf[start..start + len] {
+                        *b ^= 0xA7;
+                    }
+                }
+                if p == 3 {
+                    // Card holds pre-send-11 bytes in [128..256), plus a real GPU write at [400..500).
+                    for off in 128..256 {
+                        buf[off] ^= 0x33;
+                    }
+                    for b in &mut buf[400..500] {
+                        *b ^= 0xC9;
+                    }
+                }
+                gpu_bufs.push(buf);
+                meta.push((0, lo, hi, 10));
+            }
+
+            // Shadow 1:
+            // - Piece 0: two overlapping plans in order (plan 1 after=7, plan 2 after=9) to verify order preservation.
+            // - Piece 1: overlaps `dirty` [64..192) + GPU write at [300..420).
+            // - Piece 2: sent at 6 <= after (10), GPU writes at [10..120).
+            {
+                let mut p0_plan1 = sides[1][0..PIECE].to_vec();
+                // Pre-send-8 bytes at [16..48), GPU write from plan 1 at [100..200).
+                for off in 16..48 {
+                    p0_plan1[off] ^= 0x33;
+                }
+                for b in &mut p0_plan1[100..200] {
+                    *b = 0x11;
+                }
+                gpu_bufs.push(p0_plan1);
+                meta.push((1, 0, PIECE, 7));
+
+                let mut p0_plan2 = sides[1][0..PIECE].to_vec();
+                // Plan 2 ran after send 8 (`after=9`), and overwrote [120..240) with 0x22.
+                for b in &mut p0_plan2[120..240] {
+                    *b = 0x22;
+                }
+                gpu_bufs.push(p0_plan2);
+                meta.push((1, 0, PIECE, 9));
+
+                let mut p1 = sides[1][PIECE..2 * PIECE].to_vec();
+                for off in 64..192 {
+                    p1[off] ^= 0x55; // stale card bytes before dirty send
+                }
+                for b in &mut p1[300..420] {
+                    *b ^= 0x6D;
+                }
+                gpu_bufs.push(p1);
+                meta.push((1, PIECE, 2 * PIECE, 10));
+
+                let mut p2 = sides[1][2 * PIECE..3 * PIECE].to_vec();
+                for b in &mut p2[10..120] {
+                    *b ^= 0x8E;
+                }
+                gpu_bufs.push(p2);
+                meta.push((1, 2 * PIECE, 3 * PIECE, 10));
+            }
+
+            // Shadow 2: 1 unchanged piece + 1 sparse-diff piece.
+            {
+                gpu_bufs.push(sides[2][0..PIECE].to_vec());
+                meta.push((2, 0, PIECE, 10));
+                let mut p1 = sides[2][PIECE..2 * PIECE].to_vec();
+                p1[511] ^= 0xF0;
+                p1[PIECE - 7] ^= 0x0F;
+                gpu_bufs.push(p1);
+                meta.push((2, PIECE, 2 * PIECE, 10));
+            }
+
+            let pieces: Vec<RelayCardPiece> = meta
+                .into_iter()
+                .zip(gpu_bufs.iter())
+                .map(|((s_idx, lo, hi, after), buf)| RelayCardPiece {
+                    shadow: shadows[s_idx].clone(),
+                    lo,
+                    hi,
+                    gpu_ptr: buf.as_ptr() as usize,
+                    after,
+                    track_walls: false,
+                })
+                .collect();
+
+            let written = relay_merge_card_pieces(pieces, parallel);
+            drop(shadows);
+            Some((written, titles, sides))
+        };
+
+        let Some((seq_written, seq_titles, seq_sides)) =
+            run_case(wide_merge_enabled(Some("0"), Some(16)))
+        else {
+            return;
+        };
+        let Some((par_written, par_titles, par_sides)) =
+            run_case(wide_merge_enabled(None, Some(16)))
+        else {
+            return;
+        };
+
+        assert!(seq_written > 0, "expected non-zero merged bytes");
+        assert_eq!(par_written, seq_written, "parallel written byte count must match sequential");
+        assert_eq!(par_titles, seq_titles, "parallel merged title memory must match sequential");
+        assert_eq!(par_sides, seq_sides, "parallel merged CPU staging must match sequential");
+        // Verify plan 2's newer overlapping write won over plan 1's older write on Shadow 1 piece 0.
+        assert!(par_titles[1][120..240].iter().all(|&b| b == 0x22));
+    }
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -7481,7 +7841,9 @@ impl Batch {
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let us = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            PREPARING_COPIES[PREP_WATCH_US].fetch_add(us, Ordering::Relaxed);
         }
         let started = std::time::Instant::now();
         let items: Vec<_> = self.refreshes.drain(..).collect();
@@ -9158,6 +9520,22 @@ impl Meter {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
+        let [
+            prep_watch_ms,
+            prep_refresh_copy_ms,
+            prep_fill_ms,
+            prep_fill_count,
+            prep_fill_mb,
+            prep_title_copy_ms,
+            prep_title_copy_count,
+        ] = [0, 1, 2, 3, 4, 5, 6].map(|i| {
+            let scale = match i {
+                PREP_WATCH_US | PREP_REFRESH_COPY_US | PREP_FILL_US | PREP_TITLE_COPY_US => 1e3,
+                PREP_FILL_BYTES => 1e6,
+                _ => 1.0,
+            };
+            PREPARING_COPIES[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
+        });
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
@@ -9365,6 +9743,12 @@ impl Meter {
                 making = crate::pipeline::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
+            );
+            tracing::info!(
+                "preparing copies breakdown per frame: watch {prep_watch_ms:.1} ms, \
+                 refresh-copy {prep_refresh_copy_ms:.1} ms, fills {prep_fill_ms:.1} ms \
+                 ({prep_fill_count:.0} fills, {prep_fill_mb:.1} MB), \
+                 title-copies {prep_title_copy_ms:.1} ms ({prep_title_copy_count:.0})"
             );
             let (buf_n, buf_b, loose_n, loose_b, loose_pin, rebar_b) = crate::shadow::cache_stats();
             let (stg_n, stg_b, stg_pin) = crate::texture::cache_stats();

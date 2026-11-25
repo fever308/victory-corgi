@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -241,8 +241,11 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, for the ranges its
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
-    /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    /// are set (and read). Also used as the CPU-side lock for card copies
+    /// (`RwLock` so parallel relay merges on disjoint 64 KiB pieces take
+    /// shared read locks while `merge_under_writes` takes an exclusive write
+    /// lock).
+    before: RwLock<Option<Vec<u8>>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -1841,6 +1844,7 @@ pub(crate) fn refresh_batch(
 
     #[cfg(feature = "diagnostics")]
     let batch_started = std::time::Instant::now();
+    let plan_started = std::time::Instant::now();
 
     let count = items.len();
     let planned: Vec<(Arc<Shadow>, usize, usize, UpdatePlan)> =
@@ -1873,7 +1877,10 @@ pub(crate) fn refresh_batch(
                 })
                 .collect()
         };
+    crate::host::PREPARING_COPIES[crate::host::PREP_WATCH_US]
+        .fetch_add(plan_started.elapsed().as_micros() as u64, Ordering::Relaxed);
 
+    let copy_started = std::time::Instant::now();
     let mut all_segs: Vec<CopySeg> = Vec::new();
     let mut non_mirrored: Vec<(usize, usize, usize)> = Vec::new();
     let mut mirrored: Vec<usize> = Vec::new();
@@ -1896,9 +1903,6 @@ pub(crate) fn refresh_batch(
         }
     }
 
-    #[cfg(feature = "diagnostics")]
-    let copy_started = std::time::Instant::now();
-
     if !all_segs.is_empty() {
         run_copy_segs(&all_segs);
         for &(idx, seg_lo, seg_hi) in &non_mirrored {
@@ -1912,8 +1916,9 @@ pub(crate) fn refresh_batch(
         total_copied += shadow.copy_runs(&plan.runs);
     }
 
-    #[cfg(feature = "diagnostics")]
     let copy_us = copy_started.elapsed().as_micros() as u64;
+    crate::host::PREPARING_COPIES[crate::host::PREP_REFRESH_COPY_US]
+        .fetch_add(copy_us, Ordering::Relaxed);
     #[cfg(feature = "diagnostics")]
     let batch_us = batch_started.elapsed().as_micros() as u64;
 
@@ -1998,7 +2003,7 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
-            match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            match shadow.before.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
                 None => (0, 0, 0, 0, 0),
             }
@@ -2851,7 +2856,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
-            before: Mutex::default(),
+            before: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
@@ -3105,7 +3110,7 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
@@ -3469,7 +3474,7 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.before.read().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
@@ -3576,7 +3581,7 @@ impl Shadow {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.write().unwrap_or_else(|e| e.into_inner());
         let Some(before) = snapshot.as_mut() else {
             return 0;
         };
@@ -3714,7 +3719,7 @@ impl Shadow {
             // the snapshot's.)
             kept.0.clear();
         }
-        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(bytes) = self.before.write().unwrap_or_else(|e| e.into_inner()).take() {
             give_back(bytes);
         }
     }
@@ -3918,7 +3923,7 @@ impl Shadow {
                     // reference under the same lock, and a page read before
                     // such a merge and compared after it would take the card's
                     // bytes for the title's.
-                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
                     // A page that is not there is left as it is, and looked at
                     // again next time.
                     if !crate::host::read_into(lo as *const u8, title) {
@@ -3978,21 +3983,25 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let plan_started = std::time::Instant::now();
         let plan = self.plan_update(address, len);
+        crate::host::PREPARING_COPIES[crate::host::PREP_WATCH_US]
+            .fetch_add(plan_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         if plan.runs.is_empty() && plan.watched_ranges.is_empty() {
             return 0;
         }
-        #[cfg(feature = "diagnostics")]
-        let started = (!plan.unwatched_ranges.is_empty()).then(std::time::Instant::now);
+        let copy_started = std::time::Instant::now();
         let copied = self.copy_runs(&plan.runs);
         for &(from, to) in &plan.watched_ranges {
             self.refresh_check(from, to);
         }
+        let copy_us = copy_started.elapsed().as_micros() as u64;
+        crate::host::PREPARING_COPIES[crate::host::PREP_REFRESH_COPY_US]
+            .fetch_add(copy_us, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        if let Some(started) = started {
-            let us = started.elapsed().as_micros() as u64;
+        if !plan.unwatched_ranges.is_empty() {
             for &(from, to) in &plan.unwatched_ranges {
-                crate::copystat::whole(from, to - from, us);
+                crate::copystat::whole(from, to - from, copy_us);
             }
         }
         copied
@@ -4463,11 +4472,13 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.before.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
-        // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
+        // does write it concurrently from the submitting thread
+        // (`merge_under_writes`) takes a write lock on `self.before`, and
+        // parallel relay workers operate on strictly disjoint `[at, at + len)`
+        // ranges.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
@@ -4507,6 +4518,29 @@ impl Shadow {
         back_note(start + at, &title[..n], self.start, self.len);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_card_for_test(
+        side_data: *mut u8,
+        title_start: u64,
+        len: u64,
+        dirty: Vec<(usize, usize)>,
+        sent: Vec<(usize, usize, u64)>,
+    ) -> Option<Arc<Shadow>> {
+        let h = host()?;
+        let (buffer, _) = h.shared_buffer(64)?;
+        let (staging, _) = h.shared_buffer(64)?;
+        let mut shadow = Shadow::new(buffer, side_data, 0, title_start, len, None);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::new(dirty),
+            sent: Mutex::new(sent),
+            // 0: no card bytes counted (`Drop` subtracts `card.size`).
+            size: 0,
+        });
+        Some(Arc::new(shadow))
     }
 }
 
