@@ -8188,6 +8188,97 @@ mod tests {
         }
     }
 
+    /// A partial refresh of a page both under and beside a pending shader-write
+    /// range (as with `VICTORY_VIEW_MARKS=1` filtered copy-back) updates the
+    /// reference bytes so copy-back neither puts the refreshed byte back over
+    /// a later title write nor drops a shader write back to the pre-refresh value.
+    #[cfg(windows)]
+    #[test]
+    fn partial_refresh_under_and_beside_pending_range_preserves_writes_with_view_marks() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(h) = host() else {
+            return;
+        };
+        let len = 2 * PAGE;
+        // SAFETY: fresh write-watched allocation freed at the end of the test.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(p, 0);
+        let Some((buffer, data)) = h.shared_buffer(len as u64) else {
+            // SAFETY: freeing our test allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            return;
+        };
+        // SAFETY: live D3D12 buffer.
+        let gpu_va = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new_inner(buffer, data, gpu_va, p as u64, len as u64, None, true);
+        let write_title = |at: usize, v: u8| {
+            // SAFETY: inside our write-watched allocation.
+            unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        };
+        let read_title = |at: usize| -> u8 {
+            // SAFETY: inside our write-watched allocation.
+            unsafe { ((p + at) as *const u8).read_volatile() }
+        };
+        let write_host = |at: usize, v: u8| {
+            // SAFETY: inside `copy.data` mapping.
+            unsafe { copy.data.add(at).write_volatile(v) };
+        };
+
+        copy.update(p, len);
+        // Page 0 is wholly busy; page 1 past +16 is free (beside pending).
+        copy.writing(p, PAGE + 16, |_, _| None);
+        for (at, v) in [(20, 0x55), (24, 0x44), (40, 0x11), (PAGE + 20, 0x55)] {
+            write_title(at, v);
+        }
+        assert!(copy.update(p + 16, 16) > 0 && copy.update(p + PAGE + 16, 16) > 0);
+        // Shaders write +10 -> 0xaa, +24 -> 0x00 (back to pre-refresh value!), and PAGE+10 -> 0xbb.
+        write_host(10, 0xaa);
+        write_host(24, 0x00);
+        write_host(PAGE + 10, 0xbb);
+        // Later title writes arrive at +20 and PAGE+20 before copy-back.
+        write_title(20, 0x66);
+        write_title(PAGE + 20, 0x77);
+
+        // Simulate `VICTORY_VIEW_MARKS=1` bitmap with both pages marked.
+        let declared = [(p, p + PAGE + 16)];
+        let spans = if let Some(base) = copy.mark_base() {
+            let max_word = ((base + 2) / 32) as usize + 1;
+            let mut bm = vec![0u32; max_word];
+            bm[(base / 32) as usize] |= 1 << (base & 31);
+            bm[((base + 1) / 32) as usize] |= 1 << ((base + 1) & 31);
+            let (filtered, decl_pages, marked_pages) =
+                copy.filter_marked_spans(&declared, &[], &[&bm]);
+            assert_eq!((decl_pages, marked_pages), (2, 2));
+            filtered
+        } else {
+            declared.to_vec()
+        };
+        for (from, to) in spans {
+            copy.copy_back(from, to - from);
+        }
+        copy.copy_back_done(&declared);
+
+        assert_eq!(
+            [read_title(10), read_title(20), read_title(24), read_title(40)],
+            [0xaa, 0x66, 0x00, 0x11]
+        );
+        assert_eq!([read_title(PAGE + 10), read_title(PAGE + 20)], [0xbb, 0x77]);
+
+        drop(copy);
+        // SAFETY: freeing our test allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// Shaders only declared during preparation have not run when the card
     /// uploads the refresh. Diffing individual bytes in this case produces
     /// thousands of needless CopyBufferRegion calls for strided constants.

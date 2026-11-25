@@ -2050,6 +2050,7 @@ pub(crate) fn try_arm_lazy_under_guards(
     blocks: &[usize],
     arm: impl FnOnce(Option<u64>) -> bool,
 ) -> bool {
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if blocks.is_empty() {
         return false;
     }
@@ -2065,13 +2066,31 @@ pub(crate) fn try_arm_lazy_under_guards(
     let mut sorted = blocks.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    // Clear all guard/cold metadata across every block BEFORE restoring
+    // `PAGE_READWRITE` so no concurrent thread observes stale flags while
+    // another alias is already writable.
+    let frame32 = current_frame32();
+    let mut to_restore = Vec::new();
     for_each_contiguous_run(&sorted, |from, to| {
-        open_here(&mut g, from * BLOCK, to * BLOCK, |_| {});
-        demote_cold_range(&mut g, from, to);
+        to_restore.extend(DIR.collect_set_bits(from, to, BitField::GuardProtected));
+        let cold = DIR.collect_set_bits(from, to, BitField::ColdRo);
+        if !cold.is_empty() {
+            for &b in &cold {
+                DIR.reset_cold(b, frame32);
+            }
+            to_restore.extend(cold);
+        }
+        DIR.set_bits_range(from, to, BitField::GuardProtected, false, Ordering::SeqCst);
         DIR.set_bits_range(from, to, BitField::GuardClean, false, Ordering::SeqCst);
         DIR.set_bits_range(from, to, BitField::GuardAbsent, false, Ordering::SeqCst);
         DIR.set_bits_range(from, to, BitField::GuardAliased, false, Ordering::SeqCst);
+        DIR.set_bits_range(from, to, BitField::ColdRo, false, Ordering::SeqCst);
     });
+    if !to_restore.is_empty() {
+        to_restore.sort_unstable();
+        to_restore.dedup();
+        protect_block_runs(&to_restore, PAGE_READWRITE);
+    }
     arm(cpu_clean_after)
 }
 
@@ -2121,6 +2140,7 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
         return;
     }
     let mut run: Option<usize> = None;
+    let mut reclean: Option<usize> = None;
     let mut uncommitted_until = first;
     let lazy = crate::lazy_back::active();
     for block in first..=last {
@@ -2142,15 +2162,27 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
                 // The kernel may be writing it or lazy copy-back holds it as
                 // PAGE_NOACCESS: left as-is, reported written at every check.
             } else if DIR.is_guard_protected(block) {
-                // Written through the runtime, still read-only.
-                DIR.set_bit(block, BitField::GuardClean, true, Ordering::SeqCst);
+                // Already read-only (e.g. guarded as an alias, or left unclean
+                // after an alias rebind / unguardable alias): becomes clean only
+                // once every alias view is also guarded.
+                if let Some(from) = run.take() {
+                    protect(g, from, block, lazy);
+                }
+                reclean.get_or_insert(block);
+                continue;
             } else {
+                if let Some(from) = reclean.take() {
+                    mark_protected_clean(g, from, block, lazy);
+                }
                 run.get_or_insert(block);
                 continue;
             }
         }
         if let Some(from) = run.take() {
-            protect(g, from, block);
+            protect(g, from, block, lazy);
+        }
+        if let Some(from) = reclean.take() {
+            mark_protected_clean(g, from, block, lazy);
         }
     }
 }
@@ -2258,37 +2290,129 @@ fn protect_block_runs(blocks: &[usize], prot: u32) {
     });
 }
 
-/// Makes blocks `[from, to)` read-only and notes them guarded and clean,
-/// also guarding all alias views of the same physical pages.
-fn protect(g: &mut Guards, from: usize, to: usize) {
-    protect_here(g, from, to);
-    if !view_guard() {
-        return;
+/// Guards the other mappings of blocks in `[from, to)`, returning:
+/// - `(block, shown_blocks)` entries whose other mappings are all guarded;
+/// - the set of blocks in `[from, to)` that still have an unguardable mapping
+///   (pinned, lazy-armed, or `VirtualProtect` failed) and must stay changed.
+fn guard_aliases_for(
+    g: &Guards,
+    from: usize,
+    to: usize,
+    lazy: bool,
+) -> (Vec<(usize, Vec<usize>)>, std::collections::BTreeSet<usize>) {
+    use std::collections::BTreeSet;
+    if !view_guard() || from >= to {
+        return (Vec::new(), BTreeSet::new());
     }
-    let mut alias_targets = Vec::new();
+    // Collect alias lists while holding `inplace::VIEWS` as a leaf lock so
+    // `lazy_back::has_block` and `VirtualProtect` never nest inside `VIEWS`.
+    let mut entries: Vec<(usize, Vec<usize>)> = Vec::new();
     crate::inplace::for_each_alias_in(
         from.saturating_mul(BLOCK),
         to.saturating_mul(BLOCK),
         |block, shown| {
-            if !DIR.is_guard_protected(block) {
-                return;
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, Ordering::Relaxed);
-            for &alias in shown {
-                let alias = alias / BLOCK;
-                DIR.set_bit(alias, BitField::GuardAliased, true, Ordering::SeqCst);
-                if alias != block
-                    && !DIR.is_guard_protected(alias)
-                    && !DIR.is_cold_ro(alias)
-                    && !g.pinned(alias)
-                {
-                    alias_targets.push(alias);
-                }
-            }
+            entries.push((block, shown.iter().map(|&a| a / BLOCK).collect()));
         },
     );
+    if entries.is_empty() {
+        return (Vec::new(), BTreeSet::new());
+    }
+    let mut unguarded = BTreeSet::new();
+    let mut alias_targets = Vec::new();
+    let mut pending_pairs: Vec<(usize, usize)> = Vec::new();
+    for (block, aliases) in &entries {
+        let mut blocked = false;
+        for &alias in aliases {
+            if alias == *block {
+                continue;
+            }
+            if g.pinned(alias)
+                || DIR.is_lazy_armed(alias)
+                || (lazy && crate::lazy_back::has_block(alias))
+            {
+                blocked = true;
+                break;
+            }
+        }
+        if blocked {
+            unguarded.insert(*block);
+            continue;
+        }
+        for &alias in aliases {
+            if alias != *block && !DIR.is_guard_protected(alias) && !DIR.is_cold_ro(alias) {
+                alias_targets.push(alias);
+                pending_pairs.push((*block, alias));
+            }
+        }
+    }
     protect_alias_blocks(alias_targets);
+    for (block, alias) in pending_pairs {
+        if !DIR.is_guard_protected(alias) && !DIR.is_cold_ro(alias) {
+            unguarded.insert(block);
+        }
+    }
+    entries.retain(|(block, _)| !unguarded.contains(block));
+    (entries, unguarded)
+}
+
+/// Marks already-`GuardProtected` blocks `[from, to)` clean after ensuring
+/// every alias view of each block is guarded; any block with an unguardable
+/// alias stays unclean (`GuardClean = false`).
+fn mark_protected_clean(g: &Guards, from: usize, to: usize, lazy: bool) {
+    let (aliased, unguarded) = guard_aliases_for(g, from, to, lazy);
+    for (block, aliases) in aliased {
+        if !DIR.is_guard_protected(block) {
+            continue;
+        }
+        for alias in aliases {
+            DIR.set_bit(alias, BitField::GuardAliased, true, Ordering::SeqCst);
+        }
+    }
+    if unguarded.is_empty() {
+        DIR.set_bits_range(from, to, BitField::GuardClean, true, Ordering::SeqCst);
+        return;
+    }
+    let mut cur = from;
+    for bad in unguarded {
+        if cur < bad {
+            DIR.set_bits_range(cur, bad, BitField::GuardClean, true, Ordering::SeqCst);
+        }
+        cur = bad + 1;
+    }
+    if cur < to {
+        DIR.set_bits_range(cur, to, BitField::GuardClean, true, Ordering::SeqCst);
+    }
+}
+
+/// Makes blocks `[from, to)` read-only and notes them guarded and clean,
+/// also guarding all alias views of the same physical pages. Any block
+/// whose alias cannot be guarded is left out (stays changed).
+fn protect(g: &mut Guards, from: usize, to: usize, lazy: bool) {
+    let (aliased, unguarded) = guard_aliases_for(g, from, to, lazy);
+    if unguarded.is_empty() {
+        protect_here(g, from, to);
+    } else {
+        let mut cur = from;
+        for bad in unguarded {
+            if cur < bad {
+                protect_here(g, cur, bad);
+            }
+            cur = bad + 1;
+        }
+        if cur < to {
+            protect_here(g, cur, to);
+        }
+    }
+    for (block, aliases) in aliased {
+        if !DIR.is_guard_protected(block) {
+            continue;
+        }
+        #[cfg(feature = "diagnostics")]
+        ALIASES[0].fetch_add(1, Ordering::Relaxed);
+        for alias in aliases {
+            DIR.set_bit(alias, BitField::GuardAliased, true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Views of one page past which its views are not guarded together.
@@ -2388,61 +2512,63 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
-/// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
-fn open(g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)) -> bool {
-    let any = open_here(g, start, end, &mut dirtied);
-    if start >= end {
-        return any;
-    }
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let aliased = DIR.collect_set_bits(first, last, BitField::GuardAliased);
-    if aliased.is_empty() {
-        return any;
-    }
-    let mut alias_blocks = Vec::new();
-    for block in aliased {
-        DIR.set_bit(block, BitField::GuardAliased, false, Ordering::SeqCst);
-        for alias in crate::inplace::pages_of(block * BLOCK) {
-            let ab = alias / BLOCK;
-            DIR.set_bit(ab, BitField::GuardAliased, false, Ordering::SeqCst);
-            if ab != block {
-                alias_blocks.push(ab);
-            }
-        }
-    }
-    if !alias_blocks.is_empty() {
-        alias_blocks.sort_unstable();
-        alias_blocks.dedup();
-        for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
-            if open_here(g, r_from * BLOCK, r_to * BLOCK, &mut dirtied) {
-                #[cfg(feature = "diagnostics")]
-                ALIASES[1].fetch_add((r_to - r_from) as u64, Ordering::Relaxed);
-            }
-        });
-    }
-    any
-}
-
-/// [`open`] for one range, without the other views of its pages.
-fn open_here(_g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)) -> bool {
+/// Gives write access back to the guarded blocks of `[start, end)` and all
+/// their alias views, noting them written; true if any in `[start, end)` was
+/// guarded. Marks every primary and alias block dirty/unprotected in `PageDir`
+/// strictly BEFORE any `VirtualProtect(..., PAGE_READWRITE)` opens a page.
+fn open(_g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)) -> bool {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if start >= end {
         return false;
     }
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let blocks = DIR.collect_set_bits(first, last, BitField::GuardProtected);
-    if blocks.is_empty() {
-        return false;
+    let primary = DIR.collect_set_bits(first, last, BitField::GuardProtected);
+    let aliased = DIR.collect_set_bits(first, last, BitField::GuardAliased);
+    let mut alias_blocks = Vec::new();
+    if !aliased.is_empty() {
+        for block in aliased {
+            DIR.set_bit(block, BitField::GuardAliased, false, Ordering::SeqCst);
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let ab = alias / BLOCK;
+                DIR.set_bit(ab, BitField::GuardAliased, false, Ordering::SeqCst);
+                if ab < first || ab >= last {
+                    alias_blocks.push(ab);
+                }
+            }
+        }
+        if !alias_blocks.is_empty() {
+            alias_blocks.sort_unstable();
+            alias_blocks.dedup();
+            alias_blocks.retain(|&ab| DIR.is_guard_protected(ab));
+        }
     }
-    for &block in &blocks {
+    // Every primary and alias block is marked dirty/unprotected BEFORE any
+    // page is opened: once a page is writable, a write by another thread lands
+    // without a fault, and a concurrent lock-free `PageDir` reader on another
+    // view must not still observe `GuardClean == true`.
+    for &block in &primary {
         DIR.set_bit(block, BitField::GuardProtected, false, Ordering::SeqCst);
         if DIR.clear_bit_was_set(block, BitField::GuardClean, Ordering::SeqCst) {
             dirtied(block * BLOCK);
         }
     }
-    protect_block_runs(&blocks, PAGE_READWRITE);
-    true
+    for &block in &alias_blocks {
+        DIR.set_bit(block, BitField::GuardProtected, false, Ordering::SeqCst);
+        if DIR.clear_bit_was_set(block, BitField::GuardClean, Ordering::SeqCst) {
+            dirtied(block * BLOCK);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    if !alias_blocks.is_empty() {
+        ALIASES[1].fetch_add(alias_blocks.len() as u64, Ordering::Relaxed);
+    }
+    if !primary.is_empty() {
+        protect_block_runs(&primary, PAGE_READWRITE);
+    }
+    if !alias_blocks.is_empty() {
+        protect_block_runs(&alias_blocks, PAGE_READWRITE);
+    }
+    !primary.is_empty()
 }
 
 /// Before our own synchronous user-mode write into title memory
@@ -2480,23 +2606,23 @@ pub(crate) fn writing(at: usize, len: usize) {
 /// does not fault into our handler): opens its guarded/cold blocks and leaves them
 /// writable for [`PIN`] across every view of their pages.
 pub fn kernel_writing(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if len == 0 {
         return;
     }
     let end = at.saturating_add(len);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
-    // Pin + open/demote under `GUARDS` BEFORE `lazy_back::materialize_range`
-    // so a concurrent `try_arm_lazy_under_guards` cannot re-defer the blocks
-    // after materialization and before pinning.
+    // Pin + clear guard/cold metadata across the range and all aliases under
+    // `GUARDS` strictly BEFORE any `VirtualProtect(..., PAGE_READWRITE)` and
+    // BEFORE `lazy_back::materialize_range`, so neither a concurrent
+    // `try_arm_lazy_under_guards` nor a lock-free `PageDir` reader can race.
     {
         let mut g = guards();
         g.prune_pins();
         let until = std::time::Instant::now() + PIN;
         g.pin(first, last, until);
-        open(&mut g, at, end, |_| {});
-        demote_cold_range(&mut g, first, last);
+        let mut alias_blocks = Vec::new();
         if view_guard() {
-            let mut alias_blocks = Vec::new();
             crate::inplace::for_each_alias_in(
                 first.saturating_mul(BLOCK),
                 last.saturating_mul(BLOCK),
@@ -2504,20 +2630,58 @@ pub fn kernel_writing(at: usize, len: usize) {
                     for &alias in shown {
                         let alias_block = alias / BLOCK;
                         if alias_block != block {
-                            g.pin(alias_block, alias_block + 1, until);
                             alias_blocks.push(alias_block);
                         }
                     }
                 },
             );
-            if !alias_blocks.is_empty() {
-                alias_blocks.sort_unstable();
-                alias_blocks.dedup();
-                for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
-                    open_here(&mut g, r_from * BLOCK, r_to * BLOCK, |_| {});
-                    demote_cold_range(&mut g, r_from, r_to);
-                });
+        }
+        for block in DIR.collect_set_bits(first, last, BitField::GuardAliased) {
+            DIR.set_bit(block, BitField::GuardAliased, false, Ordering::SeqCst);
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let ab = alias / BLOCK;
+                DIR.set_bit(ab, BitField::GuardAliased, false, Ordering::SeqCst);
+                if ab < first || ab >= last {
+                    alias_blocks.push(ab);
+                }
             }
+        }
+        alias_blocks.sort_unstable();
+        alias_blocks.dedup();
+        for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
+            g.pin(r_from, r_to, until);
+        });
+
+        let frame32 = current_frame32();
+        let mut to_restore = DIR.collect_set_bits(first, last, BitField::GuardProtected);
+        let cold_primary = DIR.collect_set_bits(first, last, BitField::ColdRo);
+        if !cold_primary.is_empty() {
+            for &b in &cold_primary {
+                DIR.reset_cold(b, frame32);
+            }
+            to_restore.extend(cold_primary);
+        }
+        DIR.set_bits_range(first, last, BitField::GuardProtected, false, Ordering::SeqCst);
+        DIR.set_bits_range(first, last, BitField::GuardClean, false, Ordering::SeqCst);
+        DIR.set_bits_range(first, last, BitField::GuardAliased, false, Ordering::SeqCst);
+        DIR.set_bits_range(first, last, BitField::ColdRo, false, Ordering::SeqCst);
+
+        for &ab in &alias_blocks {
+            let was_prot = DIR.clear_bit_was_set(ab, BitField::GuardProtected, Ordering::SeqCst);
+            DIR.set_bit(ab, BitField::GuardClean, false, Ordering::SeqCst);
+            DIR.set_bit(ab, BitField::GuardAliased, false, Ordering::SeqCst);
+            let was_cold = DIR.clear_bit_was_set(ab, BitField::ColdRo, Ordering::SeqCst);
+            if was_cold {
+                DIR.reset_cold(ab, frame32);
+            }
+            if was_prot || was_cold {
+                to_restore.push(ab);
+            }
+        }
+        if !to_restore.is_empty() {
+            to_restore.sort_unstable();
+            to_restore.dedup();
+            protect_block_runs(&to_restore, PAGE_READWRITE);
         }
     }
     crate::lazy_back::materialize_range(at, len);
@@ -2583,6 +2747,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if !view_guard() {
         return;
     }
@@ -2593,13 +2758,38 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if crate::lazy_back::active() {
         crate::lazy_back::materialize_ranges(&ranges);
     }
-    let mut g = guards();
+    let _g = guards();
+    let mut to_open = Vec::new();
+    #[cfg(feature = "diagnostics")]
+    let mut opened_ranges = 0u64;
     for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n), |_| {}) {
+        if n == 0 {
+            continue;
+        }
+        let end = at.saturating_add(n);
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        let blocks = DIR.collect_set_bits(first, last, BitField::GuardProtected);
+        if !blocks.is_empty() {
             #[cfg(feature = "diagnostics")]
-            ALIASES[2].fetch_add(1, Ordering::Relaxed);
+            {
+                opened_ranges += 1;
+            }
+            to_open.extend(blocks);
         }
     }
+    if to_open.is_empty() {
+        return;
+    }
+    to_open.sort_unstable();
+    to_open.dedup();
+    for &block in &to_open {
+        DIR.set_bit(block, BitField::GuardProtected, false, Ordering::SeqCst);
+        DIR.set_bit(block, BitField::GuardClean, false, Ordering::SeqCst);
+        DIR.set_bit(block, BitField::GuardAliased, false, Ordering::SeqCst);
+    }
+    #[cfg(feature = "diagnostics")]
+    ALIASES[2].fetch_add(opened_ranges, Ordering::Relaxed);
+    protect_block_runs(&to_open, PAGE_READWRITE);
 }
 
 /// Coordinates in-place CPU reads of title memory with mapping changes.
@@ -2860,38 +3050,89 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
     crate::lazy_back::materialize_range(at, len);
     crate::descriptor::host::remapped(at, len);
     wrote(at, len);
-    let g = guards();
+    let lazy = crate::lazy_back::active();
+    let mut g = guards();
+    g.prune_pins();
     let end = at.saturating_add(len);
     let range = at / BLOCK..end.div_ceil(BLOCK);
     DIR.set_bits_range(range.start, range.end, BitField::GuardClean, false, Ordering::SeqCst);
-    if view_guard() && DIR.any_bits_in_range(range.start, range.end, &[BitField::GuardProtected]) {
-        let mut alias_targets = Vec::new();
-        crate::inplace::for_each_alias_in(
-            range.start.saturating_mul(BLOCK),
-            range.end.saturating_mul(BLOCK),
-            |block, shown| {
-                if !DIR.is_guard_protected(block) {
-                    return;
+    if !view_guard() {
+        return;
+    }
+    let mut entries: Vec<(usize, Vec<usize>)> = Vec::new();
+    crate::inplace::for_each_alias_in(
+        range.start.saturating_mul(BLOCK),
+        range.end.saturating_mul(BLOCK),
+        |block, shown| {
+            entries.push((block, shown.iter().map(|&a| a / BLOCK).collect()));
+        },
+    );
+    if entries.is_empty() {
+        return;
+    }
+    let mut alias_targets = Vec::new();
+    let mut protected_pairs: Vec<(usize, usize)> = Vec::new();
+    for (block, aliases) in &entries {
+        let block_protected = DIR.is_guard_protected(*block);
+        let any_alias_protected = aliases
+            .iter()
+            .any(|&a| a != *block && DIR.is_guard_protected(a));
+        if block_protected {
+            for &alias in aliases {
+                if alias == *block {
+                    continue;
                 }
-                for &alias in shown {
-                    let alias = alias / BLOCK;
-                    DIR.set_bit(alias, BitField::GuardAliased, true, Ordering::SeqCst);
-                    if alias != block
-                        && !DIR.is_guard_protected(alias)
-                        && !DIR.is_cold_ro(alias)
-                        && !g.pinned(alias)
+                if !DIR.is_guard_protected(alias) && !DIR.is_cold_ro(alias) {
+                    if !g.pinned(alias)
+                        && !DIR.is_lazy_armed(alias)
+                        && !(lazy && crate::lazy_back::has_block(alias))
                     {
                         alias_targets.push(alias);
+                        protected_pairs.push((*block, alias));
+                    }
+                } else {
+                    DIR.set_bit(*block, BitField::GuardAliased, true, Ordering::SeqCst);
+                    DIR.set_bit(alias, BitField::GuardAliased, true, Ordering::SeqCst);
+                }
+            }
+        } else if any_alias_protected {
+            // Another view of this rebound page is guarded: mark it changed
+            // (its bytes may already reflect a write through `block`) and guard
+            // `block` if possible; if `block` cannot be guarded, the guarded
+            // alias stays changed on subsequent checks too.
+            for &alias in aliases {
+                if alias != *block {
+                    DIR.set_bit(alias, BitField::GuardClean, false, Ordering::SeqCst);
+                }
+            }
+            if !g.pinned(*block)
+                && !DIR.is_cold_ro(*block)
+                && !DIR.is_lazy_armed(*block)
+                && !(lazy && crate::lazy_back::has_block(*block))
+            {
+                alias_targets.push(*block);
+                for &alias in aliases {
+                    if alias != *block && DIR.is_guard_protected(alias) {
+                        protected_pairs.push((alias, *block));
                     }
                 }
-            },
-        );
-        protect_alias_blocks(alias_targets);
+            }
+        }
+    }
+    protect_alias_blocks(alias_targets);
+    for (guarded, target) in protected_pairs {
+        if DIR.is_guard_protected(target) || DIR.is_cold_ro(target) {
+            DIR.set_bit(guarded, BitField::GuardAliased, true, Ordering::SeqCst);
+            DIR.set_bit(target, BitField::GuardAliased, true, Ordering::SeqCst);
+        } else {
+            DIR.set_bit(guarded, BitField::GuardClean, false, Ordering::SeqCst);
+        }
     }
 }
 
 /// Restores `PAGE_READWRITE` for a cold-promoted write-watched 64 KiB block
-/// upon CPU write fault while `GUARDS` is held, recording the page dirty.
+/// upon CPU write fault while `GUARDS` is held, recording the page dirty
+/// strictly before opening write access.
 fn open_cold_ro(_g: &mut Guards, at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let block = at / BLOCK;
@@ -2900,15 +3141,11 @@ fn open_cold_ro(_g: &mut Guards, at: usize) -> bool {
     }
     DIR.set_bit(block, BitField::ColdRo, false, Ordering::SeqCst);
     DIR.reset_cold(block, current_frame32());
-    let mut old = 0u32;
-    // SAFETY: `block` was cold-promoted to `PAGE_READONLY` by us; restoring `PAGE_READWRITE`.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) } == 0
-    {
-        return false;
-    }
     let now = next_epoch();
     DIR.record_written(block, now);
-    true
+    let mut old = 0u32;
+    // SAFETY: `block` was cold-promoted to `PAGE_READONLY` by us; restoring `PAGE_READWRITE`.
+    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -3556,18 +3793,46 @@ mod tests {
     #[test]
     fn alias_rebound_marks_guarded_block_unclean_and_guards_new_aliases() {
         let (section, a, b) = two_views(BLOCK);
-        // Pin `b` initially so guarding `a` leaves `b` writable (simulating
-        // an alias not yet guarded when an identical alias remap lands on `a`).
+        // Pin `b` initially: guarding `a` MUST leave `a` unclean while `b` is
+        // pinned and writable (cannot be guarded yet).
         let until = std::time::Instant::now() + PIN;
         guards().pin(b / BLOCK, b / BLOCK + 1, until);
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
-        assert_eq!(guard(a, a + BLOCK), Some(vec![]));
+        assert_eq!(
+            guard(a, a + BLOCK),
+            Some(vec![a / PAGE]),
+            "a page with a pinned alias stays changed"
+        );
         assert!(writable(b));
 
-        // Clear the pin, write through `b`, then notify an identical alias rebind on `a`.
+        // Clear the pin, write through `b`, then guard `a` cleanly, then re-open
+        // `b` alone via `title_memory_alias_rebound` on `a`.
         guards().pins.clear();
         // SAFETY: `b` is writable committed view memory.
         unsafe { ((b + 4) as *mut u8).write_volatile(0x42) };
+        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
+        assert_eq!(guard(a, a + BLOCK), Some(vec![]));
+        assert!(!writable(b));
+
+        // Simulate `b` having lost its read-only guard while `a` remained
+        // `GuardProtected + GuardClean`, then notify an alias rebind on `a`.
+        {
+            let mut old = 0u32;
+            DIR.set_bit(b / BLOCK, BitField::GuardProtected, false, Ordering::SeqCst);
+            // SAFETY: `b` is our committed view from `two_views`.
+            assert_ne!(
+                unsafe {
+                    windows_sys::Win32::System::Memory::VirtualProtect(
+                        b as *const _,
+                        BLOCK,
+                        PAGE_READWRITE,
+                        &mut old,
+                    )
+                },
+                0
+            );
+        }
+        assert!(writable(b));
         title_memory_alias_rebound(a, BLOCK);
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
         assert_eq!(guard(a, a + BLOCK), Some(vec![]));
@@ -3579,6 +3844,119 @@ mod tests {
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
 
         drop_views(section, &[a, b], BLOCK);
+    }
+
+    /// A page whose alias cannot be guarded (pinned for a kernel write,
+    /// `LazyArmed`, or failing `VirtualProtect`) stays changed across `guard`
+    /// and `Tracked::take`; aliasing a busy mapping to a guarded page marks
+    /// the guarded page changed.
+    #[test]
+    fn a_busy_or_unguardable_alias_leaves_the_page_changed() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualProtect, VirtualQuery,
+        };
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (section, a, b) = two_views(BLOCK);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.take(a, a + PAGE).is_empty(), "clean once both views are guarded");
+
+        // Pin alias `b` via `kernel_writing`: `a` is opened and stays changed
+        // on every `take` while `b` remains pinned.
+        kernel_writing(b, 16);
+        assert!(writable(b));
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(
+            t.take(a, a + PAGE),
+            [(a, a + PAGE)],
+            "take must leave the page changed while alias `b` is pinned"
+        );
+        // SAFETY: `b` is open and writable under `kernel_writing`.
+        unsafe { (b as *mut u32).write_volatile(0x1234) };
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+
+        // Once `b`'s pin expires, `take` reports once more, guards both views,
+        // and becomes clean.
+        guards().pins.clear();
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(
+            t.take(a, a + PAGE).is_empty(),
+            "taken cleanly once the busy alias pin ended"
+        );
+        assert!(!writable(a));
+        assert!(!writable(b));
+
+        // Aliasing a pinned mapping `c` to guarded `a` via `title_memory_alias_rebound`
+        // marks `a` changed without disturbing `c`'s pin.
+        let (sec2, c, d) = two_views(BLOCK);
+        // Make `c` alias `a`'s section in `inplace` while `c` is pinned.
+        title_memory_remapped(c, BLOCK);
+        kernel_writing(c, 16);
+        crate::inplace::title_memory_view(c, BLOCK, section, 0);
+        // `views_mapped` opened `a`; re-verify `take` stays changed while `c` is pinned.
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        // Clear `c`'s pin -> `a` becomes clean again, then pin `c` and exercise
+        // `title_memory_alias_rebound(c, BLOCK)` directly.
+        guards().pins.clear();
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.take(a, a + PAGE).is_empty());
+        {
+            let until = std::time::Instant::now() + PIN;
+            guards().pin(c / BLOCK, c / BLOCK + 1, until);
+            DIR.set_bit(c / BLOCK, BitField::GuardProtected, false, Ordering::SeqCst);
+        }
+        title_memory_alias_rebound(c, BLOCK);
+        assert!(
+            !DIR.is_guard_clean(a / BLOCK),
+            "rebounding a pinned alias must mark the guarded view unclean"
+        );
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        guards().pins.clear();
+
+        // A `LazyArmed` (`PAGE_NOACCESS`) alias `b` must NEVER have its
+        // `PAGE_NOACCESS` overwritten with `PAGE_READONLY`, and must leave `a`
+        // changed until `b` is no longer lazy-armed.
+        title_memory_remapped(c, BLOCK);
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.take(a, a + PAGE).is_empty());
+        writing(a, BLOCK);
+        let mut old = 0u32;
+        // SAFETY: `b` is our committed view; simulate `LazyArmed` (`PAGE_NOACCESS`).
+        assert_ne!(
+            unsafe { VirtualProtect(b as *const _, PAGE, PAGE_NOACCESS, &mut old) },
+            0
+        );
+        note_lazy_view_armed(&[b]);
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert_eq!(
+            t.take(a, a + PAGE),
+            [(a, a + PAGE)],
+            "a page with a LazyArmed alias must stay changed"
+        );
+        // SAFETY: plain `VirtualQuery` on committed `b`.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        assert_ne!(
+            unsafe { VirtualQuery(b as *const _, &mut info, size_of_val(&info)) },
+            0
+        );
+        assert_eq!(info.State, MEM_COMMIT);
+        assert_eq!(
+            info.Protect, PAGE_NOACCESS,
+            "guarding view `a` must not clobber LazyArmed PAGE_NOACCESS on alias `b`"
+        );
+        clear_lazy_view_armed(&[b]);
+        // SAFETY: restoring RW on `b` before cleanup.
+        assert_ne!(
+            unsafe { VirtualProtect(b as *const _, PAGE, PAGE_READWRITE, &mut old) },
+            0
+        );
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.take(a, a + PAGE).is_empty());
+
+        drop_views(section, &[a, b], BLOCK);
+        drop_views(sec2, &[c, d], BLOCK);
     }
 
     /// A VEH write fault on a guarded alias view opens the clean view of the
