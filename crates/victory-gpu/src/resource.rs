@@ -581,40 +581,51 @@ fn twin_texture(
     }))
 }
 
+/// DXGI typeless format families as `(typeless_format, last_format_in_family)`.
+const FORMAT_FAMILIES: [(u32, u32); 22] = [
+    (1, 4),
+    (5, 8),
+    (9, 14),
+    (15, 18),
+    (19, 22),
+    (23, 25),
+    (27, 32),
+    (33, 38),
+    (39, 43),
+    (44, 47),
+    (48, 52),
+    (53, 59),
+    (60, 65),
+    (70, 72),
+    (73, 75),
+    (76, 78),
+    (79, 81),
+    (82, 84),
+    (90, 91),
+    (92, 93),
+    (94, 96),
+    (97, 99),
+];
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
-    const FAMILIES: [(u32, u32); 22] = [
-        (1, 4),
-        (5, 8),
-        (9, 14),
-        (15, 18),
-        (19, 22),
-        (23, 25),
-        (27, 32),
-        (33, 38),
-        (39, 43),
-        (44, 47),
-        (48, 52),
-        (53, 59),
-        (60, 65),
-        (70, 72),
-        (73, 75),
-        (76, 78),
-        (79, 81),
-        (82, 84),
-        (90, 91),
-        (92, 93),
-        (94, 96),
-        (97, 99),
-    ];
     match format {
         87 => 90,
         88 => 92,
-        f => FAMILIES
+        f => FORMAT_FAMILIES
             .iter()
             .find(|&&(first, last)| (first..=last).contains(&f))
             .map_or(f, |&(first, _)| first),
     }
+}
+
+/// Whether `format` belongs to a DXGI typeless format family (including the
+/// typeless head format itself, such as `DXGI_FORMAT_R8G8B8A8_TYPELESS = 27`).
+fn has_family(format: u32) -> bool {
+    matches!(format, 87 | 88)
+        || FORMAT_FAMILIES
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&format))
 }
 
 /// sRGB formats and their linear twins.
@@ -2161,13 +2172,14 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.format = family(d.format);
     }
     // A texture made with the unordered flag needs a format the host can
-    // make a typed unordered view of. One without a family that could stand
-    // in (some console formats the title names, e.g. B5G6R5 / B5G5R5A1)
-    // removes the device at `GetResourceAllocationInfo`; make it without
-    // the flag instead, and its unordered views are refused later
+    // make a typed unordered view of. One without a typeless family at all
+    // (`!has_family`, e.g. B5G6R5 / B5G5R5A1; NOT typeless head formats like
+    // R8G8B8A8_TYPELESS=27 which DO have UAV-capable typed members!) removes
+    // the device at `GetResourceAllocationInfo`; make it without the flag
+    // instead, and its unordered views are refused later
     // (`descriptor::host::fits`).
     if d.flags & UNORDERED != 0
-        && family(d.format) == d.format
+        && !has_family(d.format)
         && !crate::descriptor::host::typed_store(d.format)
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -4214,5 +4226,16 @@ float4 lit() : SV_Target { return 1.0; }
             let host = host_desc(&texture(28)).unwrap();
             assert_eq!(host.flags & UNORDERED, UNORDERED, "28 keeps the flag");
         }
+        // Typeless family heads (27 = R8G8B8A8_TYPELESS, 9 = R16G16B16A16_TYPELESS)
+        // and sRGB+UAV textures converted to typeless (29 -> 27) MUST keep UNORDERED,
+        // even though CheckFeatureSupport(TYPED_UAV) is false for typeless formats!
+        let typeless = host_desc(&texture(27)).unwrap();
+        assert_eq!(typeless.format, 27);
+        assert_eq!(typeless.flags & UNORDERED, UNORDERED, "R8G8B8A8_TYPELESS must keep UAV");
+        let srgb = host_desc(&texture(29)).unwrap();
+        assert_eq!(srgb.format, 27, "sRGB+UAV becomes R8G8B8A8_TYPELESS");
+        assert_eq!(srgb.flags & UNORDERED, UNORDERED, "sRGB+UAV converted to 27 must keep UAV");
+        let fp16 = host_desc(&texture(9)).unwrap();
+        assert_eq!(fp16.flags & UNORDERED, UNORDERED, "R16G16B16A16_TYPELESS must keep UAV");
     }
 }
