@@ -1090,9 +1090,16 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
-    let Some(map) = crate::resource::page_mapper() else {
-        return E_INVALIDARG;
+    use crate::resource::{
+        PageMapOp,
+        PageMapping::{Consecutive, Repeated},
     };
+
+    let batch_map = crate::resource::page_batch_mapper();
+    let single_map = crate::resource::page_mapper();
+    if batch_map.is_none() && single_map.is_none() {
+        return E_INVALIDARG;
+    }
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -1101,26 +1108,66 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    let mut ops = if batch_map.is_some() {
+        Vec::new()
+    } else {
+        Vec::with_capacity(0)
+    };
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
         }
         // SAFETY: each batch holds `count` ranges.
         let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        if batch_map.is_some() {
+            ops.reserve(ranges.len());
+        }
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
+            let op = match r.kind {
+                0 if inside(r.count) => Some(PageMapOp {
+                    to: at,
+                    from: source,
+                    len,
+                    mapping: Consecutive,
+                }),
+                1 if inside(1) => Some(PageMapOp {
+                    to: at,
+                    from: source,
+                    len,
+                    mapping: Repeated,
+                }),
+                2 => Some(PageMapOp {
+                    to: at,
+                    from: 0,
+                    len,
+                    mapping: Consecutive,
+                }),
+                3 => None,
+                _ => {
+                    ok = false;
+                    None
+                }
             };
+            if let Some(op) = op {
+                if batch_map.is_some() {
+                    if op.len > 0 {
+                        ops.push(op);
+                    }
+                } else if let Some(map) = single_map {
+                    ok &= map(op.to, op.from, op.len, op.mapping);
+                }
+            }
             at += len;
         }
+    }
+    if let Some(batch_map) = batch_map
+        && !ops.is_empty()
+    {
+        ok &= batch_map(&ops);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();

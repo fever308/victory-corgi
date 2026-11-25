@@ -950,10 +950,32 @@ pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
     let _ = ALLOCATOR.set((alloc, free));
 }
 
+/// Whether to advance through the source pages or use the first page for
+/// each destination page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageMapping {
+    Consecutive,
+    Repeated,
+}
+
+/// One page-mapping operation within a `CopyPageMappingsBatchX` call.
+#[derive(Debug, Clone, Copy)]
+pub struct PageMapOp {
+    pub to: u64,
+    pub from: u64,
+    pub len: u64,
+    pub mapping: PageMapping,
+}
+
 /// Maps the physical pages behind one range of title memory at another,
-/// `(to, from, len)` (`from` 0 unmaps); false on failure.
-pub type PageMapper = fn(u64, u64, u64) -> bool;
+/// `(to, from, len, mapping)` (`from` 0 unmaps); false on failure.
+pub type PageMapper = fn(u64, u64, u64, PageMapping) -> bool;
 static PAGE_MAPPER: std::sync::OnceLock<PageMapper> = std::sync::OnceLock::new();
+
+/// Maps physical pages across an entire `CopyPageMappingsBatchX` call in one
+/// batch (`from == 0` unmaps); false if any range failed.
+pub type PageBatchMapper = fn(&[PageMapOp]) -> bool;
+static PAGE_BATCH_MAPPER: std::sync::OnceLock<PageBatchMapper> = std::sync::OnceLock::new();
 
 /// The runtime's page mapper, for the queues' page-mapping copies (memory
 /// is the runtime's, as on the console).
@@ -961,8 +983,18 @@ pub fn use_page_mapper(mapper: PageMapper) {
     let _ = PAGE_MAPPER.set(mapper);
 }
 
+/// Registers a batched page mapper for `CopyPageMappingsBatchX` so the runtime
+/// can coalesce locks and skip no-op unmaps or identical alias re-mappings.
+pub fn use_page_batch_mapper(mapper: PageBatchMapper) {
+    let _ = PAGE_BATCH_MAPPER.set(mapper);
+}
+
 pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
+}
+
+pub(crate) fn page_batch_mapper() -> Option<PageBatchMapper> {
+    PAGE_BATCH_MAPPER.get().copied()
 }
 
 /// Allocation attributes for resource memory: allocator id, page size

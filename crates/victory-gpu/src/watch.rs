@@ -1680,6 +1680,45 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+/// The runtime left `[at, at + len)` mapped to the exact same physical pages
+/// during a page-mapping batch (`CopyPageMappingsBatchX`), skipping redundant
+/// unmap/remap syscalls. Placed textures and guarded buffer copies over the
+/// range still treat its contents as potentially updated via another alias,
+/// and any newly mapped alias of a guarded block becomes guarded too.
+pub fn title_memory_alias_rebound(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    crate::descriptor::host::remapped(at, len);
+    wrote(at, len);
+    let mut g = guards();
+    let end = at.saturating_add(len);
+    let range = at / BLOCK..end.div_ceil(BLOCK);
+    let clean: Vec<usize> = g.clean.range(range.clone()).copied().collect();
+    for block in clean {
+        g.clean.remove(&block);
+        clean_bit(block, false);
+    }
+    if view_guard() && g.protected.range(range.clone()).next().is_some() {
+        crate::inplace::for_each_alias_in(
+            range.start.saturating_mul(BLOCK),
+            range.end.saturating_mul(BLOCK),
+            |block, shown| {
+                if !g.protected.contains(&block) {
+                    return;
+                }
+                for &alias in shown {
+                    let alias = alias / BLOCK;
+                    g.aliased.insert(alias);
+                    if alias != block {
+                        protect_alias(&mut g, alias);
+                    }
+                }
+            },
+        );
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -2284,6 +2323,34 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    #[test]
+    fn alias_rebound_marks_guarded_block_unclean_and_guards_new_aliases() {
+        let (section, a, b) = two_views(BLOCK);
+        // Pin `b` initially so guarding `a` leaves `b` writable (simulating
+        // an alias not yet guarded when an identical alias remap lands on `a`).
+        let until = std::time::Instant::now() + PIN;
+        guards().pin(b / BLOCK, b / BLOCK + 1, until);
+        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
+        assert_eq!(guard(a, a + BLOCK), Some(vec![]));
+        assert!(writable(b));
+
+        // Clear the pin, write through `b`, then notify an identical alias rebind on `a`.
+        guards().pins.clear();
+        // SAFETY: `b` is writable committed view memory.
+        unsafe { ((b + 4) as *mut u8).write_volatile(0x42) };
+        title_memory_alias_rebound(a, BLOCK);
+        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
+        assert_eq!(guard(a, a + BLOCK), Some(vec![]));
+
+        // `b` must also be guarded now so subsequent CPU writes through `b` open `a`.
+        assert!(!writable(b));
+        // SAFETY: writing through guarded `b` faults into the VEH and opens `a` too.
+        unsafe { ((b + 12) as *mut u8).write_volatile(0x99) };
+        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
+
+        drop_views(section, &[a, b], BLOCK);
     }
 }
 

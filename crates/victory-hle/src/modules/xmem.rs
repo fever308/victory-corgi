@@ -13,6 +13,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
+use victory_gpu::resource::{PageMapOp, PageMapping};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -763,38 +764,334 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     1
 }
 
-/// Maps the physical pages shown at `[from, from + len)` at `to` as well,
-/// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
+/// Whether batched `CopyPageMappingsBatchX` coalescing and redundant-remap
+/// skipping are enabled (`VICTORY_BATCH_PAGE_MAP=0` restores legacy per-range
+/// `map_alias` calls).
+fn batch_page_map_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BATCH_PAGE_MAP").is_none_or(|v| v != "0"))
+}
+
+fn lookup_slice(physical: &Physical, at: usize) -> Option<Slice> {
+    physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + *size)
+        .map(|(base, (_, s))| Slice {
+            index: s.index + (at - *base) / PAGE,
+            section: s.section.clone(),
+        })
+}
+
+fn page_maps_slice(physical: &Physical, at: usize, slice: &Slice) -> bool {
+    physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + *size)
+        .is_some_and(|(base, (_, s))| {
+            Arc::ptr_eq(&s.section, &slice.section) && s.index + (at - *base) / PAGE == slice.index
+        })
+}
+
+fn has_mapped_views(physical: &Physical, base: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = base + len;
+    physical
+        .views
+        .range(..=base)
+        .next_back()
+        .is_some_and(|(at, (size, _))| *at + *size > base)
+        || physical.views.range(base + 1..end).next().is_some()
+}
+
+fn touched_ops_span(physical: &Physical, ops: &[PageMapOp]) -> (usize, usize) {
+    let mut from = usize::MAX;
+    let mut to = 0usize;
+    for op in ops {
+        let len = op.len as usize;
+        if len == 0 {
+            continue;
+        }
+        let (start, span_len) = touched_span(physical, op.to as usize, len);
+        if span_len > 0 {
+            from = from.min(start);
+            to = to.max(start.saturating_add(span_len));
+        }
+    }
+    if from < to { (from, to - from) } else { (0, 0) }
+}
+
+fn ensure_remapping(
+    physical: &Physical,
+    ops: &[PageMapOp],
+    changing: &mut Option<victory_gpu::Remapping>,
+) {
+    if changing.is_none() {
+        let (span_at, span_len) = touched_ops_span(physical, ops);
+        *changing = Some(victory_gpu::title_memory_remapping(span_at, span_len));
+    }
+}
+
+/// Maps the physical pages at `from` at `to` as well, in place of what
+/// `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): Grand Theft Auto
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
-pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+pub fn map_alias(to: u64, from: u64, len: u64, mapping: PageMapping) -> bool {
+    if !batch_page_map_enabled() {
+        return map_alias_legacy(to, from, len, mapping);
+    }
+    map_alias_batch(&[PageMapOp {
+        to,
+        from,
+        len,
+        mapping,
+    }])
+}
+
+fn map_alias_legacy(to: u64, from: u64, len: u64, mapping: PageMapping) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 {
+        return true;
+    }
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let (span_at, span_len) = touched_span(&physical, to, len);
     let _changing = victory_gpu::title_memory_remapping(span_at, span_len);
-    unmap(&mut physical, to, len);
-    for k in (0..len).step_by(PAGE) {
+    map_alias_one(&mut physical, to, from, len, mapping)
+}
+
+fn map_alias_one(
+    physical: &mut Physical,
+    to: usize,
+    from: usize,
+    len: usize,
+    mapping: PageMapping,
+) -> bool {
+    let repeated = matches!(mapping, PageMapping::Repeated);
+    if !repeated {
+        unmap(physical, to, len);
         if from == 0 {
-            break;
+            return true;
         }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+    }
+    for k in (0..len).step_by(PAGE) {
+        let at = if repeated {
+            // Keep the page order, including when the source lies inside
+            // the destination or a later page fails.
+            unmap(physical, to + k, PAGE);
+            if from == 0 {
+                continue;
+            }
+            from
+        } else {
+            from + k
+        };
+        let Some(slice) = lookup_slice(physical, at) else {
             return false;
         };
         // The source view already committed this page of the same section.
-        if !map(&mut physical, to + k, PAGE, slice, PageCommitment::Existing) {
+        if !map(physical, to + k, PAGE, slice, PageCommitment::Existing) {
             return false;
+        }
+    }
+    true
+}
+
+/// Applies all ranges of a `CopyPageMappingsBatchX` call under a single
+/// `PHYSICAL` lock and at most one `title_memory_remapping()` lock acquisition,
+/// skipping no-op unmaps and destination pages already mapped to the exact
+/// same physical section slice.
+pub fn map_alias_batch(ops: &[PageMapOp]) -> bool {
+    if !batch_page_map_enabled() {
+        let mut ok = true;
+        for op in ops {
+            ok &= map_alias_legacy(op.to, op.from, op.len, op.mapping);
+        }
+        return ok;
+    }
+    if ops.iter().all(|op| op.len == 0) {
+        return true;
+    }
+    let mut physical = physical();
+    let mut changing: Option<victory_gpu::Remapping> = None;
+    let mut ok = true;
+    for (op_idx, &op) in ops.iter().enumerate() {
+        let remaining = &ops[op_idx..];
+        let (to, from, len) = (op.to as usize, op.from as usize, op.len as usize);
+        if len == 0 {
+            continue;
+        }
+        if from == 0 {
+            if has_mapped_views(&physical, to, len) {
+                ensure_remapping(&physical, remaining, &mut changing);
+                unmap(&mut physical, to, len);
+            }
+            continue;
+        }
+        if len % PAGE != 0 {
+            ensure_remapping(&physical, remaining, &mut changing);
+            ok &= map_alias_one(&mut physical, to, from, len, op.mapping);
+            continue;
+        }
+        match op.mapping {
+            PageMapping::Repeated => {
+                let overlaps = from >= to && from < to.saturating_add(len);
+                if overlaps {
+                    ensure_remapping(&physical, remaining, &mut changing);
+                    ok &= map_alias_one(&mut physical, to, from, len, PageMapping::Repeated);
+                } else {
+                    ok &= map_repeated_nonoverlapping(
+                        &mut physical,
+                        remaining,
+                        &mut changing,
+                        to,
+                        from,
+                        len,
+                    );
+                }
+            }
+            PageMapping::Consecutive => {
+                let overlaps = from < to.saturating_add(len) && to < from.saturating_add(len);
+                if overlaps {
+                    ensure_remapping(&physical, remaining, &mut changing);
+                    ok &= map_alias_one(&mut physical, to, from, len, PageMapping::Consecutive);
+                } else {
+                    ok &= map_consecutive_nonoverlapping(
+                        &mut physical,
+                        remaining,
+                        &mut changing,
+                        to,
+                        from,
+                        len,
+                    );
+                }
+            }
+        }
+    }
+    ok
+}
+
+fn map_repeated_nonoverlapping(
+    physical: &mut Physical,
+    remaining: &[PageMapOp],
+    changing: &mut Option<victory_gpu::Remapping>,
+    to: usize,
+    from: usize,
+    len: usize,
+) -> bool {
+    let Some(slice) = lookup_slice(physical, from) else {
+        if has_mapped_views(physical, to, PAGE) {
+            ensure_remapping(physical, remaining, changing);
+            unmap(physical, to, PAGE);
+        }
+        return false;
+    };
+    let pages = len / PAGE;
+    let mut i = 0;
+    while i < pages {
+        let same = page_maps_slice(physical, to + i * PAGE, &slice);
+        let start = i;
+        i += 1;
+        while i < pages && page_maps_slice(physical, to + i * PAGE, &slice) == same {
+            i += 1;
+        }
+        let run_start = to + start * PAGE;
+        let run_len = (i - start) * PAGE;
+        if same {
+            victory_gpu::title_memory_alias_rebound(run_start, run_len);
+            continue;
+        }
+        ensure_remapping(physical, remaining, changing);
+        if has_mapped_views(physical, run_start, run_len) {
+            unmap_inner(physical, run_start, run_len, false);
+        }
+        victory_gpu::title_memory_remapped(run_start, run_len);
+        let mut mapped_len = 0;
+        let mut failed = false;
+        for offset in (0..run_len).step_by(PAGE) {
+            let dst = run_start + offset;
+            if !map_view_raw(dst, PAGE, &slice, PageCommitment::Existing) {
+                failed = true;
+                break;
+            }
+            victory_gpu::title_memory_view(
+                dst,
+                PAGE,
+                slice.section.0 as usize,
+                (slice.index * PAGE) as u64,
+            );
+            physical.views.insert(dst, (PAGE, slice.clone()));
+            mapped_len += PAGE;
+        }
+        if mapped_len > 0 {
+            let shown = physical.shown.entry(slice.key(0)).or_default();
+            shown.reserve(mapped_len / PAGE);
+            for offset in (0..mapped_len).step_by(PAGE) {
+                shown.push(run_start + offset);
+            }
+        }
+        if failed {
+            return false;
+        }
+    }
+    true
+}
+
+fn map_consecutive_nonoverlapping(
+    physical: &mut Physical,
+    remaining: &[PageMapOp],
+    changing: &mut Option<victory_gpu::Remapping>,
+    to: usize,
+    from: usize,
+    len: usize,
+) -> bool {
+    let pages = len / PAGE;
+    let mut slices = Vec::with_capacity(pages);
+    for i in 0..pages {
+        let Some(s) = lookup_slice(physical, from + i * PAGE) else {
+            ensure_remapping(physical, remaining, changing);
+            return map_alias_one(physical, to, from, len, PageMapping::Consecutive);
+        };
+        slices.push(s);
+    }
+    let mut i = 0;
+    while i < pages {
+        let same = page_maps_slice(physical, to + i * PAGE, &slices[i]);
+        let start = i;
+        i += 1;
+        while i < pages && page_maps_slice(physical, to + i * PAGE, &slices[i]) == same {
+            i += 1;
+        }
+        let run_start = to + start * PAGE;
+        let run_len = (i - start) * PAGE;
+        if same {
+            victory_gpu::title_memory_alias_rebound(run_start, run_len);
+            continue;
+        }
+        ensure_remapping(physical, remaining, changing);
+        if has_mapped_views(physical, run_start, run_len) {
+            unmap_inner(physical, run_start, run_len, false);
+        }
+        victory_gpu::title_memory_remapped(run_start, run_len);
+        for p in start..i {
+            let dst = to + p * PAGE;
+            let slice = &slices[p];
+            if !map_view_raw(dst, PAGE, slice, PageCommitment::Existing) {
+                return false;
+            }
+            victory_gpu::title_memory_view(
+                dst,
+                PAGE,
+                slice.section.0 as usize,
+                (slice.index * PAGE) as u64,
+            );
+            physical.shown.entry(slice.key(0)).or_default().push(dst);
+            physical.views.insert(dst, (PAGE, slice.clone()));
         }
     }
     true
@@ -805,27 +1102,13 @@ enum PageCommitment {
     Existing,
 }
 
-/// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
-fn map(
-    physical: &mut Physical,
-    base: usize,
-    len: usize,
-    slice: Slice,
-    commitment: PageCommitment,
-) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
+fn map_view_raw(base: usize, len: usize, slice: &Slice, commitment: PageCommitment) -> bool {
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle.
+    let process = unsafe { GetCurrentProcess() };
+    let try_map = || unsafe {
         MapViewOfFile3(
             slice.section.0,
-            GetCurrentProcess(),
+            process,
             base as *const c_void,
             (slice.index * PAGE) as u64,
             len,
@@ -835,6 +1118,20 @@ fn map(
             0,
         )
     };
+    // When `[base, base + len)` is already an exact split placeholder, replace
+    // it directly; otherwise split the enclosing placeholder first and retry.
+    let mut view = try_map();
+    if view.Value as usize != base {
+        // SAFETY: splits the placeholder around the range when needed.
+        unsafe {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+        }
+        view = try_map();
+    }
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -846,7 +1143,22 @@ fn map(
     }
     if matches!(commitment, PageCommitment::Required) && !commit(base, len) {
         // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+        unsafe { UnmapViewOfFile2(process, view, MEM_PRESERVE_PLACEHOLDER) };
+        return false;
+    }
+    true
+}
+
+/// Maps `slice` and the slices after it over `[base, base + len)`, which
+/// must lie in one placeholder.
+fn map(
+    physical: &mut Physical,
+    base: usize,
+    len: usize,
+    slice: Slice,
+    commitment: PageCommitment,
+) -> bool {
+    if !map_view_raw(base, len, &slice, commitment) {
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
@@ -967,6 +1279,10 @@ fn touched_scatter_span(physical: &Physical, addresses: &[*mut c_void]) -> (usiz
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
+    unmap_inner(physical, base, len, true);
+}
+
+fn unmap_inner(physical: &mut Physical, base: usize, len: usize, notify_remapped: bool) {
     // No bytes: no view to return. The search below would still find the
     // view holding `base` and cut it in two there, and its range of views
     // starting inside would run backwards (which `BTreeMap` panics on).
@@ -980,12 +1296,17 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         .views
         .range(..=base)
         .next_back()
-        .filter(|(at, (size, _))| *at + size > base)
+        .filter(|(at, (size, _))| *at + *size > base)
         .map(|(at, _)| *at);
     let hit: Vec<usize> = first
         .into_iter()
         .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
         .collect();
+    if hit.is_empty() {
+        return;
+    }
+    let mut removed: Vec<(usize, usize, Slice)> = Vec::with_capacity(hit.len());
+    let (mut min_at, mut max_end) = (usize::MAX, 0usize);
     for at in hit {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
@@ -999,11 +1320,23 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
+        min_at = min_at.min(at);
+        max_end = max_end.max(at + size);
+        removed.push((at, size, slice));
+    }
+    if removed.is_empty() {
+        return;
+    }
+    if notify_remapped || min_at < base || max_end > end {
+        victory_gpu::title_memory_remapped(min_at, max_end - min_at);
+    }
+    // SAFETY: pseudo-handle for current process.
+    let process = unsafe { GetCurrentProcess() };
+    for (at, size, slice) in removed {
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
-                GetCurrentProcess(),
+                process,
                 MEMORY_MAPPED_VIEW_ADDRESS {
                     Value: at as *mut c_void,
                 },
@@ -1327,7 +1660,7 @@ mod tests {
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
         // The GPU's page-mapping copy: what `a + 2 pages` shows, at `b`.
         let commits_before_alias = COMMIT_CALLS.get();
-        assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64));
+        assert!(map_alias(b as u64, at(a, 2) as u64, PAGE as u64, PageMapping::Consecutive));
         assert_eq!(COMMIT_CALLS.get(), commits_before_alias);
         assert_eq!(query(b).host.State, MEM_COMMIT);
         // SAFETY: both views are mapped read-write.
@@ -1336,9 +1669,9 @@ mod tests {
             b.cast::<u8>().add(PAGE - 1).write(13);
             assert_eq!(at(a, 2).cast::<u8>().add(PAGE - 1).read(), 13);
         }
-        assert!(map_alias(b as u64, 0, PAGE as u64));
+        assert!(map_alias(b as u64, 0, PAGE as u64, PageMapping::Consecutive));
         assert_eq!(query(b).host.State, MEM_RESERVE);
-        assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
+        assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64, PageMapping::Consecutive));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
@@ -1495,8 +1828,8 @@ mod tests {
         for at in [a, second, a.wrapping_byte_add(2 * PAGE)] {
             assert_eq!(XMemMapPhysicalPages(at, 0, pages.as_ptr()), at);
             assert_eq!(XMemMapPhysicalPages(at, 0, std::ptr::null()), at);
-            assert!(map_alias(at as u64, a as u64, 0));
-            assert!(map_alias(at as u64, 0, 0));
+            assert!(map_alias(at as u64, a as u64, 0, PageMapping::Consecutive));
+            assert!(map_alias(at as u64, 0, 0, PageMapping::Consecutive));
         }
 
         // The view is still the one view it was.
@@ -1648,5 +1981,105 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn batched_page_mappings_skip_noop_unmaps_and_identical_aliases_without_blocking_readers() {
+        let pages = allocate(2);
+        let pool = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        let heap = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            8 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!pool.is_null() && !heap.is_null());
+        assert_eq!(XMemMapPhysicalPages(pool, 2, pages.as_ptr()), pool);
+        // SAFETY: pool pages are mapped read-write.
+        unsafe {
+            pool.cast::<u8>().write(0x11);
+            pool.wrapping_byte_add(PAGE).cast::<u8>().write(0x22);
+        }
+
+        // Initial batch maps `heap[0..4]` repeatedly to `pool[0]` and leaves `heap[4..8]` unmapped.
+        let initial = [
+            PageMapOp {
+                to: heap as u64,
+                from: pool as u64,
+                len: (4 * PAGE) as u64,
+                mapping: PageMapping::Repeated,
+            },
+            PageMapOp {
+                to: (heap as usize + 4 * PAGE) as u64,
+                from: 0,
+                len: (4 * PAGE) as u64,
+                mapping: PageMapping::Consecutive,
+            },
+        ];
+        assert!(map_alias_batch(&initial));
+        for k in 0..4 {
+            assert_eq!(unsafe { heap.cast::<u8>().add(k * PAGE).read() }, 0x11);
+        }
+        assert_eq!(query(heap.wrapping_byte_add(4 * PAGE)).host.State, MEM_RESERVE);
+
+        // Re-applying identical repeated aliases and unmapping already-unmapped pages
+        // must not acquire `title_memory_remapping()` (holding `title_memory_reading()`
+        // on the same thread would deadlock if it did).
+        {
+            let _reading = victory_gpu::title_memory_reading(heap as usize, 8 * PAGE);
+            assert!(map_alias_batch(&initial));
+        }
+
+        // Now remap `heap[1..3]` to `pool[1]` and unmap `heap[3]`.
+        let update = [
+            PageMapOp {
+                to: (heap as usize + PAGE) as u64,
+                from: (pool as usize + PAGE) as u64,
+                len: (2 * PAGE) as u64,
+                mapping: PageMapping::Repeated,
+            },
+            PageMapOp {
+                to: (heap as usize + 3 * PAGE) as u64,
+                from: 0,
+                len: PAGE as u64,
+                mapping: PageMapping::Consecutive,
+            },
+        ];
+        assert!(map_alias_batch(&update));
+        assert_eq!(unsafe { heap.cast::<u8>().read() }, 0x11);
+        assert_eq!(unsafe { heap.cast::<u8>().add(PAGE).read() }, 0x22);
+        assert_eq!(unsafe { heap.cast::<u8>().add(2 * PAGE).read() }, 0x22);
+        assert_eq!(query(heap.wrapping_byte_add(3 * PAGE)).host.State, MEM_RESERVE);
+
+        // Verify `physical.shown` tracks the pool view and the two repeated heap aliases.
+        let mut shown = shown_at(&pages[1..2], 0, PAGE);
+        shown.sort_unstable();
+        let mut expected = vec![
+            (pool as usize + PAGE, PAGE),
+            (heap as usize + PAGE, 2 * PAGE),
+        ];
+        expected.sort_unstable();
+        assert_eq!(shown, expected);
+
+        assert!(map_alias_batch(&[PageMapOp {
+            to: heap as u64,
+            from: 0,
+            len: (8 * PAGE) as u64,
+            mapping: PageMapping::Consecutive,
+        }]));
+        assert_eq!(XMemMapPhysicalPages(pool, 2, std::ptr::null()), pool);
+        for p in [pool, heap] {
+            for k in 0..(if p == pool { 2 } else { 8 }) {
+                unsafe { VirtualFree(p.wrapping_byte_add(k * PAGE), 0, MEM_RELEASE) };
+            }
+        }
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }

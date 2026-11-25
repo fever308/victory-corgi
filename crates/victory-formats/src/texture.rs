@@ -529,6 +529,55 @@ impl Layout {
         }
     }
 
+    /// Byte ranges (offset, bytes) of the texture to sample for a cheap look
+    /// at whether its memory changed: one inside each mip of each slice
+    /// (those in the tail at their places in its block), the first `window`
+    /// bytes of the mip or all of it if it is smaller (a mip's elements
+    /// start at its start; a tail mip may fill only part of its place). A
+    /// texture streams in whole mips, so a mip that arrives late changes
+    /// bytes under its range.
+    ///
+    /// At most `most` ranges: with more mips than that over all slices, the
+    /// ranges are taken at evenly spread places in the order of the memory.
+    /// In order, inside `size`, with ranges that touch or overlap joined.
+    pub fn sample_ranges(&self, window: u64, most: usize) -> Vec<(u64, u64)> {
+        if self.slice_size == 0 || window == 0 || most == 0 {
+            return Vec::new();
+        }
+        // Where each mip of a slice starts: those in the tail at their
+        // places in the tail block (which is at 0), the others at their
+        // offsets; 0 in any case.
+        let mut starts: Vec<u64> = self
+            .mips
+            .iter()
+            .map(|m| m.tail.map_or(m.offset, |t| u64::from(t.offset)))
+            .chain([0])
+            .filter(|&at| at < self.slice_size)
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        let per = starts.len();
+        let total = per * self.slices as usize;
+        let picked = total.min(most);
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(picked);
+        for i in 0..picked {
+            let g = if total > most { i * total / most } else { i };
+            let (slice, r) = (g / per, g % per);
+            let base = slice as u64 * self.slice_size;
+            let (from, to) = (starts[r], starts.get(r + 1).copied().unwrap_or(self.slice_size));
+            let at = base + from;
+            let len = window.min(to - from).min(self.size.saturating_sub(at));
+            if len == 0 {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if at <= last.0 + last.1 => last.1 = last.1.max(at + len - last.0),
+                _ => out.push((at, len)),
+            }
+        }
+        out
+    }
+
     /// Byte offset of element (`x`, `y`) of mip `mip` in array slice or
     /// depth slice `z`. Coordinates must lie inside the mip.
     pub fn offset(&self, mip: u32, x: u32, y: u32, z: u32) -> Result<u64, Error> {
@@ -639,11 +688,19 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+
+        // Multiple depth slices must not overwrite each other.
+        if depth > 1 && depth_pitch < slice_bytes {
+            return Err(Error::TooSmall);
+        }
+
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
-            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
-            .and_then(|offset| offset.checked_add(bytes))
+            .and_then(|offset| offset.checked_add(slice_bytes))
             .ok_or(Error::TooSmall)?;
         let (tiled_len, linear_len) = if DETILE {
             (src.len(), dst.len())
@@ -1175,5 +1232,192 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    fn volume_pitch_layout(swizzle: Swizzle) -> Layout {
+        Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 2,
+            ..desc(4, 2, 1, 4, swizzle)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn depth_pitch_rejects_overlapping_detile() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let l = volume_pitch_layout(swizzle);
+            let tiled = vec![0x42; l.size as usize];
+            let mut linear = [0xcc; 72];
+
+            for pitch in [0, 16, 35] {
+                assert_eq!(
+                    l.detile(&tiled, 0, 0, &mut linear, 20, pitch),
+                    Err(Error::TooSmall),
+                    "{swizzle:?}, pitch {pitch}"
+                );
+
+                assert_eq!(linear, [0xcc; 72]);
+            }
+        }
+    }
+
+    #[test]
+    fn depth_pitch_rejects_overlapping_tile() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let l = volume_pitch_layout(swizzle);
+            let mut tiled = vec![0xcc; l.size as usize];
+            let linear = [0x42; 72];
+
+            for pitch in [0, 16, 35] {
+                assert_eq!(
+                    l.tile(&mut tiled, 0, 0, &linear, 20, pitch),
+                    Err(Error::TooSmall),
+                    "{swizzle:?}, pitch {pitch}"
+                );
+
+                assert!(tiled.iter().all(|&b| b == 0xcc));
+            }
+        }
+    }
+
+    #[test]
+    fn depth_pitch_accepts_exact_and_padded_slices() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let l = volume_pitch_layout(swizzle);
+
+            for pitch in [36usize, 40, 64] {
+                let len = pitch + 36;
+                let mut tiled = vec![0; l.size as usize];
+
+                let linear: Vec<u8> = (0..len).map(|i| i as u8).collect();
+
+                let mut back = vec![0xcc; len];
+
+                l.tile(&mut tiled, 0, 0, &linear, 20, pitch).unwrap();
+
+                l.detile(&tiled, 0, 0, &mut back, 20, pitch).unwrap();
+
+                for z in 0..2 {
+                    for y in 0..2 {
+                        let start = z * pitch + y * 20;
+
+                        assert_eq!(back[start..start + 16], linear[start..start + 16]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plane(
+        dimension: Dimension,
+        w: u32,
+        h: u32,
+        depth: u32,
+        mips: u32,
+        bpe: u32,
+        block: u32,
+        swizzle: Swizzle,
+    ) -> Desc {
+        Desc {
+            dimension,
+            width: w,
+            height: h,
+            depth,
+            mips,
+            element_bytes: bpe,
+            block,
+            samples: 1,
+            swizzle,
+        }
+    }
+
+    /// Each mip of each slice, tail mips included, has a sampled range
+    /// over bytes its elements are stored at (found through `offset`, not
+    /// through the mip offsets `sample_ranges` uses).
+    #[test]
+    fn every_mip_of_every_slice_is_sampled() {
+        use Dimension::*;
+        let cases = [
+            plane(Tex2d, 2048, 2048, 1, 12, 16, 4, Swizzle::SW_64KB_D),
+            plane(Tex2d, 1024, 512, 1, 11, 4, 1, Swizzle::SW_64KB_S),
+            plane(Tex2d, 512, 512, 6, 10, 8, 4, Swizzle::SW_64KB_D),
+            plane(Tex2d, 300, 200, 1, 9, 4, 1, Swizzle::LINEAR),
+            plane(Tex2d, 256, 256, 4, 9, 4, 1, Swizzle::SW_4KB_S),
+            plane(Tex2d, 4096, 64, 1, 13, 2, 1, Swizzle::SW_64KB_D),
+        ];
+        for desc in cases {
+            let l = Layout::new(&desc).unwrap();
+            let ranges = l.sample_ranges(1024, 10_000);
+            for z in 0..l.slices {
+                for (i, m) in l.mips.iter().enumerate() {
+                    let (w, h) = (m.width, m.height);
+                    let xs: Vec<u32> = (0..w).step_by((w as usize / 16).max(1)).chain([w - 1]).collect();
+                    let ys: Vec<u32> = (0..h).step_by((h as usize / 16).max(1)).chain([h - 1]).collect();
+                    let (mut lo, mut hi) = (u64::MAX, 0);
+                    for &y in &ys {
+                        for &x in &xs {
+                            let at = l.offset(i as u32, x, y, z).unwrap();
+                            lo = lo.min(at);
+                            hi = hi.max(at + u64::from(desc.element_bytes));
+                        }
+                    }
+                    assert!(
+                        ranges.iter().any(|&(at, n)| at < hi && at + n > lo),
+                        "{desc:?}: mip {i} of slice {z} ({lo:#x}..{hi:#x}) has no range in {ranges:x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Ranges are in order, apart, inside the texture, at most `most` and
+    /// at most `window` bytes each before joining, for every mode.
+    #[test]
+    fn sample_ranges_are_ordered_and_bounded() {
+        use Dimension::*;
+        let swizzles = [
+            Swizzle::LINEAR,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_64KB_D,
+            Swizzle::SW_64KB_S_X,
+            Swizzle::SW_64KB_D_X,
+            Swizzle::SW_64KB_R_X,
+            Swizzle::SW_4KB_S_X,
+        ];
+        for swizzle in swizzles {
+            for (dimension, w, h, depth, mips, bpe, block) in [
+                (Tex2d, 4096, 4096, 1, 13, 16, 4),
+                (Tex2d, 1000, 300, 64, 10, 4, 1),
+                (Tex2d, 1, 1, 1, 1, 4, 1),
+                (Tex2d, 64, 64, 6, 7, 8, 4),
+            ] {
+                let desc = plane(dimension, w, h, depth, mips, bpe, block, swizzle);
+                let Ok(l) = Layout::new(&desc) else { continue };
+                for (window, most) in [(1024u64, 32usize), (256, 4), (1 << 20, 1000)] {
+                    let r = l.sample_ranges(window, most);
+                    assert!(!r.is_empty() && r.len() <= most, "{desc:?}");
+                    let bytes: u64 = r.iter().map(|x| x.1).sum();
+                    assert!(bytes <= window * most as u64, "{desc:?}");
+                    for pair in r.windows(2) {
+                        assert!(pair[0].0 + pair[0].1 < pair[1].0, "{desc:?}: {r:x?}");
+                    }
+                    let last = r[r.len() - 1];
+                    assert!(last.1 > 0 && last.0 + last.1 <= l.size, "{desc:?}");
+                }
+            }
+        }
+    }
+
+    /// With more mips over all slices than ranges, the ranges spread over
+    /// the slices instead of staying in the first ones.
+    #[test]
+    fn capped_ranges_spread_over_the_slices() {
+        let l = Layout::new(&plane(Dimension::Tex2d, 256, 256, 64, 9, 4, 1, Swizzle::SW_64KB_D)).unwrap();
+        let r = l.sample_ranges(512, 16);
+        let slices: Vec<u64> = r.iter().map(|&(at, _)| at / l.slice_size).collect();
+        assert_eq!(slices.first(), Some(&0));
+        assert!(*slices.last().unwrap() >= 56, "{slices:?}");
     }
 }
