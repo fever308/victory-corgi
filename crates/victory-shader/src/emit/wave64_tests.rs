@@ -133,7 +133,7 @@ fn lowered_on(
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
-        group_split: 1,
+        group_split: lowered.group_split,
         half_views: lowered.half_views,
     })
 }
@@ -532,4 +532,90 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// A two-wave `[8, 16, 1]` Wave64 compute shader (like `AlphaCBPPPC`, `f133e35efed2a48a`)
+/// split into two 64-lane host groups along Z (`group_split = 2`). Each wave runs a
+/// cross-half `WAVE_OR` inside a wave-wide divergent branch and writes its result to
+/// `uav[wave]` using guest `SV_GroupThreadID` (`v0 = x`, `v1 = y`). Before fixing
+/// `console_thread` / `exchange_pair`, wave 1 (`groupId.z % 2 == 1`) indexed `lds[2..4]`
+/// out of bounds instead of `lds[0..2]`.
+#[test]
+fn group_split_two_wave_exchange_and_guest_thread_ids() {
+    let mut words = vec![
+        0x3408_0283, // v_lshlrev_b32 v4, 3, v1       (y * 8; v4 survives WAVE_OR_V7_TO_S7)
+        0x3808_0104, // v_or_b32 v4, v4, v0           (flat = y * 8 + x in 0..127)
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x360C_08BF, // v_and_b32 v6, 63, v4          (lane = flat & 63)
+        0x2C0C_0C81, // v_lshrrev_b32 v6, 1, v6       (lane >> 1)
+        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5      (1 << (lane >> 1))
+        0x7D88_0800, // v_cmp_gt_u32 vcc, s0, v4      (flat < s0)
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | 25, // s_cbranch_execz to restore of EXEC
+    ];
+    words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+    words.extend_from_slice(&[
+        0x2C06_0886, // v_lshrrev_b32 v3, 6, v4       (wave = flat >> 6 in 0..1)
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3       (byte offset = wave * 4)
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18 | 1 << 12, // buffer_store_dword v0, v3, s[8:11], 0 offen
+        0x80 << 24 | 2 << 16 | 3,          // vaddr=v3, vdata=v0, srsrc=s[8:11], soffset=0
+        0xBEFE_040C,                       // s_mov_b64 exec, s[12:13]
+    ]);
+    let mut native = native_of(&words, true, 128);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: (5 << 1) | (1 << 11), // 5 user SGPRs + v0(x), v1(y)
+        threads: [8, 16, 1],
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the skip");
+    let shader = lower::with_group_split(|| lowered(&native, &p, &HashSet::from([branch])))
+        .expect("lower with group_split");
+    assert_eq!(shader.group_split, 2);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    for (limit, want0, want1) in [
+        (0u32, 0u32, 0u32),
+        (32, 0x0000_FFFF, 0),
+        (96, 0xFFFF_FFFF, 0x0000_FFFF),
+        (112, 0xFFFF_FFFF, 0x00FF_FFFF),
+        (128, 0xFFFF_FFFF, 0xFFFF_FFFF),
+    ] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = limit;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, shader.group_split],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(
+            (out[0][0], out[0][1]),
+            (want0, want1),
+            "limit={limit}: wave 0 and wave 1 must exchange independently with exact guest thread IDs"
+        );
+    }
 }

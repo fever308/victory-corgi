@@ -201,7 +201,8 @@ fn translate(container: &[u8], hash: &str) -> Result<Translated, String> {
     #[cfg(feature = "diagnostics")]
     let host = if crate::debugger::trace::traced(hash) {
         tracing::info!(hash, "shader translated traced (VICTORY_SHADER_TRACE)");
-        victory_shader::emit::with_trace(|| victory_shader::emit::translate(container)).map_err(|e| e.to_string())?
+        victory_shader::emit::with_trace(|| victory_shader::emit::translate_for_hash(container, hash))
+            .map_err(|e| e.to_string())?
     } else {
         crate::shader_cache::host_shader(container)?
     };

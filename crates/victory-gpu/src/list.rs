@@ -711,9 +711,11 @@ fn new_list(
         #[cfg(windows)]
         gate: Vec::new(),
     });
-    #[cfg(not(windows))]
-    let _ = pipeline;
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    if hr == S_OK {
+        crate::pipeline::bound(pipeline);
+    }
+    hr
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -782,8 +784,9 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         host.reset();
         state.reset(pipeline);
     });
+    crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
-    let _ = (this, pipeline);
+    let _ = this;
     S_OK
 }
 
@@ -972,6 +975,11 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+/// Copies left out because both sides were one host texture
+/// ([`copy_resource`], [`copy_texture_region`]), since the start.
+#[cfg(windows)]
+pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -985,6 +993,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if unlike(dst, src) {
                 return;
             }
+            // Two title textures over the same memory have one host texture
+            // between them: the copy would be of that texture onto itself,
+            // which D3D12 forbids and which changes nothing. Only the two
+            // state changes and the copy are left out; what is noted of the
+            // textures stays as it was (after a2537066 / triippywhale 6e502b3b).
+            let same =
+                windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from);
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
@@ -996,9 +1011,21 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // A destination made level by level gets its levels' memory
             // ahead of this list (`crate::tiles`).
             crate::texture::card_writes(list, dst, to, None);
+            crate::texture::host_written(dst);
+            if same {
+                SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        ?dst,
+                        ?src,
+                        "a copy between two title textures that share one host texture is left out: the first one"
+                    );
+                });
+                return;
+            }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             list.mark_work();
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
@@ -1093,6 +1120,8 @@ extern "system" fn copy_texture_region(
             return;
         }
         let mut from = src;
+        // Both sides are the same subresource of one host texture (set below).
+        let mut same = false;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -1121,11 +1150,21 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            // The same subresource of one host texture on both sides (two
+            // title textures over one memory): not a copy the host allows.
+            // The states and the copy are left out below; the rest is
+            // noted as before.
+            same = texture.as_raw() == to.as_raw()
+                && src.kind != FOOTPRINT
+                && dst.kind != FOOTPRINT
+                && src.footprint.offset as u32 == dst.footprint.offset as u32;
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            if !same {
+                ensure_state(list, src.resource, COPY_SOURCE);
+            }
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
@@ -1136,8 +1175,12 @@ extern "system" fn copy_texture_region(
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
-        ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
+        if same {
+            SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        ensure_state(list, dst.resource, COPY_DEST);
         list.mark_work();
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
@@ -2345,6 +2388,119 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tracing::{Event, Metadata, Subscriber, span};
+
+    struct PipelineBinds(Arc<AtomicUsize>);
+
+    impl Subscriber for PipelineBinds {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.is_event()
+                && metadata.target() == "victory_gpu::pipeline"
+                && metadata.fields().field("pipeline").is_some()
+                && metadata.fields().field("frame").is_some()
+        }
+
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            unreachable!()
+        }
+
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            if self.enabled(event.metadata()) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn lists_bind_the_initial_pipeline_on_creation() {
+        use crate::pipeline::{ComputeHead, create_compute};
+
+        // A synthetic compute description matching the public ABI.
+        #[repr(C)]
+        struct ComputeDesc {
+            root: This,
+            code: *const u8,
+            size: usize,
+        }
+
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let desc = ListDesc {
+            kind: 0,
+            flags: 0,
+            nodes: 0,
+            barrier_batch: 0,
+        };
+        let bytes = [0xa5, 0xb6, 0xc7];
+        let compute = ComputeDesc {
+            root: null,
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        let compute = std::ptr::from_ref(&compute).cast::<ComputeHead>();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let binds = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing::Dispatch::new(PipelineBinds(binds.clone()));
+
+        tracing::dispatcher::with_default(&subscriber, || {
+            for console in [false, true] {
+                let create = |pipeline, out| {
+                    if console {
+                        create_list_x(null, &desc, allocator, pipeline, &LIST_IIDS[1], out)
+                    } else {
+                        create_list(null, 0, 0, allocator, pipeline, &LIST_IIDS[1], out)
+                    }
+                };
+                let mut pipeline = null;
+                let mut list = null;
+                assert_eq!(
+                    create_compute(null, compute, &PAGEABLE_IIDS[0], &mut pipeline),
+                    S_OK
+                );
+                let before = binds.load(Ordering::Relaxed);
+
+                assert_eq!(create(null, &mut list), S_OK);
+                assert_eq!(binds.load(Ordering::Relaxed), before);
+                assert_eq!(release(list), 0);
+
+                assert_eq!(create(pipeline, &mut list), S_OK);
+                assert_eq!(binds.load(Ordering::Relaxed), before + 1);
+                assert_eq!(release(list), 0);
+                assert_eq!(release(pipeline), 0);
+            }
+            // Reset also logs initial pipeline binding for parity with creation.
+            let mut pipeline = null;
+            let mut list = null;
+            assert_eq!(
+                create_compute(null, compute, &PAGEABLE_IIDS[0], &mut pipeline),
+                S_OK
+            );
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            let before = binds.load(Ordering::Relaxed);
+            assert_eq!(close(list), S_OK);
+            assert_eq!(reset(list, allocator, pipeline), S_OK);
+            assert_eq!(binds.load(Ordering::Relaxed), before + 1);
+            assert_eq!(release(list), 0);
+            assert_eq!(release(pipeline), 0);
+        });
+        assert_eq!(release(allocator), 0);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

@@ -198,6 +198,40 @@ fn windows() -> bool {
         && !crate::drvwatch::tripped()
 }
 
+/// Whether a single record that misses its window is gathered: given a
+/// slot that the list's prelude fills in one pass with the list's other
+/// such records, in place of a pass of ours in front of its draw
+/// (`crate::indirect::gather`; `VICTORY_INDIRECT_GATHER=1`; `alt`: twenty
+/// seconds with, twenty without, in turn, each change said in the log).
+/// Off by default. Needs [`windows`].
+fn gathers() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_INDIRECT_GATHER").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "single indirect records are gathered for their list's prelude from now (VICTORY_INDIRECT_GATHER=alt): {}",
+                    if on { "ON" } else { "off, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Records served from gathered slots vs asked and got none (`VICTORY_INDIRECT_GATHER=1`).
+static GATHER_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Constant buffer views in descriptor tables are views of the buffer's
 /// host copy when it has one at a 256-byte boundary, not a copy of title
 /// memory filled on the CPU at submission: a fill of memory that a flight
@@ -2808,6 +2842,16 @@ impl State {
         }
     }
 
+    /// Whether the shaders of the pipeline bound now can store to buffers
+    /// (or the pipeline is not known): a draw with them may write the
+    /// arguments of draws after it, which ends a list's gathering
+    /// (`crate::indirect::gather`). The same test keeps such a draw out of
+    /// a window ([`windows`]).
+    fn may_store(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.seen_gone();
@@ -2816,6 +2860,7 @@ impl State {
         }
         // It may write the arguments a window holds clamped.
         self.window = None;
+        list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3223,6 +3268,9 @@ impl State {
     /// them; else the first 65,535.
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         self.window = None;
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let rows = crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.mesh_rows());
@@ -3692,6 +3740,9 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3801,6 +3852,9 @@ impl State {
         first_instance: u32,
     ) {
         self.window = None;
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3958,6 +4012,9 @@ impl State {
                 tracing::info!(amplified = n, left = AMPLIFIED[1].load(Ordering::Relaxed), "one-record indirect mesh draws through the amplification stage (VICTORY_INDIRECT_AMPLIFY=1); left: a buffer shaders cannot write, or an odd offset");
             }
             if fits {
+                if p.stages.iter().any(|stage| stage.translated().stores) {
+                    list.gather_close();
+                }
                 args.refresh(list, arguments, len);
                 // (`VICTORY_AMPLIFY_WAIT=0`, experiment: no barrier for
                 // earlier shader writes before each such draw.)
@@ -4055,6 +4112,11 @@ impl State {
             None
         };
         let inline = before.is_none();
+        // Whether `crate::indirect::done` must transition `bounded` back from
+        // `INDIRECT_ARGUMENT` to `COMMON` after `ExecuteIndirect` (false for
+        // hoisted clamps and for gathered scratch buffers, which `HostList::close`
+        // transitions once at list close).
+        let mut needs_done = inline;
         // A program that reads its group id in x: where it takes the first
         // group of the dispatch (root parameter, dword), and where the
         // second records begin once they are made. (Dispatches are never
@@ -4065,6 +4127,9 @@ impl State {
         let (bounded, at) = match before {
             Some(hoisted) => {
                 self.window = None;
+                if p.stages.iter().any(|stage| stage.translated().stores) {
+                    list.gather_close();
+                }
                 hoisted
             }
             None => {
@@ -4083,6 +4148,11 @@ impl State {
                 if !windowed || list.first_use(WINDOW_USE) {
                     self.window = None;
                 }
+                if !windowed {
+                    // A dispatch, or shaders that store to buffers: arguments may
+                    // be written from here on.
+                    list.gather_close();
+                }
                 let same = |w: &Window| {
                     w.copy == args.id() && w.kind == kind && w.stride == stride && w.rows == rows.is_some()
                 };
@@ -4096,9 +4166,45 @@ impl State {
                         let step = if w.rows { u64::from(crate::indirect::ROW_STRIDE) } else { u64::from(w.step) };
                         (w.scratch.clone(), n * step)
                     });
-                match hit {
-                    Some(hit) => hit,
-                    None => {
+                // A record that misses its window: a slot the list's prelude fills,
+                // if the list still gathers ([`gathers`]).
+                let gathered = if hit.is_none() && windowed && gathers() {
+                    let slot = crate::indirect::gather(
+                        list,
+                        (&args.buffer, args.id()),
+                        offset,
+                        (clamp_kind, stride),
+                    );
+                    let n = GATHER_STATS[usize::from(slot.is_none())].fetch_add(1, Ordering::Relaxed) + 1;
+                    if slot.is_some() && n.is_power_of_two() && n >= 1 << 12 {
+                        let g = crate::indirect::GATHER_NONE
+                            .each_ref()
+                            .map(|c| c.load(Ordering::Relaxed));
+                        tracing::info!(
+                            gathered = n,
+                            missed = GATHER_STATS[1].load(Ordering::Relaxed),
+                            no_fit = g[0],
+                            closed = g[1],
+                            too_many_buffers = g[2],
+                            set_full = g[3],
+                            no_buffer = g[4],
+                            "scattered indirect records gathered for list preludes (VICTORY_INDIRECT_GATHER=1)"
+                        );
+                    }
+                    slot
+                } else {
+                    None
+                };
+                match (hit, gathered) {
+                    (Some(hit), _) => hit,
+                    (None, Some((scratch, at))) => {
+                        // The record's bytes are up to date when the list is
+                        // submitted, as for a record clamped in the list.
+                        args.refresh(list, arguments, len);
+                        needs_done = false;
+                        (scratch, at)
+                    }
+                    (None, None) => {
                         // A record a short step after the last window's last one
                         // (the same step as that window's, if it had one): the
                         // title walks the buffer, so the ones that step apart
@@ -4169,7 +4275,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            if inline {
+            if needs_done {
                 crate::indirect::done(list, &bounded);
             }
             why("prepare failed");
@@ -4228,7 +4334,7 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        if inline {
+        if needs_done {
             crate::indirect::done(list, &bounded);
         }
         if kind == DISPATCH {

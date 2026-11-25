@@ -364,25 +364,41 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    translate_with(
+    translate_for_hash(container, "")
+}
+
+/// As [`translate`], with the 16-hex-character container hash available for
+/// shader-specific Wave32 exact-lowering overrides (such as `AlphaCBPPPC`).
+pub fn translate_for_hash(container: &[u8], hash: &str) -> Result<HostShader, ShaderError> {
+    translate_with_hash(
         container,
         Options {
             view_marks: view_marks_enabled(),
         },
+        hash,
     )
 }
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
-    match translate_plain(container, options) {
+    translate_with_hash(container, options, "")
+}
+
+/// [`translate_with`] with the container hash available.
+pub fn translate_with_hash(
+    container: &[u8],
+    options: Options,
+    hash: &str,
+) -> Result<HostShader, ShaderError> {
+    match translate_plain(container, options, hash) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
-            lower::with_first_half_pairs(|| translate_plain(container, options))
+            lower::with_first_half_pairs(|| translate_plain(container, options, hash))
         }
         other => other,
     }
 }
 
-fn translate_plain(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+fn translate_plain(container: &[u8], options: Options, hash: &str) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -406,7 +422,7 @@ fn translate_plain(container: &[u8], options: Options) -> Result<HostShader, Sha
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with(&c, &native, &p, &st, &io, &res, options)
+    emit_with_hash(&c, &native, &p, &st, &io, &res, options, hash)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -418,7 +434,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    emit_with(
+    emit_with_hash(
         c,
         native,
         p,
@@ -428,6 +444,7 @@ pub fn emit(
         Options {
             view_marks: view_marks_enabled(),
         },
+        "",
     )
 }
 
@@ -440,6 +457,21 @@ pub fn emit_with(
     io: &io::Io,
     res: &resource::Resources,
     options: Options,
+) -> Result<HostShader, ShaderError> {
+    emit_with_hash(c, native, p, st, io, res, options, "")
+}
+
+/// [`emit_with`] with the container hash available.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_with_hash(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+    hash: &str,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -549,6 +581,23 @@ pub fn emit_with(
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
                         }
+                    }
+                }
+                // AlphaCBPPPC uses Wave64 across divergent branches, but its two
+                // waves share no LDS or group barrier. Split them into separate
+                // host groups (`group_split = 2`) before the approximate local-waves
+                // fallback can take over on Wave32 hosts (after upstream fedad73b).
+                if hash == "f133e35efed2a48a"
+                    && group_sync() != 0
+                    && std::env::var_os("VICTORY_CASCADE_SPLIT_WAVE").is_none_or(|v| v != "0")
+                    && matches!(&native.io, crate::native::StageIo::Cs(cs)
+                        if cs.threads == [8, 16, 1] && cs.lds_bytes() == 0)
+                    && !p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+                {
+                    let again = widen(c, native, p, why, options);
+                    report("one console wave per host group (AlphaCBPPPC)", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
                     }
                 }
                 if strict {

@@ -4146,12 +4146,16 @@ impl<'a> Lower<'a> {
         Some(base)
     }
 
-    /// The console thread index of this thread in the group: `wave_base` plus the host lane
-    /// (host waves of 32), else the wave's first thread index rounded down plus the lane.
+    /// The console thread index of this thread within its host group:
+    /// `wave_base` plus the host lane (host waves of 32), else the wave's first
+    /// thread index rounded down plus the lane. (When `self.split > 1`, each
+    /// host group holds one 64-lane console wave, so this stays in `0..63` for
+    /// `exchange_pair` and `console_lane`; guest `SV_GroupThreadID` adds the
+    /// wave offset via [`Self::split_thread`] in [`Self::thread_id`].)
     fn console_thread(&mut self) -> V {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let t = if let Some(base) = self.wave_base() {
+        if let Some(base) = self.wave_base() {
             self.s.m.bin(e, Bin::Add, base, lane)
         } else {
             let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
@@ -4160,8 +4164,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i32(!(wave - 1));
             let base = self.s.m.bin(e, Bin::And, first, mask);
             self.s.m.bin(e, Bin::Add, base, lane)
-        };
-        self.split_thread(t)
+        }
     }
 
     /// With [`Self::split`]: a thread index within the host group (0..63) as its index in the
@@ -4704,6 +4707,7 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         if self.halves.is_some() {
             let f = self.console_thread();
+            let f = self.split_thread(f);
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
             return Val::I32(match c {
@@ -4736,6 +4740,7 @@ impl<'a> Lower<'a> {
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.lane_index();
         let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let f = self.split_thread(f);
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
