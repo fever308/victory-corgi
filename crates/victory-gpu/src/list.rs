@@ -345,6 +345,73 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
 /// its place in the part: a queue waiting for it starts later than on the
 /// console, never earlier, and nothing can wait for itself that way (a
 /// part has no wait after its first work).
+/// Finishes any open hoisted-clamp list on `state` and appends it to
+/// `earlier` ahead of `host`.
+#[cfg(windows)]
+fn finish_hoist(
+    earlier: &mut Vec<Part>,
+    gate: &mut Vec<ValueWait>,
+    state: &mut crate::draw::State,
+) {
+    if let Some(clamps) = state.end_hoist() {
+        let waits = std::mem::take(gate);
+        earlier.push(Part { waits, host: clamps });
+    }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`, opt-in): unless the
+/// clamps of the list's draws already go to a list before it and nothing since
+/// may have written arguments, the recording is cut here; a list for the
+/// clamps of the draws to come follows what was recorded, and the recording
+/// goes on in another list after it, with the state the title set.
+#[cfg(windows)]
+fn hoist(this: This) {
+    if !crate::indirect::hoisting() || this.is_null() {
+        return;
+    }
+    // SAFETY: one of our lists; the title uses it on one thread at a time,
+    // and no reference to the host list is in use here.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(current) = list.host.as_ref() else {
+        return;
+    };
+    if state.hoists_into(current) {
+        return;
+    }
+    finish_hoist(&mut list.earlier, &mut list.gate, &mut state);
+    crate::indirect::CUTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(next) = fresh_list() else {
+        return;
+    };
+    // What was recorded keeps its place; with no work in it, it holds the
+    // clamps itself (the state set in it does them no harm).
+    let needs_separate = list
+        .host
+        .as_ref()
+        .is_some_and(|h| !h.untouched() || crate::indirect::hoist_mode() == 5);
+    let clamps = if needs_separate {
+        let Some(clamps) = fresh_list() else {
+            return;
+        };
+        if let Some(old) = list.host.replace(next) {
+            old.close();
+            let waits = std::mem::take(&mut list.gate);
+            list.earlier.push(Part { waits, host: old });
+        }
+        clamps
+    } else {
+        let Some(old) = list.host.replace(next) else {
+            return;
+        };
+        old
+    };
+    if let Some(next) = list.host.as_ref() {
+        state.replay(next);
+        state.hoist(clamps, next);
+    }
+}
+
 #[cfg(windows)]
 fn cut(this: This, wait: ValueWait) {
     if this.is_null() {
@@ -353,6 +420,10 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    {
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        finish_hoist(&mut list.earlier, &mut list.gate, &mut state);
+    }
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -669,8 +740,16 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
-        host.close();
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        {
+            let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+            finish_hoist(&mut list.earlier, &mut list.gate, &mut state);
+        }
+        if let Some(host) = list.host.as_ref() {
+            host.close();
+        }
     }
     S_OK
 }
@@ -694,6 +773,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         // SAFETY: the title passes one of our lists, and neither records
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        let _ = list.state.lock().unwrap_or_else(|e| e.into_inner()).end_hoist();
         list.earlier.clear();
         list.gate.clear();
     }
@@ -870,6 +950,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        list.count_write();
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -927,6 +1008,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            list.count_write();
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -1361,6 +1443,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && dst != 0
         && src != 0
     {
+        list.count_write();
         let len = len as usize;
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
@@ -1763,6 +1846,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        if kind != DISPATCH {
+            hoist(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });

@@ -2118,21 +2118,20 @@ fn host_texture(
     host_texture_as(desc, state, clear, false)
 }
 
-/// [`host_texture`]; `reserved`: without memory of its own, to be given
-/// tiles level by level (`crate::tiles`).
+/// The host description for a title texture: strips console layout and flags,
+/// drops UAV on depth targets (which get a colour twin), maps refused target
+/// formats to stand-ins, turns sRGB UAV textures typeless, and drops UAV on
+/// formats that have neither a typeless family nor host typed-UAV support.
 #[cfg(windows)]
-fn host_texture_as(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-    reserved: bool,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    use windows::Win32::Graphics::Direct3D12::*;
+fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    const DENY_SHADER_RESOURCE: u32 = 8;
     if desc.dimension == BUFFER {
         return None;
     }
-    let host = crate::host::host()?;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -2141,8 +2140,6 @@ fn host_texture_as(
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // The host copy loses the unordered access: shaders write a colour
     // twin instead ([`Twin`]).
-    const DEPTH: u32 = 2;
-    const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
         if d.flags & UNORDERED != 0 {
             DEPTH_UNORDERED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2150,11 +2147,9 @@ fn host_texture_as(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
-    const TARGET: u32 = 1;
     if d.flags & (TARGET | UNORDERED) != 0 {
         d.format = target_format(d.format);
     }
-    const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
     {
@@ -2165,6 +2160,42 @@ fn host_texture_as(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // A texture made with the unordered flag needs a format the host can
+    // make a typed unordered view of. One without a family that could stand
+    // in (some console formats the title names, e.g. B5G6R5 / B5G5R5A1)
+    // removes the device at `GetResourceAllocationInfo`; make it without
+    // the flag instead, and its unordered views are refused later
+    // (`descriptor::host::fits`).
+    if d.flags & UNORDERED != 0
+        && family(d.format) == d.format
+        && !crate::descriptor::host::typed_store(d.format)
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                format = d.format,
+                "no unordered access for this format: textures are made without it, their unordered views are refused"
+            );
+        });
+        d.flags &= !UNORDERED;
+    }
+    Some(d)
+}
+
+/// [`host_texture`]; `reserved`: without memory of its own, to be given
+/// tiles level by level (`crate::tiles`).
+#[cfg(windows)]
+fn host_texture_as(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+    reserved: bool,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    const TARGET: u32 = 1;
+    const UNORDERED: u32 = 4;
+    let host = crate::host::host()?;
+    let mut d = host_desc(desc)?;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
@@ -2683,6 +2714,36 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[cfg(windows)]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Width, height and format of texture `this` (`None` for a buffer), for
+/// `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension != BUFFER).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer or a texture with planes.
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
 }
 
 /// The bytes of title memory a texture with the resource description
@@ -4117,5 +4178,41 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// A texture asked for with the unordered flag in a format the host has no
+    /// typed UAV for and no family/stand-in to substitute (e.g. B5G6R5 = 85)
+    /// is made without the flag instead of removing the device; a UAV-capable
+    /// format keeps it.
+    #[cfg(windows)]
+    #[test]
+    fn a_format_without_unordered_access_loses_the_flag() {
+        const UNORDERED: u32 = 4;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let texture = |format| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1 | UNORDERED,
+        };
+        if !crate::descriptor::host::typed_store(85) {
+            let host = host_desc(&texture(85)).unwrap();
+            assert_eq!(host.flags & UNORDERED, 0, "85 has no typed UAV");
+            assert_eq!(host.format, 85, "and no family to stand in");
+        }
+        // A format whose type can be stored to keeps the flag.
+        if crate::descriptor::host::typed_store(28) {
+            let host = host_desc(&texture(28)).unwrap();
+            assert_eq!(host.flags & UNORDERED, UNORDERED, "28 keeps the flag");
+        }
     }
 }

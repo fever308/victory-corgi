@@ -872,7 +872,7 @@ pub(crate) fn frame_count() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(windows, feature = "diagnostics"))]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }

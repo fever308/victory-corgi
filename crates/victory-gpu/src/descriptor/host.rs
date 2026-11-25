@@ -411,12 +411,70 @@ impl Spans {
 /// [`REMAPPED`] so that what such writes do is counted by itself.
 static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
-/// pass took them; of those, the slots whose texture had been uploaded
-/// before the write (out of the queue, or in it after an upload): they are
-/// the ones that kept the bytes from before, and the ones made due when
-/// `VICTORY_PAGE_WRITES` asks for it.
+/// The most ranges kept between texture passes.
+const MOST_TEXTURE_CHANGES: usize = 1 << 15;
+/// Leave room for a burst of new ranges after compacting under the queue lock.
+const TEXTURE_CHANGE_HEADROOM: usize = MOST_TEXTURE_CHANGES / 8;
+
+/// Keeps a pending texture change. Returns the number of gaps included to
+/// stay within the limit after merging overlaps.
+fn keep_texture_change(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> usize {
+    if start >= end {
+        return 0;
+    }
+    if let Some(last) = ranges.last_mut()
+        && start <= last.1
+        && last.0 <= end
+    {
+        *last = (last.0.min(start), last.1.max(end));
+        return 0;
+    }
+    let mut gaps = 0;
+    if ranges.len() == MOST_TEXTURE_CHANGES {
+        coalesce_texture_changes(ranges);
+        let len = ranges.len();
+        gaps = len.saturating_sub(MOST_TEXTURE_CHANGES - TEXTURE_CHANGE_HEADROOM);
+        if gaps != 0 {
+            // Join enough disjoint pairs to leave headroom. The next pass
+            // may check a texture in a gap, but every change is retained.
+            for i in 0..gaps {
+                ranges[i] = (ranges[2 * i].0, ranges[2 * i + 1].1);
+            }
+            ranges.copy_within(2 * gaps.., gaps);
+            ranges.truncate(len - gaps);
+        }
+    }
+    ranges.push((start, end));
+    gaps
+}
+
+/// Sort and replace each run of touching or overlapping ranges with its
+/// union. Texture lookups then visit each changed area together.
+fn coalesce_texture_changes(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    let mut kept = 0;
+    for i in 0..ranges.len() {
+        let (start, end) = ranges[i];
+        if kept != 0 && start <= ranges[kept - 1].1 {
+            ranges[kept - 1].1 = ranges[kept - 1].1.max(end);
+        } else {
+            ranges[kept] = (start, end);
+            kept += 1;
+        }
+    }
+    ranges.truncate(kept);
+}
+
+fn take_texture_changes(pending: &Mutex<Vec<(u64, u64)>>) -> Vec<(u64, u64)> {
+    let mut ranges = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+    coalesce_texture_changes(&mut ranges);
+    ranges
+}
+
+/// Since the start: notification ranges; gaps included at capacity;
+/// slots of placed textures that held bytes of those ranges when a pass
+/// took them; and slots whose texture was already uploaded before the
+/// write. The last group is made due when `VICTORY_PAGE_WRITES` asks.
 pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
@@ -432,25 +490,16 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let gaps = keep_texture_change(&mut ranges, start, end);
+    if gaps != 0 {
+        PAGE_WRITES[1].fetch_add(gaps as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -467,8 +516,8 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
-/// ranges; and made slots whose memory was found unmapped (made null).
+/// gaps included at capacity; slots made due by the ranges; and made
+/// slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -494,39 +543,23 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let gaps = keep_texture_change(&mut ranges, start, end);
+    if gaps != 0 {
+        STALE[2].fetch_add(gaps as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound: a
-        // loading screen). Cleared here, as they were, the slots of every
-        // texture streamed into the place of another in the meantime went
-        // on showing the old one (98,304 ranges dropped in each run of
-        // 20261124, all while the world loaded): joined instead into fewer,
-        // wider ranges, which make a few more slots due than need be.
-        let before = ranges.len();
-        coarsen(&mut ranges, MOST / 2);
-        STALE[2].fetch_add((before - ranges.len()) as u64, Relaxed);
-    }
-    ranges.push((start, end));
 }
 
 /// Joins `ranges` until at most `most` are left: first the ones that
 /// overlap or touch, then those with the smallest gaps between them, by
 /// gaps of 64 KiB, then 128 KiB, and so on. What the joined ranges cover
 /// takes in all that the ranges did.
+#[cfg(test)]
 fn coarsen(ranges: &mut Vec<(u64, u64)>, most: usize) {
     ranges.sort_unstable();
     let mut gap = 0u64;
@@ -1171,8 +1204,21 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
+        // Releases come all the time and each resets `too_long`, allowing a
+        // full search again: cap failed walks per frame so a fragmented heap
+        // cannot stall a frame for seconds.
+        static FAILED: [std::sync::atomic::AtomicU64; 2] = [
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ];
+        const WALKS: u64 = 8;
+        let frame = crate::queue::presented();
+        if FAILED[0].swap(frame, std::sync::atomic::Ordering::Relaxed) != frame {
+            FAILED[1].store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
-            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
+            && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed)
+            && FAILED[1].load(std::sync::atomic::Ordering::Relaxed) < WALKS;
         let n = n as usize;
         // Search from `next` on, then from the start.
         let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
@@ -1194,6 +1240,7 @@ impl HostHeap {
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                FAILED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
@@ -1336,7 +1383,7 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let ranges = take_texture_changes(&REMAPPED);
         if ranges.is_empty() {
             return 0;
         }
@@ -1371,7 +1418,7 @@ impl HostHeap {
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
     fn texture_slots_page_written(&self, frame: u64) -> usize {
-        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        let ranges = take_texture_changes(&PAGE_WRITTEN);
         if ranges.is_empty() {
             return 0;
         }
@@ -2099,7 +2146,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_view_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -3489,6 +3536,33 @@ fn buffer_uav(
     Some(Kept::Shadow(shadow))
 }
 
+/// Whether the host stores to typed unordered views of `format`.
+pub(crate) fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -3631,6 +3705,23 @@ fn twin_uav(
     Some(desc)
 }
 
+/// The size of a constant buffer view the host takes: 256-byte steps, and
+/// at most 4,096 vectors (65,536 bytes, `D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT`).
+/// The title names constant views of more (one of 1,306,368 bytes, in the
+/// world); `CreateConstantBufferView` with such a size is an invalid call,
+/// and NVIDIA removes the device for it (`DXGI_ERROR_INVALID_CALL`), in
+/// the frame the view is made. A shader reads at most 4,096 vectors through
+/// a constant view, so nothing it can read is lost.
+fn constant_view_size(size: u32) -> u32 {
+    const MOST: u32 = 4096 * 16;
+    // Capped before rounding: a size within 255 of u32::MAX would overflow.
+    if size > MOST {
+        once!(size, "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)");
+        return MOST;
+    }
+    size.max(1).next_multiple_of(256)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3649,7 +3740,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_view_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -4496,6 +4587,79 @@ mod tests {
         let mut touching = vec![(8, 12), (0, 4), (4, 6)];
         coarsen(&mut touching, 1000);
         assert_eq!(touching, [(0, 6), (8, 12)]);
+    }
+
+    /// A constant view is made in 256-byte steps and at most 64 KiB, the
+    /// most the host takes (a larger size removes the device on NVIDIA).
+    #[test]
+    fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(16), 256);
+        assert_eq!(constant_view_size(256), 256);
+        assert_eq!(constant_view_size(65_536), 65_536);
+        assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
+        assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
+    }
+
+    #[test]
+    fn disjoint_texture_changes_keep_coverage_at_capacity() {
+        let pending = Mutex::new(Vec::new());
+        let count = 2 * MOST_TEXTURE_CHANGES;
+        {
+            let mut ranges = pending.lock().unwrap();
+            for i in (0..count as u64).rev() {
+                keep_texture_change(&mut ranges, 3 * i, 3 * i + 1);
+                assert!(ranges.len() <= MOST_TEXTURE_CHANGES);
+            }
+        }
+        let ranges = take_texture_changes(&pending);
+        let mut covering = ranges.iter();
+        let mut next = covering.next();
+        for start in (0..3 * count as u64).step_by(3) {
+            while next.is_some_and(|&(_, end)| end <= start) {
+                next = covering.next();
+            }
+            assert!(next.is_some_and(|&(from, end)| from <= start && end > start), "lost change at {start}");
+        }
+    }
+
+    #[test]
+    fn a_nearly_disjoint_texture_burst_leaves_room_after_compaction() {
+        let mut ranges = Vec::new();
+        for i in 0..(MOST_TEXTURE_CHANGES - 1) as u64 {
+            keep_texture_change(&mut ranges, 3 * i, 3 * i + 1);
+        }
+        // The duplicate gives exact coalescing only one slot to reclaim.
+        keep_texture_change(&mut ranges, 0, 1);
+        assert_eq!(ranges.len(), MOST_TEXTURE_CHANGES);
+        let next = 3 * (MOST_TEXTURE_CHANGES - 1) as u64;
+        assert_eq!(keep_texture_change(&mut ranges, next, next + 1), TEXTURE_CHANGE_HEADROOM - 1);
+        assert_eq!(ranges.len(), MOST_TEXTURE_CHANGES - TEXTURE_CHANGE_HEADROOM + 1);
+    }
+
+    #[test]
+    fn coalescing_intersecting_changes_preserves_affected_texture_slots() {
+        let mut spans = Spans::default();
+        for slot in 0..6 {
+            let start = (u64::from(slot) + 1) * 0x2000;
+            spans.note(slot, start, start + 0x5000, true);
+        }
+        let slots_in = |ranges: &[(u64, u64)]| {
+            ranges.iter().flat_map(|&(start, end)| spans.slots_in(start, end))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let slots_holding = |ranges: &[(u64, u64)]| {
+            ranges.iter().flat_map(|&(start, end)| spans.slots_holding(start, end))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let mut ranges = vec![
+            (0xc000, 0xc100), (0x4000, 0x5000), (0x3800, 0x4000),
+            (0x3800, 0x4000), (0xc070, 0xd000), (0x3a00, 0x4600),
+        ];
+        let expected = (slots_in(&ranges), slots_holding(&ranges));
+        coalesce_texture_changes(&mut ranges);
+        assert_eq!(ranges, [(0x3800, 0x5000), (0xc000, 0xd000)]);
+        assert_eq!((slots_in(&ranges), slots_holding(&ranges)), expected);
     }
 
     /// Slots held back for lack of room on the card are not handed out

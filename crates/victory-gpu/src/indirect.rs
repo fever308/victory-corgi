@@ -28,7 +28,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -44,6 +44,10 @@ cbuffer Record : register(b0) {
     // shader reads), then the groups as rows of at most 65,535.
     uint has_count;
     uint count_offset;
+    // The first record this dispatch clamps: the caller dispatches one group
+    // per 64 records (see `record_clamp_with`), so a chunk's charges land in
+    // lane order rather than in whatever order the groups ran in.
+    uint base;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -60,16 +64,19 @@ static const uint BUDGET = 1u << 31;
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
+    // The record this thread clamps: the caller runs one group per 64
+    // records, and `base` says which 64.
+    uint index = base + gi;
+    if (index >= eff_count) return;
     bool rows = (has_count & (1u << 16)) != 0;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * (rows ? 20u : stride);
+    uint src_at = args_offset + index * stride;
+    uint dst_at = index * (rows ? 20u : stride);
     uint2 row_words = uint2(0, 0);
     uint cost;
     uint2 draw_counts = uint2(0, 0);
@@ -498,7 +505,7 @@ fn record_clamp_with(
     // bit 16: mesh records as rows ([`ROWS`])
     let (kind, split, rows) = (kind & 0xff, (kind >> 8) & 0xff, (kind >> 16) & 1);
     let flags = has_count | (u32::from(ahead) << 1) | (split << 8) | (rows << 16);
-    let constants = [kind, stride, records, args_offset, flags, count_offset];
+    let constants = [kind, stride, records, args_offset, flags, count_offset, 0];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -542,16 +549,165 @@ fn record_clamp_with(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            // One dispatch per 64 records, each after the last: a chunk's
+            // records charge the budget in lane order, and the budget is one
+            // word the chunks would otherwise race for. D3D12 runs the groups
+            // of one dispatch in no defined order, so a single dispatch of
+            // them charged in whatever order the scheduler picked: with 128
+            // records WARP kept the second chunk's first two and emptied the
+            // first chunk's, where lane order keeps the first chunk's. The
+            // barrier between the dispatches is what makes it lane order.
+            // `chunk[6]` is the chunk's first record.
+            let mut offset: u32 = 0;
+            while offset < records {
+                let mut chunk = constants;
+                chunk[6] = offset;
+                l.SetComputeRoot32BitConstants(0, 7, chunk.as_ptr().cast(), 0);
+                l.Dispatch(1, 1, 1);
+                offset += 64;
+                if offset < records {
+                    l.ResourceBarrier(&[uav_barrier()]);
+                }
+            }
         }
         l.ResourceBarrier(&second[skip_after..]);
     }
     true
+}
+
+/// How clamps of indirect draws are recorded (`VICTORY_HOIST_CLAMPS`, opt-in):
+/// - `0` (default): off — each clamp runs inline before its draw (or via
+///   `VICTORY_INDIRECT_AMPLIFY=1` / windowed clamping, 100% intact).
+/// - `1`: in a list of their own before the list that draws, so that a run of
+///   draws is not interleaved with our dispatches.
+/// - `2`: as `1`, with a UAV barrier before each draw.
+/// - `3`: as `1` for mesh dispatches only; `4`: for draws only; `5`: always a
+///   new list for clamps; `6`: lists cut as for `1`, clamps inline.
+/// - `7` (also `"on"` / `"true"`): as `1`, with clamps run one after another
+///   (a UAV barrier between them) so mesh objects do not flicker when hitting
+///   the list's budget.
+/// Diagnostics builds also re-read it every half second from `VICTORY_HOIST_FILE`.
+pub(crate) fn hoist_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let mode = MODE.load(Ordering::Relaxed);
+    if mode == u8::MAX {
+        let set = parse_hoist_mode(std::env::var_os("VICTORY_HOIST_CLAMPS").as_deref());
+        MODE.store(set, Ordering::Relaxed);
+        if cfg!(feature = "diagnostics")
+            && let Some(file) = std::env::var_os("VICTORY_HOIST_FILE")
+        {
+            let _ = std::thread::Builder::new().name("victory-hoist".into()).spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let read = std::fs::read_to_string(&file).ok().and_then(|t| t.trim().parse::<u8>().ok());
+                    let cuts = CUTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                    if cuts != [0, 0] {
+                        tracing::info!(cuts = cuts[0], queries = cuts[1], "lists cut for hoisted clamps");
+                    }
+                    if let Some(n) = read.filter(|&n| n < 8 && n != MODE.load(Ordering::Relaxed)) {
+                        MODE.store(n, Ordering::Relaxed);
+                        tracing::info!(mode = n, "clamps of indirect draws: mode changed");
+                    }
+                }
+            });
+        }
+        return set;
+    }
+    mode
+}
+
+fn parse_hoist_mode(value: Option<&std::ffi::OsStr>) -> u8 {
+    let Some(text) = value.and_then(|v| v.to_str()) else {
+        return 0;
+    };
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("on") || trimmed.eq_ignore_ascii_case("true") {
+        return 7;
+    }
+    trimmed.parse::<u8>().ok().filter(|&n| n < 8).unwrap_or(0)
+}
+
+/// Cuts made for hoisted clamps, and those skipped for open queries.
+pub(crate) static CUTS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Whether clamps of indirect draws go to a list before the one that draws.
+pub(crate) fn hoisting() -> bool {
+    hoist_mode() != 0
+}
+
+/// As [`bound`], recorded in `clamps`, a list that runs before the one that
+/// executes: the buffer and the offset of the clamped records, readable as
+/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, budget) = (clamp()?, clamps.budget()?);
+    // SAFETY: live buffers.
+    let (src_base, count_base) =
+        unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
+    // Addresses the shader's offsets (32 bits) reach, as in `record_clamp_with`.
+    let fits = |offset: u64, len: u64| offset.checked_add(len).is_some_and(|end| end <= u64::from(u32::MAX));
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match (count, count_base) {
+        (Some((_, off)), Some(base)) if fits(off, 4) => (base, 1u32, off as u32),
+        (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
+        _ => (src_gpu, 0, 0),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let dst_bytes = scratch_bytes(kind, stride, records);
+    let (dst, at) = clamps.clamp_room(dst_bytes)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let (kind, split, rows) = (kind & 0xff, (kind >> 8) & 0xff, (kind >> 16) & 1);
+    let flags = has_count | (split << 8) | (rows << 16);
+    let constants = [kind, stride, records, args_offset, flags, count_offset, 0];
+    let l = &clamps.list;
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (writable: `clamp_room`) and budget buffers.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        let mut offset: u32 = 0;
+        while offset < records {
+            let mut chunk = constants;
+            chunk[6] = offset;
+            l.SetComputeRoot32BitConstants(0, 7, chunk.as_ptr().cast(), 0);
+            l.Dispatch(1, 1, 1);
+            offset += 64;
+            if offset < records {
+                l.ResourceBarrier(&[uav_barrier()]);
+            }
+        }
+        // Mode 7: one clamp after another, so that the budget is charged in
+        // the order of the draws as it is when each clamp precedes its draw.
+        if hoist_mode() == 7 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+    }
+    Some((dst, at))
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
