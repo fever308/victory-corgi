@@ -2177,6 +2177,11 @@ RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
 RWByteAddressBuffer marks : register(u2);
 groupshared uint4 shared_h[64];
+uint4 mix_pair(uint4 a, uint4 b) {
+    uint4 x = (a ^ (b * uint4(0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du, 0x27D4EB2Fu)))
+            * uint4(0x01000193u, 0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u);
+    return x.yzwx ^ (x >> 15);
+}
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
@@ -2206,12 +2211,9 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     shared_h[lane] = h;
     GroupMemoryBarrierWithGroupSync();
     [unroll]
-    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    for (uint stride = 32u; stride > 1u; stride >>= 1u) {
         if (active && lane < stride) {
-            uint4 a = shared_h[lane];
-            uint4 b = shared_h[lane + stride];
-            a = (a ^ b) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-            shared_h[lane] = a.yzwx ^ (a >> 15);
+            shared_h[lane] = mix_pair(shared_h[lane], shared_h[lane + stride]);
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -2219,7 +2221,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         if (!active) {
             differs.Store(out_at + idx * 4u, 0u);
         } else {
-            uint4 final_h = shared_h[0];
+            uint4 final_h = mix_pair(shared_h[0], shared_h[1]);
             if (compare != 0u) {
                 differs.Store(out_at + idx * 4u, any(final_h != hashes.Load4(piece * 16u)) ? 1u : 0u);
                 // With the copy-back on its own thread: the next compare of the

@@ -1096,6 +1096,51 @@ void main() {
             std::ptr::copy_nonoverlapping(content[PIECE..PIECE + 16].as_ptr(), now_ptr.add(PIECE + 16), 16);
         }
         assert_eq!(run(&mut warp, 1), [0, 1, 0]);
+
+        // Multi-group skewed span (5 pieces, skew 16, mutating the final byte
+        // at `size - 1`, ported from 091ad67a).
+        const SKEW_PIECES: u32 = 5;
+        const SKEW: u32 = 16;
+        let skew_size = PIECE * SKEW_PIECES as usize - SKEW as usize;
+        let (_s_now, s_now_ptr, s_now_gpu) = warp.shared_buffer(skew_size as u64);
+        let (_s_hashes, _, s_hashes_gpu) = warp.shared_buffer(16 * u64::from(SKEW_PIECES));
+        let (_s_differs, s_differs_ptr, s_differs_gpu) = warp.shared_buffer(64);
+        let s_content: Vec<u8> = (0..skew_size).map(|i| (i * 31 + i / 251) as u8).collect();
+        // SAFETY: the mapping holds `skew_size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(s_content.as_ptr(), s_now_ptr, skew_size) };
+        let run_skew = |warp: &mut WarpHarness, mode: u32| -> [u32; SKEW_PIECES as usize] {
+            // SAFETY: open list, live buffers, compare's root signature.
+            unsafe {
+                for piece in 0..SKEW_PIECES as usize {
+                    s_differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, SKEW, skew_size as u32, SKEW_PIECES, 0, mode, u32::MAX];
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, s_now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, s_hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, s_differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, s_differs_gpu);
+                warp.list.Dispatch(SKEW_PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            std::array::from_fn(|piece| unsafe { s_differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        let last_at = skew_size - 1;
+        let unchanged = [0; SKEW_PIECES as usize];
+        let changed = [0, 0, 0, 0, 1];
+        assert_eq!(run_skew(&mut warp, 0), [7; SKEW_PIECES as usize]);
+        assert_eq!(run_skew(&mut warp, 1), unchanged);
+        // SAFETY: `last_at` is inside the mapped buffer.
+        unsafe { s_now_ptr.add(last_at).write_volatile(s_content[last_at] ^ 0x40) };
+        assert_eq!(run_skew(&mut warp, 2), changed);
+        assert_eq!(run_skew(&mut warp, 2), unchanged);
+        // SAFETY: restore byte and confirm mode 2 detects the revert.
+        unsafe { s_now_ptr.add(last_at).write_volatile(s_content[last_at]) };
+        assert_eq!(run_skew(&mut warp, 2), changed);
+        assert_eq!(run_skew(&mut warp, 2), unchanged);
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
