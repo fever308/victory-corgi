@@ -72,6 +72,15 @@ fn promote_frames() -> u32 {
     })
 }
 
+/// Whether internal runtime materializations contribute to hot block promotion
+/// (`VICTORY_LAZY_INTERNAL_PROMOTE`, default `1`).
+fn internal_promote_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LAZY_INTERNAL_PROMOTE").is_none_or(|v| v != "0")
+    })
+}
+
 /// Fast lock-free check for whether any lazy blocks are currently armed.
 #[inline]
 pub(crate) fn active() -> bool {
@@ -84,7 +93,16 @@ struct LazyEntry {
     len: usize,
     fetched_after: u64,
     armed_vas: Vec<usize>,
+    is_view: bool,
+    cpu_clean_after: Option<u64>,
     materializing: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaterializeReason {
+    CpuFault { is_write: bool },
+    InternalRead,
+    Retire,
 }
 
 #[derive(Clone, Copy)]
@@ -143,6 +161,8 @@ struct LazyStats {
     read_faults: AtomicU64,
     write_faults: AtomicU64,
     internal_materializes: AtomicU64,
+    retire_materializes: AtomicU64,
+    dma_batches: AtomicU64,
     hot_promoted: AtomicU64,
 }
 
@@ -154,6 +174,8 @@ static STATS: LazyStats = LazyStats {
     read_faults: AtomicU64::new(0),
     write_faults: AtomicU64::new(0),
     internal_materializes: AtomicU64::new(0),
+    retire_materializes: AtomicU64::new(0),
+    dma_batches: AtomicU64::new(0),
     hot_promoted: AtomicU64::new(0),
 };
 
@@ -168,43 +190,52 @@ fn current_thread_materializing(block: usize) -> bool {
     IN_MATERIALIZE.with(|v| v.borrow().contains(&block))
 }
 
-struct MaterializeScope {
-    block: usize,
+struct MaterializeBatchScope {
+    blocks: Vec<usize>,
     finished: bool,
 }
 
-impl MaterializeScope {
-    fn enter(block: usize) -> Self {
-        IN_MATERIALIZE.with(|v| v.borrow_mut().push(block));
+impl MaterializeBatchScope {
+    fn enter(blocks: Vec<usize>) -> Self {
+        IN_MATERIALIZE.with(|v| v.borrow_mut().extend_from_slice(&blocks));
         Self {
-            block,
+            blocks,
             finished: false,
         }
     }
 }
 
-impl Drop for MaterializeScope {
+impl Drop for MaterializeBatchScope {
     fn drop(&mut self) {
         IN_MATERIALIZE.with(|v| {
             let mut list = v.borrow_mut();
-            if let Some(pos) = list.iter().rposition(|&b| b == self.block) {
-                list.remove(pos);
+            for &block in self.blocks.iter().rev() {
+                if let Some(pos) = list.iter().rposition(|&b| b == block) {
+                    list.remove(pos);
+                }
             }
         });
         if !self.finished {
             // Unwind safety: ensure armed pages do not stay stuck in `materializing` or `PAGE_NOACCESS`.
-            let removed = {
+            let mut removed = Vec::with_capacity(self.blocks.len());
+            {
                 let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-                remove_entry_locked(&mut table, self.block, true)
-            };
-            if let Some(entry) = removed {
+                for &block in &self.blocks {
+                    if let Some(entry) = remove_entry_locked_no_notify(&mut table, block, true) {
+                        removed.push(entry);
+                    }
+                }
+                LAZY_COUNT.store(table.pages.len(), Ordering::Release);
+                LAZY_CV.notify_all();
+            }
+            for entry in &removed {
                 for &va in &entry.armed_vas {
                     let mut old = 0u32;
                     // SAFETY: restoring title view protection on unwind.
                     unsafe { VirtualProtect(va as *const _, PAGE, PAGE_READWRITE, &mut old) };
                 }
-                drop(entry);
             }
+            drop(removed);
         }
     }
 }
@@ -268,9 +299,30 @@ impl LazyFetcher {
         }
     }
 
+    #[cfg(test)]
     fn fetch(&mut self, shadow: &Shadow, offset: usize, len: usize) -> windows::core::Result<Vec<u8>> {
+        let (buf, _) = self.fetch_batch(&[(shadow, offset, len)])?;
+        Ok(buf)
+    }
+
+    fn fetch_batch(
+        &mut self,
+        items: &[(&Shadow, usize, usize)],
+    ) -> windows::core::Result<(Vec<u8>, Vec<(usize, usize)>)> {
+        if items.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let host = crate::host::host().ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
-        let needed = len.max(PAGE);
+        let mut total_bytes = 0usize;
+        let mut slices = Vec::with_capacity(items.len());
+        for &(_, _, len) in items {
+            let dst_off = total_bytes;
+            total_bytes = total_bytes
+                .checked_add(len)
+                .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
+            slices.push((dst_off, len));
+        }
+        let needed = total_bytes.max(PAGE);
         if self.readback.as_ref().is_none_or(|(_, _, cap)| *cap < needed) {
             let alloc_len = needed.max(FETCHER_INIT_BYTES).next_multiple_of(PAGE);
             let (res, ptr) = host
@@ -284,25 +336,38 @@ impl LazyFetcher {
             .as_ref()
             .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
 
-        // SAFETY: `shadow.buffer` is live (held by `Arc<Shadow>`) in `COMMON` state (implicit
-        // promotion to `COPY_SOURCE` and decay back to `COMMON` at `ExecuteCommandLists`),
-        // `rb_res` is live with capacity >= `len`, and `FETCHER` serializes this queue/list/fence.
+        // SAFETY: every `shadow.buffer` is live (held by `Arc<Shadow>`) in `COMMON` state
+        // (implicit promotion to `COPY_SOURCE` and decay back to `COMMON` at
+        // `ExecuteCommandLists`), `rb_res` is live with capacity >= `total_bytes`, and
+        // `FETCHER` serializes this queue/list/fence.
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
-            self.list
-                .CopyBufferRegion(rb_res, 0, &shadow.buffer, offset as u64, len as u64);
+            for (&(shadow, offset, _), &(dst_off, len)) in items.iter().zip(&slices) {
+                if len > 0 {
+                    self.list.CopyBufferRegion(
+                        rb_res,
+                        dst_off as u64,
+                        &shadow.buffer,
+                        offset as u64,
+                        len as u64,
+                    );
+                }
+            }
             self.list.Close()?;
             host.sync_copy_queue(&self.queue)?;
             let lists = [Some(self.list.cast::<ID3D12CommandList>()?)];
             self.queue.ExecuteCommandLists(&lists);
             self.sent += 1;
+            STATS.dma_batches.fetch_add(1, Ordering::Relaxed);
             self.queue.Signal(&self.fence, self.sent)?;
             self.fence.SetEventOnCompletion(self.sent, self.event)?;
             WaitForSingleObject(self.event, INFINITE);
-            let mut out = vec![0u8; len];
-            std::ptr::copy_nonoverlapping(*rb_ptr, out.as_mut_ptr(), len);
-            Ok(out)
+            let mut out = vec![0u8; total_bytes];
+            if total_bytes > 0 {
+                std::ptr::copy_nonoverlapping(*rb_ptr, out.as_mut_ptr(), total_bytes);
+            }
+            Ok((out, slices))
         }
     }
 }
@@ -311,6 +376,29 @@ impl LazyFetcher {
 /// `watch::GUARDS`, `shadow::BUFFERS`, or any `Shadow` lock.
 static FETCHER: Mutex<Option<LazyFetcher>> = Mutex::new(None);
 
+#[cfg(test)]
+pub(crate) fn fetcher_sent_count() -> u64 {
+    let guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map_or(0, |f| f.sent)
+}
+
+fn fetch_gpu_batch(
+    items: &[(&Shadow, usize, usize)],
+) -> windows::core::Result<(Vec<u8>, Vec<(usize, usize)>)> {
+    if items.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(LazyFetcher::new()?);
+    }
+    guard
+        .as_mut()
+        .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?
+        .fetch_batch(items)
+}
+
+#[cfg(test)]
 fn fetch_gpu_bytes(shadow: &Shadow, offset: usize, len: usize) -> windows::core::Result<Vec<u8>> {
     let mut guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -322,12 +410,15 @@ fn fetch_gpu_bytes(shadow: &Shadow, offset: usize, len: usize) -> windows::core:
         .fetch(shadow, offset, len)
 }
 
-fn remove_entry_locked(
+fn remove_entry_locked_no_notify(
     table: &mut LazyTable,
     primary_block: usize,
     record_recent: bool,
 ) -> Option<LazyEntry> {
     let entry = table.pages.remove(&primary_block)?;
+    if entry.is_view {
+        crate::watch::clear_lazy_view_armed(&entry.armed_vas);
+    }
     for &va in &entry.armed_vas {
         let b = va / PAGE;
         table.alias_to_primary.remove(&b);
@@ -342,8 +433,6 @@ fn remove_entry_locked(
             table.by_shadow.remove(&shadow_ptr);
         }
     }
-    LAZY_COUNT.store(table.pages.len(), Ordering::Release);
-    LAZY_CV.notify_all();
     Some(entry)
 }
 
@@ -416,6 +505,9 @@ fn try_defer_page_inner(
                 return false;
             }
             existing.fetched_after = existing.fetched_after.max(fetched_after);
+            if existing.is_view {
+                crate::watch::note_lazy_view_reused(&existing.armed_vas);
+            }
             STATS.deferred_reused.fetch_add(1, Ordering::Relaxed);
             STATS.skipped_bytes.fetch_add(len as u64, Ordering::Relaxed);
             return true;
@@ -425,6 +517,8 @@ fn try_defer_page_inner(
         }
     }
 
+    let is_view =
+        crate::inplace::has_view_at(primary_va) || crate::watch::is_known_view_block(primary_block);
     let mut vas = crate::inplace::pages_of(primary_va);
     if !vas.contains(&primary_va) {
         vas.push(primary_va);
@@ -441,13 +535,16 @@ fn try_defer_page_inner(
     let blocks: Vec<usize> = vas.iter().map(|&va| va / PAGE).collect();
 
     crate::watch::ensure_handler();
-    crate::watch::try_arm_lazy_under_guards(&blocks, || {
+    crate::watch::try_arm_lazy_under_guards(&blocks, |cpu_clean_after| {
         let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = table.pages.get_mut(&primary_block) {
             if existing.materializing || !Arc::ptr_eq(&existing.shadow, shadow) {
                 return false;
             }
             existing.fetched_after = existing.fetched_after.max(fetched_after);
+            if existing.is_view {
+                crate::watch::note_lazy_view_reused(&existing.armed_vas);
+            }
             STATS.deferred_reused.fetch_add(1, Ordering::Relaxed);
             STATS.skipped_bytes.fetch_add(len as u64, Ordering::Relaxed);
             return true;
@@ -489,6 +586,9 @@ fn try_defer_page_inner(
         }
 
         let armed_vas: Vec<usize> = protected.into_iter().map(|(va, _)| va).collect();
+        if is_view {
+            crate::watch::note_lazy_view_armed(&armed_vas);
+        }
         for &va in &armed_vas {
             let b = va / PAGE;
             table.clear_recent(b);
@@ -507,6 +607,8 @@ fn try_defer_page_inner(
                 len,
                 fetched_after,
                 armed_vas,
+                is_view,
+                cpu_clean_after: if is_view { cpu_clean_after } else { None },
                 materializing: false,
             },
         );
@@ -550,6 +652,33 @@ pub(crate) fn owned_blocks_in(shadow_ptr: usize, first_page: usize, last_page: u
     blocks.range(first_page..last_page).copied().collect()
 }
 
+/// Returns sorted `(block, pre_epoch)` pairs for non-`materializing` view
+/// blocks in `[first_page, last_page)` owned by `shadow_ptr` that were
+/// guard-clean before being armed.
+pub(crate) fn owned_cpu_clean_blocks_in(
+    shadow_ptr: usize,
+    first_page: usize,
+    last_page: usize,
+) -> Vec<(usize, u64)> {
+    if !active() || first_page >= last_page {
+        return Vec::new();
+    }
+    let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(blocks) = table.by_shadow.get(&shadow_ptr) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for &b in blocks.range(first_page..last_page) {
+        if let Some(entry) = table.pages.get(&b)
+            && !entry.materializing
+            && let Some(pre_epoch) = entry.cpu_clean_after
+        {
+            out.push((b, pre_epoch));
+        }
+    }
+    out
+}
+
 /// Returns the minimum `fetched_after` watermark among currently deferred `card` entries, if any.
 pub(crate) fn min_card_fetched_after() -> Option<u64> {
     if !active() {
@@ -589,51 +718,26 @@ fn note_fault_hot_locked(table: &mut LazyTable, primary_block: usize) {
     }
 }
 
-/// Materializes `primary_block` outside `LAZY_STATE`.
-/// `fault`: `None` for internal runtime materialization, `Some(false)` for CPU read fault,
-/// `Some(true)` for CPU write fault. Returns `true` if `primary_block` was active (or waited
-/// on another thread materializing it).
-fn materialize_primary(primary_block: usize, fault: Option<bool>) -> bool {
-    let (shadow, offset, len, fetched_after, armed_vas) = {
-        let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        let mut waited = false;
-        loop {
-            match table.pages.get_mut(&primary_block) {
-                Some(entry) if entry.materializing => {
-                    waited = true;
-                    table = LAZY_CV.wait(table).unwrap_or_else(|e| e.into_inner());
-                }
-                Some(entry) => {
-                    entry.materializing = true;
-                    let info = (
-                        entry.shadow.clone(),
-                        entry.offset,
-                        entry.len,
-                        entry.fetched_after,
-                        entry.armed_vas.clone(),
-                    );
-                    match fault {
-                        Some(is_write) => {
-                            note_fault_hot_locked(&mut table, primary_block);
-                            if is_write {
-                                STATS.write_faults.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                STATS.read_faults.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        None => {
-                            STATS.internal_materializes.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    break info;
-                }
-                None => return waited,
-            }
-        }
-    };
+struct ClaimedBlock {
+    primary_block: usize,
+    shadow: Arc<Shadow>,
+    offset: usize,
+    len: usize,
+    fetched_after: u64,
+    armed_vas: Vec<usize>,
+}
 
-    let mut scope = MaterializeScope::enter(primary_block);
-    let fetched = fetch_gpu_bytes(&shadow, offset, len);
+fn materialize_claimed_batch(claimed: Vec<ClaimedBlock>, reason: MaterializeReason) {
+    if claimed.is_empty() {
+        return;
+    }
+    let scope_blocks: Vec<usize> = claimed.iter().map(|c| c.primary_block).collect();
+    let mut scope = MaterializeBatchScope::enter(scope_blocks);
+    let fetch_items: Vec<(&Shadow, usize, usize)> = claimed
+        .iter()
+        .map(|c| (&*c.shadow, c.offset, c.len))
+        .collect();
+    let fetched = fetch_gpu_batch(&fetch_items);
 
     let restore_prot = |vas: &[usize]| {
         for &va in vas {
@@ -644,70 +748,153 @@ fn materialize_primary(primary_block: usize, fault: Option<bool>) -> bool {
     };
 
     match fetched {
-        Ok(gpu_bytes) => {
-            // Section-backed views merge GPU->title bytes via `inplace` own `PAGE_READWRITE`
-            // views BEFORE restoring `PAGE_READWRITE` on `armed_vas`, so concurrent title
-            // threads never observe stale pre-GPU-write RAM without faulting.
-            let merged_via_own = if crate::inplace::has_view_at(primary_block * PAGE) {
-                if shadow.carded() {
-                    let mut scratch = Vec::new();
-                    shadow
-                        .card_merge_relay_via_own(offset, &gpu_bytes, fetched_after, &mut scratch)
-                        .is_some()
-                } else if shadow.is_rebar() {
-                    if shadow.relay_merge_rebar_via_own(offset, &gpu_bytes).is_some() {
-                        shadow.mark_rebar_dirty_range(offset, len);
-                        true
+        Ok((buf, slices)) => {
+            for (item, (buf_off, buf_len)) in claimed.iter().zip(slices) {
+                let gpu_bytes = &buf[buf_off..buf_off + buf_len];
+                // Section-backed views merge GPU->title bytes via `inplace` own `PAGE_READWRITE`
+                // views BEFORE restoring `PAGE_READWRITE` on `armed_vas`, so concurrent title
+                // threads never observe stale pre-GPU-write RAM without faulting.
+                let merged_via_own = if crate::inplace::has_view_at(item.primary_block * PAGE) {
+                    if item.shadow.carded() {
+                        let mut scratch = Vec::new();
+                        item.shadow
+                            .card_merge_relay_via_own(
+                                item.offset,
+                                gpu_bytes,
+                                item.fetched_after,
+                                &mut scratch,
+                            )
+                            .is_some()
+                    } else if item.shadow.is_rebar() {
+                        if item
+                            .shadow
+                            .relay_merge_rebar_via_own(item.offset, gpu_bytes)
+                            .is_some()
+                        {
+                            item.shadow.mark_rebar_dirty_range(item.offset, item.len);
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     }
                 } else {
                     false
-                }
-            } else {
-                false
-            };
+                };
 
-            // Private non-section allocations (or section views whose own view could not be
-            // acquired, e.g. during an active remap) have no `PAGE_READWRITE` own view, so
-            // `armed_vas` must be restored to `PAGE_READWRITE` before `ReadProcessMemory` /
-            // `NtWriteVirtualMemory` in `card_merge_relay` / `relay_merge_rebar` can run.
-            restore_prot(&armed_vas);
+                // Private non-section allocations (or section views whose own view could not be
+                // acquired, e.g. during an active remap) have no `PAGE_READWRITE` own view, so
+                // `armed_vas` must be restored to `PAGE_READWRITE` before `ReadProcessMemory` /
+                // `NtWriteVirtualMemory` in `card_merge_relay` / `relay_merge_rebar` can run.
+                restore_prot(&item.armed_vas);
 
-            if !merged_via_own {
-                if shadow.carded() {
-                    let mut scratch = Vec::new();
-                    shadow.card_merge_relay(offset, &gpu_bytes, fetched_after, &mut scratch);
-                } else if shadow.is_rebar() {
-                    shadow.relay_merge_rebar(&[(offset, offset + len)], &[&gpu_bytes]);
-                    shadow.mark_rebar_dirty_range(offset, len);
+                if !merged_via_own {
+                    if item.shadow.carded() {
+                        let mut scratch = Vec::new();
+                        item.shadow.card_merge_relay(
+                            item.offset,
+                            gpu_bytes,
+                            item.fetched_after,
+                            &mut scratch,
+                        );
+                    } else if item.shadow.is_rebar() {
+                        item.shadow.relay_merge_rebar(
+                            &[(item.offset, item.offset + item.len)],
+                            &[gpu_bytes],
+                        );
+                        item.shadow.mark_rebar_dirty_range(item.offset, item.len);
+                    }
                 }
-            }
-            if fault == Some(true) {
-                for &va in &armed_vas {
-                    crate::watch::wrote(va, PAGE);
+                if reason == (MaterializeReason::CpuFault { is_write: true }) {
+                    for &va in &item.armed_vas {
+                        crate::watch::wrote(va, PAGE);
+                    }
                 }
+                STATS
+                    .materialized_bytes
+                    .fetch_add(item.len as u64, Ordering::Relaxed);
             }
-            STATS.materialized_bytes.fetch_add(len as u64, Ordering::Relaxed);
         }
         Err(e) => {
-            restore_prot(&armed_vas);
+            for item in &claimed {
+                restore_prot(&item.armed_vas);
+            }
             tracing::warn!(
                 error = %e,
-                va = format_args!("{:#x}", primary_block * PAGE),
-                "lazy copy-back DMA fetch failed"
+                count = claimed.len(),
+                "lazy copy-back batched DMA fetch failed"
             );
         }
     }
 
-    let removed = {
+    let mut removed = Vec::with_capacity(claimed.len());
+    {
         let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        remove_entry_locked(&mut table, primary_block, true)
-    };
+        for item in &claimed {
+            if let Some(entry) = remove_entry_locked_no_notify(&mut table, item.primary_block, true)
+            {
+                removed.push(entry);
+            }
+        }
+        LAZY_COUNT.store(table.pages.len(), Ordering::Release);
+        LAZY_CV.notify_all();
+    }
     scope.finished = true;
     drop(scope);
     drop(removed);
-    drop(shadow);
+    drop(claimed);
+}
+
+/// Materializes `primary_block` outside `LAZY_STATE`.
+/// Returns `true` if `primary_block` was active (or waited on another thread materializing it).
+fn materialize_primary(primary_block: usize, reason: MaterializeReason) -> bool {
+    let claimed = {
+        let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waited = false;
+        loop {
+            match table.pages.get_mut(&primary_block) {
+                Some(entry) if entry.materializing => {
+                    waited = true;
+                    table = LAZY_CV.wait(table).unwrap_or_else(|e| e.into_inner());
+                }
+                Some(entry) => {
+                    entry.materializing = true;
+                    let claimed = ClaimedBlock {
+                        primary_block,
+                        shadow: entry.shadow.clone(),
+                        offset: entry.offset,
+                        len: entry.len,
+                        fetched_after: entry.fetched_after,
+                        armed_vas: entry.armed_vas.clone(),
+                    };
+                    match reason {
+                        MaterializeReason::CpuFault { is_write } => {
+                            note_fault_hot_locked(&mut table, primary_block);
+                            if is_write {
+                                STATS.write_faults.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                STATS.read_faults.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        MaterializeReason::InternalRead => {
+                            if internal_promote_enabled() {
+                                note_fault_hot_locked(&mut table, primary_block);
+                            }
+                            STATS.internal_materializes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        MaterializeReason::Retire => {
+                            STATS.retire_materializes.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    break claimed;
+                }
+                None => return waited,
+            }
+        }
+    };
+
+    materialize_claimed_batch(vec![claimed], reason);
     true
 }
 
@@ -732,7 +919,7 @@ pub(crate) fn handle_fault(at: usize, is_write: bool) -> bool {
     let Some(primary_block) = primary else {
         return false;
     };
-    if materialize_primary(primary_block, Some(is_write)) {
+    if materialize_primary(primary_block, MaterializeReason::CpuFault { is_write }) {
         return true;
     }
     if !is_write {
@@ -744,70 +931,142 @@ pub(crate) fn handle_fault(at: usize, is_write: bool) -> bool {
     false
 }
 
-/// Materializes any deferred lazy blocks overlapping `[at, at + len)` before an internal
-/// runtime read, kernel write, copy, or memory remap.
-pub(crate) fn materialize_range(at: usize, len: usize) {
-    if len == 0 || !active() {
+/// Materializes any deferred lazy blocks overlapping any `[at, at + len)` in `ranges`
+/// in a single batched `COPY`-queue DMA before internal runtime reads, kernel writes,
+/// copies, or memory remaps.
+pub(crate) fn materialize_ranges(ranges: &[(usize, usize)]) {
+    if ranges.is_empty() || !active() {
         return;
     }
-    let end = at.saturating_add(len);
-    let first = at / PAGE;
-    let last = end.div_ceil(PAGE);
     loop {
-        let next = {
-            let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-            let mut found = None;
+        let (claimed, wait_only) = {
+            let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut to_claim = BTreeSet::new();
             let mut wait_only = false;
-            for (_, &primary_block) in table.alias_to_primary.range(first..last) {
-                if current_thread_materializing(primary_block) {
+            for &(at, len) in ranges {
+                if len == 0 {
                     continue;
                 }
-                if table
-                    .pages
-                    .get(&primary_block)
-                    .is_some_and(|e| e.materializing)
-                {
-                    wait_only = true;
-                } else {
-                    found = Some(primary_block);
+                let end = at.saturating_add(len);
+                let first = at / PAGE;
+                let last = end.div_ceil(PAGE);
+                for (_, &primary_block) in table.alias_to_primary.range(first..last) {
+                    if current_thread_materializing(primary_block) {
+                        continue;
+                    }
+                    if table
+                        .pages
+                        .get(&primary_block)
+                        .is_some_and(|e| e.materializing)
+                    {
+                        wait_only = true;
+                    } else {
+                        to_claim.insert(primary_block);
+                    }
                 }
-                break;
             }
-            if wait_only {
-                drop(LAZY_CV.wait(table).unwrap_or_else(|e| e.into_inner()));
-                continue;
+            if to_claim.is_empty() {
+                if wait_only {
+                    drop(LAZY_CV.wait(table).unwrap_or_else(|e| e.into_inner()));
+                    continue;
+                }
+                return;
             }
-            found
+            let do_promote = internal_promote_enabled();
+            let mut claimed = Vec::with_capacity(to_claim.len());
+            for primary_block in to_claim {
+                if let Some(entry) = table.pages.get_mut(&primary_block)
+                    && !entry.materializing
+                {
+                    entry.materializing = true;
+                    claimed.push(ClaimedBlock {
+                        primary_block,
+                        shadow: entry.shadow.clone(),
+                        offset: entry.offset,
+                        len: entry.len,
+                        fetched_after: entry.fetched_after,
+                        armed_vas: entry.armed_vas.clone(),
+                    });
+                    if do_promote {
+                        note_fault_hot_locked(&mut table, primary_block);
+                    }
+                    STATS.internal_materializes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            (claimed, wait_only)
         };
-        let Some(primary_block) = next else {
+        if !claimed.is_empty() {
+            materialize_claimed_batch(claimed, MaterializeReason::InternalRead);
+        }
+        if !wait_only {
             return;
-        };
-        materialize_primary(primary_block, None);
+        }
     }
 }
 
-/// Materializes all deferred lazy blocks owned by `shadow_ptr` before retirement or unregister.
+/// Materializes any deferred lazy blocks overlapping `[at, at + len)` before an internal
+/// runtime read, kernel write, copy, or memory remap.
+pub(crate) fn materialize_range(at: usize, len: usize) {
+    if len > 0 && active() {
+        materialize_ranges(&[(at, len)]);
+    }
+}
+
+/// Materializes all deferred lazy blocks owned by `shadow_ptr` before retirement or unregister
+/// in a single batched `COPY`-queue DMA without hot promotion.
 pub(crate) fn materialize_shadow(shadow_ptr: usize) {
     if !active() {
         return;
     }
     loop {
-        let next = {
-            let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-            let first = table
-                .by_shadow
-                .get(&shadow_ptr)
-                .and_then(|set| set.iter().copied().find(|&b| !current_thread_materializing(b)));
-            let Some(block) = first else {
-                return;
-            };
-            if table.pages.get(&block).is_some_and(|e| e.materializing) {
-                drop(LAZY_CV.wait(table).unwrap_or_else(|e| e.into_inner()));
-                continue;
+        let (claimed, wait_only) = {
+            let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut to_claim = Vec::new();
+            let mut wait_only = false;
+            if let Some(blocks) = table.by_shadow.get(&shadow_ptr) {
+                for &b in blocks {
+                    if current_thread_materializing(b) {
+                        continue;
+                    }
+                    if table.pages.get(&b).is_some_and(|e| e.materializing) {
+                        wait_only = true;
+                    } else {
+                        to_claim.push(b);
+                    }
+                }
             }
-            block
+            if to_claim.is_empty() {
+                if wait_only {
+                    drop(LAZY_CV.wait(table).unwrap_or_else(|e| e.into_inner()));
+                    continue;
+                }
+                return;
+            }
+            let mut claimed = Vec::with_capacity(to_claim.len());
+            for primary_block in to_claim {
+                if let Some(entry) = table.pages.get_mut(&primary_block)
+                    && !entry.materializing
+                {
+                    entry.materializing = true;
+                    STATS.retire_materializes.fetch_add(1, Ordering::Relaxed);
+                    claimed.push(ClaimedBlock {
+                        primary_block,
+                        shadow: entry.shadow.clone(),
+                        offset: entry.offset,
+                        len: entry.len,
+                        fetched_after: entry.fetched_after,
+                        armed_vas: entry.armed_vas.clone(),
+                    });
+                }
+            }
+            (claimed, wait_only)
         };
-        materialize_primary(next, None);
+        if !claimed.is_empty() {
+            materialize_claimed_batch(claimed, MaterializeReason::Retire);
+        }
+        if !wait_only {
+            return;
+        }
     }
 }
 
@@ -841,16 +1100,23 @@ pub(crate) fn discard_range(at: usize, len: usize) {
             .collect();
         for (va_block, primary) in hits {
             if va_block == primary {
-                if let Some(entry) = remove_entry_locked(&mut table, primary, true) {
+                if let Some(entry) = remove_entry_locked_no_notify(&mut table, primary, true) {
                     dropped.push(entry);
                 }
             } else {
                 table.alias_to_primary.remove(&va_block);
                 table.note_recent(va_block);
                 if let Some(entry) = table.pages.get_mut(&primary) {
+                    if entry.is_view {
+                        crate::watch::clear_lazy_view_armed_block(va_block);
+                    }
                     entry.armed_vas.retain(|&va| va / PAGE != va_block);
                 }
             }
+        }
+        if !dropped.is_empty() {
+            LAZY_COUNT.store(table.pages.len(), Ordering::Release);
+            LAZY_CV.notify_all();
         }
         for b in first..last {
             if table.hot.is_empty() {
@@ -876,9 +1142,13 @@ pub(crate) fn discard_shadow(shadow_ptr: usize) {
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default();
         for b in blocks {
-            if let Some(entry) = remove_entry_locked(&mut table, b, true) {
+            if let Some(entry) = remove_entry_locked_no_notify(&mut table, b, true) {
                 dropped.push(entry);
             }
+        }
+        if !dropped.is_empty() {
+            LAZY_COUNT.store(table.pages.len(), Ordering::Release);
+            LAZY_CV.notify_all();
         }
     }
     drop(dropped);
@@ -898,9 +1168,11 @@ pub(crate) fn log_stats(frames: f64) {
     let read_faults = STATS.read_faults.swap(0, Ordering::Relaxed) as f64 / frames;
     let write_faults = STATS.write_faults.swap(0, Ordering::Relaxed) as f64 / frames;
     let internal = STATS.internal_materializes.swap(0, Ordering::Relaxed) as f64 / frames;
+    let retire = STATS.retire_materializes.swap(0, Ordering::Relaxed) as f64 / frames;
+    let batches = STATS.dma_batches.swap(0, Ordering::Relaxed) as f64 / frames;
     let hot_promoted = STATS.hot_promoted.swap(0, Ordering::Relaxed) as f64;
     tracing::info!(
-        "lazy copy-back (VICTORY_LAZY_BACK=1): deferred {deferred_new:.1} new / {deferred_reused:.1} reused ({skipped_mb:.1} MB/frame skipped); materialized {materialized_mb:.1} MB/frame (read faults {read_faults:.1}, write faults {write_faults:.1}, internal {internal:.1}); hot promoted {hot_promoted:.0}"
+        "lazy copy-back (VICTORY_LAZY_BACK=1): deferred {deferred_new:.1} new / {deferred_reused:.1} reused ({skipped_mb:.1} MB/frame skipped); materialized {materialized_mb:.1} MB/frame (read faults {read_faults:.1}, write faults {write_faults:.1}, internal {internal:.1}, retire {retire:.1}, dma batches {batches:.1}); hot promoted {hot_promoted:.0}"
     );
 }
 
@@ -1796,6 +2068,303 @@ mod tests {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view_a.Value });
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view_b.Value });
             CloseHandle(section);
+        }
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_view_owner_skips_self_refresh_while_other_shadow_materializes_and_promotes_hot() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let pages = 2;
+        // SAFETY: anonymous section mapped for a 2-page view.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (pages * PAGE) as u32,
+                ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: mapping 2-page view.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, pages * PAGE) };
+        assert!(!view.Value.is_null());
+        let va0 = view.Value as usize;
+        let va1 = va0 + PAGE;
+        clear_hot_for_test(va0 / PAGE);
+        clear_hot_for_test(va1 / PAGE);
+
+        crate::inplace::title_memory_section(section as usize, (pages * PAGE) as u64, true);
+        crate::inplace::title_memory_view(va0, pages * PAGE, section as usize, 0);
+
+        // SAFETY: `va0` is mapped for `2 * PAGE` bytes.
+        unsafe { ptr::write_bytes(va0 as *mut u8, 0x11, pages * PAGE) };
+        let Some((shadow_a, side_a)) = make_card_shadow_at(va0 as u64, pages, 0x11) else {
+            crate::watch::title_memory_remapped(va0, pages * PAGE);
+            // SAFETY: cleanup.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+                CloseHandle(section);
+            }
+            return;
+        };
+        let Some((shadow_b, side_b)) = make_card_shadow_at(va0 as u64, pages, 0x11) else {
+            drop(side_a);
+            drop(shadow_a);
+            crate::watch::title_memory_remapped(va0, pages * PAGE);
+            // SAFETY: cleanup.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+                CloseHandle(section);
+            }
+            return;
+        };
+
+        // 1. View owner skips self-refresh when page 0 was guard-clean before deferring.
+        let _ = shadow_a.update(va0, pages * PAGE);
+        shadow_a.clear_card_dirty_for_test();
+        let _ = shadow_b.update(va0, pages * PAGE);
+        assert!(crate::watch::clean(va0 / PAGE));
+        gpu_write_shadow(&shadow_a, 0, &[0xA1; 32]);
+        assert!(try_defer_page_inner(&shadow_a, 0, PAGE, 0));
+        assert!(has_block(va0 / PAGE));
+        assert!(
+            !owned_cpu_clean_blocks_in(
+                Arc::as_ptr(&shadow_a) as usize,
+                va0 / PAGE,
+                va0 / PAGE + 1
+            )
+            .is_empty()
+        );
+        assert_eq!(shadow_a.update(va0, PAGE), 0);
+        assert!(has_block(va0 / PAGE), "view owner must skip self-refresh");
+        assert!(!is_readable_now(va0));
+
+        // 2. Pre-defer CPU write safety on page 1:
+        // (a) Un-guarded CPU write before deferring leaves `cpu_clean_after == None`.
+        // SAFETY: `va1` is committed RW title view memory.
+        unsafe { ((va1 + 16) as *mut u8).write(0x22) };
+        assert!(!crate::watch::clean(va1 / PAGE));
+        gpu_write_shadow(&shadow_a, PAGE, &[0xB1; 16]);
+        assert!(try_defer_page_inner(&shadow_a, PAGE, PAGE, 0));
+        assert!(
+            owned_cpu_clean_blocks_in(
+                Arc::as_ptr(&shadow_a) as usize,
+                va1 / PAGE,
+                va1 / PAGE + 1
+            )
+            .is_empty(),
+            "dirty view block before defer must not record cpu_clean_after"
+        );
+        materialize_range(va1, PAGE);
+        assert!(shadow_a.update(va1, PAGE) > 0);
+        assert_eq!(side_a[PAGE + 16], 0x22);
+
+        // (b) CPU write after `shadow_a` refreshed, guarded by `shadow_b` before `shadow_a` defers:
+        // `cpu_clean_after > shadow_a.copied[1]` so `shadow_a` must still refresh after materialize.
+        // SAFETY: `va1` is committed RW title view memory.
+        unsafe { ((va1 + 20) as *mut u8).write(0x23) };
+        assert!(shadow_b.update(va1, PAGE) > 0);
+        assert!(crate::watch::clean(va1 / PAGE));
+        gpu_write_shadow(&shadow_a, PAGE, &[0xB2; 16]);
+        assert!(try_defer_page_inner(&shadow_a, PAGE, PAGE, 0));
+        assert_eq!(shadow_a.update(va1, PAGE), 0);
+        materialize_range(va1, PAGE);
+        assert!(shadow_a.update(va1, PAGE) > 0);
+        assert_eq!(side_a[PAGE + 20], 0x23);
+
+        // 3. Overlapping `shadow_b.update` materializes `shadow_a`'s deferred block via
+        //    `InternalRead` and promotes it to hot across `promote_frames()` distinct frames.
+        materialize_range(va0, PAGE);
+        clear_hot_for_test(va0 / PAGE);
+        let threshold = promote_frames();
+        for f in 0..threshold {
+            advance_frames(1);
+            let _ = shadow_a.update(va0, PAGE);
+            shadow_a.clear_card_dirty_for_test();
+            gpu_write_shadow(&shadow_a, 0, &[0xD0 + f as u8; 16]);
+            assert!(try_defer_page_inner(&shadow_a, 0, PAGE, (f + 1) as u64));
+            assert!(
+                shadow_b.update(va0, PAGE) >= 16,
+                "overlapping shadow_b must materialize and observe GPU bytes on frame {f}"
+            );
+            assert!(!has_block(va0 / PAGE));
+            assert_eq!(&side_b[..16], &[0xD0 + f as u8; 16]);
+        }
+        advance_frames(1);
+        assert!(
+            !try_defer_page_inner(&shadow_a, 0, PAGE, 99),
+            "InternalRead must promote overlapping block to hot"
+        );
+
+        // 4. `materialize_shadow` (`Retire`) must NOT promote to hot.
+        clear_hot_for_test(va1 / PAGE);
+        for f in 0..threshold {
+            advance_frames(1);
+            gpu_write_shadow(&shadow_a, PAGE, &[0xE0 + f as u8; 16]);
+            assert!(try_defer_page_inner(&shadow_a, PAGE, PAGE, (f + 10) as u64));
+            materialize_shadow(Arc::as_ptr(&shadow_a) as usize);
+            assert!(!has_block(va1 / PAGE));
+        }
+        advance_frames(1);
+        assert!(
+            try_defer_page_inner(&shadow_a, PAGE, PAGE, 99),
+            "Retire (materialize_shadow) must not promote block to hot"
+        );
+        materialize_shadow(Arc::as_ptr(&shadow_a) as usize);
+
+        clear_hot_for_test(va0 / PAGE);
+        clear_hot_for_test(va1 / PAGE);
+        drop(side_b);
+        drop(shadow_b);
+        drop(side_a);
+        drop(shadow_a);
+        crate::watch::title_memory_remapped(va0, pages * PAGE);
+        // SAFETY: cleanup.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_materialize_ranges_batches_multi_block_and_multi_shadow_into_single_dma() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let ptr1 = alloc_watch_pages(2);
+        let ptr2 = alloc_watch_pages(2);
+        let ptr3 = alloc_watch_pages(3);
+        // SAFETY: fresh allocations own their respective page counts.
+        unsafe {
+            ptr::write_bytes(ptr1, 0x11, 2 * PAGE);
+            ptr::write_bytes(ptr2, 0x11, 2 * PAGE);
+            ptr::write_bytes(ptr3, 0x11, 3 * PAGE);
+        }
+        let va1 = ptr1 as usize;
+        let va2 = ptr2 as usize;
+        let va3 = ptr3 as usize;
+        for b in [
+            va1 / PAGE,
+            va1 / PAGE + 1,
+            va2 / PAGE,
+            va2 / PAGE + 1,
+            va3 / PAGE,
+            va3 / PAGE + 1,
+            va3 / PAGE + 2,
+        ] {
+            clear_hot_for_test(b);
+        }
+
+        let Some((shadow1, _side1)) = make_card_shadow_at(va1 as u64, 2, 0x11) else {
+            // SAFETY: cleanup.
+            unsafe {
+                free_watch_pages(ptr1);
+                free_watch_pages(ptr2);
+                free_watch_pages(ptr3);
+            }
+            return;
+        };
+        let Some((shadow2, _side2)) = make_card_shadow_at(va2 as u64, 2, 0x11) else {
+            drop(shadow1);
+            // SAFETY: cleanup.
+            unsafe {
+                free_watch_pages(ptr1);
+                free_watch_pages(ptr2);
+                free_watch_pages(ptr3);
+            }
+            return;
+        };
+        let Some((shadow3, _side3)) = make_card_shadow_at(va3 as u64, 3, 0x11) else {
+            drop(shadow2);
+            drop(shadow1);
+            // SAFETY: cleanup.
+            unsafe {
+                free_watch_pages(ptr1);
+                free_watch_pages(ptr2);
+                free_watch_pages(ptr3);
+            }
+            return;
+        };
+
+        gpu_write_shadow(&shadow1, 0, &[0xA1; 16]);
+        gpu_write_shadow(&shadow1, PAGE, &[0xA2; 16]);
+        gpu_write_shadow(&shadow2, 0, &[0xB1; 16]);
+        gpu_write_shadow(&shadow2, PAGE, &[0xB2; 16]);
+
+        assert!(try_defer_page_inner(&shadow1, 0, PAGE, 0));
+        assert!(try_defer_page_inner(&shadow1, PAGE, PAGE, 0));
+        assert!(try_defer_page_inner(&shadow2, 0, PAGE, 0));
+        assert!(try_defer_page_inner(&shadow2, PAGE, PAGE, 0));
+
+        let sent_before = fetcher_sent_count();
+        materialize_ranges(&[(va1, 2 * PAGE), (va2, 2 * PAGE)]);
+        assert_eq!(
+            fetcher_sent_count(),
+            sent_before + 1,
+            "materialize_ranges must batch all 4 blocks across 2 shadows into 1 DMA"
+        );
+        assert!(!has_block(va1 / PAGE) && !has_block(va1 / PAGE + 1));
+        assert!(!has_block(va2 / PAGE) && !has_block(va2 / PAGE + 1));
+        // SAFETY: all 4 pages are materialized to readable RAM.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(ptr1, 16), &[0xA1; 16]);
+            assert_eq!(std::slice::from_raw_parts(ptr1.add(PAGE), 16), &[0xA2; 16]);
+            assert_eq!(std::slice::from_raw_parts(ptr2, 16), &[0xB1; 16]);
+            assert_eq!(std::slice::from_raw_parts(ptr2.add(PAGE), 16), &[0xB2; 16]);
+        }
+
+        // Batched `materialize_shadow` across 3 deferred blocks of `shadow3`.
+        gpu_write_shadow(&shadow3, 0, &[0xC1; 16]);
+        gpu_write_shadow(&shadow3, PAGE, &[0xC2; 16]);
+        gpu_write_shadow(&shadow3, 2 * PAGE, &[0xC3; 16]);
+        assert!(try_defer_page_inner(&shadow3, 0, PAGE, 0));
+        assert!(try_defer_page_inner(&shadow3, PAGE, PAGE, 0));
+        assert!(try_defer_page_inner(&shadow3, 2 * PAGE, PAGE, 0));
+
+        let sent_before_retire = fetcher_sent_count();
+        materialize_shadow(Arc::as_ptr(&shadow3) as usize);
+        assert_eq!(
+            fetcher_sent_count(),
+            sent_before_retire + 1,
+            "materialize_shadow must batch all 3 blocks into 1 DMA"
+        );
+        assert!(!has_block(va3 / PAGE) && !has_block(va3 / PAGE + 1) && !has_block(va3 / PAGE + 2));
+        // SAFETY: all 3 pages are materialized to readable RAM.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(ptr3, 16), &[0xC1; 16]);
+            assert_eq!(std::slice::from_raw_parts(ptr3.add(PAGE), 16), &[0xC2; 16]);
+            assert_eq!(std::slice::from_raw_parts(ptr3.add(2 * PAGE), 16), &[0xC3; 16]);
+        }
+
+        for b in [
+            va1 / PAGE,
+            va1 / PAGE + 1,
+            va2 / PAGE,
+            va2 / PAGE + 1,
+            va3 / PAGE,
+            va3 / PAGE + 1,
+            va3 / PAGE + 2,
+        ] {
+            clear_hot_for_test(b);
+        }
+        drop(shadow3);
+        drop(shadow2);
+        drop(shadow1);
+        // SAFETY: cleanup.
+        unsafe {
+            free_watch_pages(ptr1);
+            free_watch_pages(ptr2);
+            free_watch_pages(ptr3);
         }
         h.log_messages();
         assert_eq!(h.d3d12_errors(), errors_before);

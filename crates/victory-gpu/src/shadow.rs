@@ -1774,6 +1774,20 @@ fn chunk_copy_segs(segs: &[CopySeg], chunk_bytes: usize) -> Vec<Vec<CopySeg>> {
     buckets
 }
 
+/// Materializes any deferred `lazy_back` blocks overlapping `segs` in one batched DMA.
+fn materialize_copy_segs(segs: &[CopySeg]) {
+    if !segs.is_empty() && crate::lazy_back::active() {
+        let ranges: Vec<(usize, usize)> = segs
+            .iter()
+            .filter(|s| s.len > 0)
+            .map(|s| (s.src, s.len))
+            .collect();
+        if !ranges.is_empty() {
+            crate::lazy_back::materialize_ranges(&ranges);
+        }
+    }
+}
+
 /// Materializes any deferred `lazy_back` blocks in `[addr, addr + buf.len())`
 /// outside the per-`Shadow` lock, then acquires `acquire()` and reads via
 /// `read_into_raw`. If a concurrent relay thread re-deferred the block before
@@ -2027,15 +2041,9 @@ pub(crate) fn refresh_batch(
     }
 
     if !all_segs.is_empty() {
-        if crate::lazy_back::active() {
-            for seg in &all_segs {
-                crate::lazy_back::materialize_range(seg.src, seg.len);
-            }
-        }
+        materialize_copy_segs(&all_segs);
         if !run_copy_segs_checked(&all_segs) {
-            for seg in &all_segs {
-                crate::lazy_back::materialize_range(seg.src, seg.len);
-            }
+            materialize_copy_segs(&all_segs);
             let _ = run_copy_segs_checked(&all_segs);
         }
         for &(idx, seg_lo, seg_hi) in &non_mirrored {
@@ -3454,10 +3462,16 @@ impl Shadow {
         }
         let start = self.start as usize;
         let limit = self.len as usize;
-        for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
-            if from < to && to <= limit && gpu_span.len() == to - from {
-                crate::lazy_back::materialize_range(start + from, to - from);
-            }
+        let ranges: Vec<(usize, usize)> = spans
+            .iter()
+            .zip(gpu_slices)
+            .filter_map(|(&(from, to), &gpu_span)| {
+                (from < to && to <= limit && gpu_span.len() == to - from)
+                    .then_some((start + from, to - from))
+            })
+            .collect();
+        if !ranges.is_empty() {
+            crate::lazy_back::materialize_ranges(&ranges);
         }
     }
 
@@ -3493,12 +3507,7 @@ impl Shadow {
             return 0;
         }
 
-        let apply_subrange =
-            |sub_at: usize, gpu: &[u8], old: &mut [u8], title: &mut Vec<u8>| -> usize {
-                self.apply_rebar_relay_subrange(start, sub_at, gpu, old, title, false)
-                    .unwrap_or(0)
-            };
-
+        let mut wrote_fallback = false;
         let mut written = 0;
         let mut title = Vec::new();
         if total_bytes < PARALLEL_THRESHOLD {
@@ -3515,15 +3524,23 @@ impl Shadow {
                         && let Some(first) = first_difference(gpu, old)
                     {
                         let last = last_difference(gpu, old).unwrap_or(first);
-                        written += apply_subrange(
-                            at + first,
-                            &gpu[first..=last],
-                            &mut old[first..=last],
-                            &mut title,
-                        );
+                        written += self
+                            .apply_rebar_relay_subrange(
+                                start,
+                                at + first,
+                                &gpu[first..=last],
+                                &mut old[first..=last],
+                                &mut title,
+                                false,
+                                &mut wrote_fallback,
+                            )
+                            .unwrap_or(0);
                     }
                     at += n;
                 }
+            }
+            if wrote_fallback {
+                crate::watch::ask_once_void();
             }
             return written;
         }
@@ -3618,11 +3635,25 @@ impl Shadow {
         for (sub_at, sub_n, slice_idx, slice_off) in diffs {
             let gpu = &gpu_slices[slice_idx][slice_off..slice_off + sub_n];
             let old = &mut mirror[sub_at..sub_at + sub_n];
-            written += apply_subrange(sub_at, gpu, old, &mut title);
+            written += self
+                .apply_rebar_relay_subrange(
+                    start,
+                    sub_at,
+                    gpu,
+                    old,
+                    &mut title,
+                    false,
+                    &mut wrote_fallback,
+                )
+                .unwrap_or(0);
+        }
+        if wrote_fallback {
+            crate::watch::ask_once_void();
         }
         written
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_rebar_relay_subrange(
         &self,
         start: usize,
@@ -3631,6 +3662,7 @@ impl Shadow {
         old: &mut [u8],
         title: &mut Vec<u8>,
         via_own: bool,
+        wrote_fallback: &mut bool,
     ) -> Option<usize> {
         let sub_n = gpu.len();
         title.clear();
@@ -3671,6 +3703,7 @@ impl Shadow {
                     "rebar relay",
                 );
                 crate::host::write_mapped_raw((start + sub_at) as *mut u8, title.as_ptr(), sub_n);
+                *wrote_fallback = true;
                 return Some(sub_n);
             }
         } else {
@@ -3695,6 +3728,7 @@ impl Shadow {
         let mut title = Vec::new();
         let mut written = 0usize;
         let mut at = offset;
+        let mut unused_fallback = false;
         while at < end {
             let n = (PAGE - (start + at) % PAGE).min(end - at);
             let gpu_page = &gpu[at - offset..at - offset + n];
@@ -3710,6 +3744,7 @@ impl Shadow {
                     &mut old[first..=last],
                     &mut title,
                     true,
+                    &mut unused_fallback,
                 )?;
             }
             at += n;
@@ -3881,6 +3916,7 @@ impl Shadow {
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
             let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            let mut wrote_fallback = false;
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -3905,9 +3941,13 @@ impl Shadow {
                             opened = true;
                         }
                         crate::host::write_mapped_raw((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                        wrote_fallback = true;
                     }
                     written += len;
                 }
+            }
+            if wrote_fallback {
+                crate::watch::ask_once_void();
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -4884,10 +4924,21 @@ impl Shadow {
     ) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
+        let last = (to - 1) / PAGE;
+        // Acquire `LAZY_STATE` before `self.copied` (lock order).
+        let own_clean = if crate::lazy_back::active() {
+            crate::lazy_back::owned_cpu_clean_blocks_in(
+                self as *const Shadow as usize,
+                from / PAGE,
+                last + 1,
+            )
+        } else {
+            Vec::new()
+        };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
+        let mut clean_owned = own_clean.iter().peekable();
         let mut run = None;
-        let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -4896,8 +4947,16 @@ impl Shadow {
                 }
                 _ => 0,
             };
+            let pre_epoch = match clean_owned.peek() {
+                Some(&&(p, e)) if p == page => {
+                    clean_owned.next();
+                    Some(e)
+                }
+                _ => None,
+            };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            let own_lazy_clean = pre_epoch.is_some_and(|pre| *at > 0 && pre <= *at);
+            if !own_lazy_clean && (*at == 0 || write > *at) {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
@@ -4958,11 +5017,7 @@ impl Shadow {
         if total == 0 {
             return 0;
         }
-        if crate::lazy_back::active() {
-            for s in &segs {
-                crate::lazy_back::materialize_range(s.src, s.len);
-            }
-        }
+        materialize_copy_segs(&segs);
         if let Some(rebar) = &self.rebar {
             let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(m) = mirror.as_mut() {
@@ -4977,9 +5032,7 @@ impl Shadow {
                     let ok = run_copy_segs_checked(&segs);
                     drop(mirror);
                     if !ok {
-                        for s in &segs {
-                            crate::lazy_back::materialize_range(s.src, s.len);
-                        }
+                        materialize_copy_segs(&segs);
                         let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(m) = mirror.as_mut() {
                             let m_ptr = m.as_mut_ptr() as usize;
@@ -4998,9 +5051,7 @@ impl Shadow {
             }
         }
         if !run_copy_segs_checked(&segs) {
-            for s in &segs {
-                crate::lazy_back::materialize_range(s.src, s.len);
-            }
+            materialize_copy_segs(&segs);
             let _ = run_copy_segs_checked(&segs);
         }
         self.finish_copy_segs(start, &segs);
@@ -5337,6 +5388,7 @@ impl Shadow {
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped_raw((start + at) as *mut u8, title.as_ptr(), n);
+        crate::watch::ask_once_void();
         Some(n)
     }
 
@@ -5382,6 +5434,13 @@ impl Shadow {
             size: 0,
         });
         Some(Arc::new(shadow))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_card_dirty_for_test(&self) {
+        if let Some(card) = &self.card {
+            card.dirty.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
     }
 }
 

@@ -130,6 +130,7 @@ enum BitField {
     GuardAbsent,
     GuardAliased,
     GuardViewed,
+    LazyArmed,
 }
 
 struct LeafChunk {
@@ -144,6 +145,7 @@ struct LeafChunk {
     guard_absent_bits: [AtomicU64; CHUNK_WORDS],
     guard_aliased_bits: [AtomicU64; CHUNK_WORDS],
     guard_viewed_bits: [AtomicU64; CHUNK_WORDS],
+    lazy_armed_bits: [AtomicU64; CHUNK_WORDS],
 }
 
 impl LeafChunk {
@@ -160,6 +162,7 @@ impl LeafChunk {
             guard_absent_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
             guard_aliased_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
             guard_viewed_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
+            lazy_armed_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
         }
     }
 
@@ -173,6 +176,7 @@ impl LeafChunk {
             BitField::GuardAbsent => &self.guard_absent_bits,
             BitField::GuardAliased => &self.guard_aliased_bits,
             BitField::GuardViewed => &self.guard_viewed_bits,
+            BitField::LazyArmed => &self.lazy_armed_bits,
         }
     }
 }
@@ -422,6 +426,13 @@ impl PageDir {
     }
 
     #[inline]
+    fn written_epoch(&self, page: usize) -> u64 {
+        self.get(page)
+            .map(|(leaf, idx)| leaf.written_epoch[idx].load(Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
+    #[inline]
     fn is_cold_ro(&self, block: usize) -> bool {
         self.get_bit(block, BitField::ColdRo, Ordering::SeqCst)
     }
@@ -429,6 +440,11 @@ impl PageDir {
     #[inline]
     fn is_guard_clean(&self, block: usize) -> bool {
         self.get_bit(block, BitField::GuardClean, Ordering::SeqCst)
+    }
+
+    #[inline]
+    fn is_lazy_armed(&self, block: usize) -> bool {
+        self.get_bit(block, BitField::LazyArmed, Ordering::SeqCst)
     }
 
     #[inline]
@@ -449,6 +465,7 @@ impl PageDir {
         let (w, bit) = (idx / 64, 1u64 << (idx % 64));
         (leaf.guard_protected_bits[w].load(Ordering::Acquire) & bit != 0)
             || (leaf.guard_absent_bits[w].load(Ordering::Acquire) & bit != 0)
+            || (leaf.lazy_armed_bits[w].load(Ordering::Acquire) & bit != 0)
             || (vk && (leaf.guard_viewed_bits[w].load(Ordering::Acquire) & bit != 0))
     }
 
@@ -465,7 +482,7 @@ impl PageDir {
         combined & bit != 0
     }
 
-    fn all_guard_clean(&self, first: usize, last: usize) -> bool {
+    fn all_words_set(&self, first: usize, last: usize, mut word_val: impl FnMut(&LeafChunk, usize) -> u64) -> bool {
         if first >= last || last > MAX_RADIX_PAGES {
             return false;
         }
@@ -480,7 +497,7 @@ impl PageDir {
             let hi_idx = next_chunk - chunk_page;
             let mut all = true;
             for_each_word_in_chunk(lo_idx, hi_idx, |w, mask| {
-                if leaf.guard_clean_bits[w].load(Ordering::SeqCst) & mask != mask {
+                if word_val(leaf, w) & mask != mask {
                     all = false;
                     return false;
                 }
@@ -492,6 +509,13 @@ impl PageDir {
             cur = next_chunk;
         }
         true
+    }
+
+    fn all_guard_clean_or_lazy(&self, first: usize, last: usize) -> bool {
+        self.all_words_set(first, last, |leaf, w| {
+            leaf.guard_clean_bits[w].load(Ordering::SeqCst)
+                | leaf.lazy_armed_bits[w].load(Ordering::SeqCst)
+        })
     }
 
     fn any_bits_in_range(&self, first: usize, last: usize, fields: &[BitField]) -> bool {
@@ -553,8 +577,13 @@ impl PageDir {
         out
     }
 
-    /// Collects contiguous sub-runs of `[first, last)` where `field` bits are 0.
-    fn collect_clear_runs(&self, first: usize, last: usize, field: BitField) -> Vec<(usize, usize)> {
+    /// Collects contiguous sub-runs of `[first, last)` where `word_val` bits are 0.
+    fn collect_clear_runs_with(
+        &self,
+        first: usize,
+        last: usize,
+        mut word_val: impl FnMut(&LeafChunk, usize) -> u64,
+    ) -> Vec<(usize, usize)> {
         let mut runs: Vec<(usize, usize)> = Vec::new();
         if first >= last {
             return runs;
@@ -584,11 +613,10 @@ impl PageDir {
                 cur = skip_to;
                 continue;
             };
-            let words = leaf.bits(field);
             let lo_idx = cur - chunk_page;
             let hi_idx = next_chunk - chunk_page;
             for_each_word_in_chunk(lo_idx, hi_idx, |w, mask| {
-                let val = words[w].load(Ordering::SeqCst);
+                let val = word_val(leaf, w);
                 let mut clear = (!val) & mask;
                 while clear != 0 {
                     let tz = clear.trailing_zeros() as usize;
@@ -607,6 +635,21 @@ impl PageDir {
             cur = next_chunk;
         }
         runs
+    }
+
+    /// Collects contiguous sub-runs of `[first, last)` where `field` bits are 0.
+    fn collect_clear_runs(&self, first: usize, last: usize, field: BitField) -> Vec<(usize, usize)> {
+        self.collect_clear_runs_with(first, last, |leaf, w| {
+            leaf.bits(field)[w].load(Ordering::SeqCst)
+        })
+    }
+
+    /// Collects contiguous sub-runs of `[first, last)` where neither `GuardClean` nor `LazyArmed` is set.
+    fn collect_non_clean_non_lazy_runs(&self, first: usize, last: usize) -> Vec<(usize, usize)> {
+        self.collect_clear_runs_with(first, last, |leaf, w| {
+            leaf.guard_clean_bits[w].load(Ordering::Acquire)
+                | leaf.lazy_armed_bits[w].load(Ordering::Acquire)
+        })
     }
 
     #[inline]
@@ -1245,6 +1288,7 @@ fn collect_and_ask_batch(
                             BitField::GuardAbsent,
                             BitField::GuardViewed,
                             BitField::GuardAliased,
+                            BitField::LazyArmed,
                         ],
                     )
                 {
@@ -1413,12 +1457,25 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
                 }
             }
         }
-        SHARED[1].fetch_add(1, Relaxed);
-        let n = SHARED[1].load(Relaxed);
-        if n.is_power_of_two() && n >= 256 {
+        let n = SHARED[1].fetch_add(1, Relaxed) + 1;
+        if n >= 256 && (n.is_power_of_two() || n.is_multiple_of(1024)) {
+            let shared = SHARED[0].load(Relaxed);
+            let prev_shared = SHARED_LAST[0].swap(shared, Relaxed);
+            let prev_asked = SHARED_LAST[1].swap(n, Relaxed);
+            let window_shared = shared.saturating_sub(prev_shared);
+            let window_asked = n.saturating_sub(prev_asked);
+            let window_total = window_shared + window_asked;
+            let window_hit_pct = if window_total > 0 {
+                (window_shared as f64 * 100.0) / window_total as f64
+            } else {
+                0.0
+            };
             tracing::info!(
-                shared = SHARED[0].load(Relaxed),
+                shared,
                 asked = n,
+                window_shared,
+                window_asked,
+                window_hit_pct = format_args!("{window_hit_pct:.1}"),
                 "submissions that took the asking before them, and that asked anew (VICTORY_ASK_SHARED=1)"
             );
         }
@@ -1476,6 +1533,7 @@ pub(crate) static CURRENT_STAMP: AtomicU64 = AtomicU64::new(0);
 /// [`TITLE_SUBMITS`] when the asking that stands was made.
 static ASK_STAMP: AtomicU64 = AtomicU64::new(0);
 static SHARED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static SHARED_LAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// `VICTORY_ASK_SHARED=1` (experiment, with `VICTORY_ASYNC_SUBMIT`): one
 /// asking of the kernel stands for every submission the title gave before
@@ -1944,11 +2002,54 @@ pub(crate) fn ensure_handler() {
     install();
 }
 
+/// Returns `true` if `block` is known view memory in `PageDir` without locking `GUARDS`.
+#[inline]
+pub(crate) fn is_known_view_block(block: usize) -> bool {
+    DIR.is_known_view(block, view_known())
+}
+
+/// Records a fresh write epoch and sets `BitField::LazyArmed` for view pages
+/// armed with `PAGE_NOACCESS` (lock-free; safe under `LAZY_STATE`).
+pub(crate) fn note_lazy_view_armed(armed_vas: &[usize]) {
+    let now = next_epoch();
+    for &va in armed_vas {
+        let b = va / PAGE;
+        DIR.record_written(b, now);
+        DIR.set_bit(b, BitField::LazyArmed, true, Ordering::SeqCst);
+    }
+}
+
+/// Advances the write epoch when an already-armed lazy view entry is reused for
+/// another GPU flight (lock-free; safe under `LAZY_STATE`).
+pub(crate) fn note_lazy_view_reused(armed_vas: &[usize]) {
+    let now = next_epoch();
+    for &va in armed_vas {
+        DIR.record_written(va / PAGE, now);
+    }
+}
+
+/// Clears `BitField::LazyArmed` for all pages in `armed_vas` (lock-free).
+pub(crate) fn clear_lazy_view_armed(armed_vas: &[usize]) {
+    for &va in armed_vas {
+        DIR.set_bit(va / PAGE, BitField::LazyArmed, false, Ordering::SeqCst);
+    }
+}
+
+/// Clears `BitField::LazyArmed` for a single 64 KiB `block` (lock-free).
+#[inline]
+pub(crate) fn clear_lazy_view_armed_block(block: usize) {
+    DIR.set_bit(block, BitField::LazyArmed, false, Ordering::SeqCst);
+}
+
 /// Atomically checks pin state, clears guard/cold metadata for `blocks`, and
-/// invokes `arm()` under `GUARDS` (`GUARDS -> LAZY_STATE` lock order) so no
-/// concurrent `guard()`, `promote_cold_pages()`, or `kernel_writing()` can
-/// re-arm or pin `blocks` between disarming and `LAZY_STATE` insertion.
-pub(crate) fn try_arm_lazy_under_guards(blocks: &[usize], arm: impl FnOnce() -> bool) -> bool {
+/// invokes `arm(cpu_clean_after)` under `GUARDS` (`GUARDS -> LAZY_STATE` lock
+/// order) so no concurrent `guard()`, `promote_cold_pages()`, or
+/// `kernel_writing()` can re-arm or pin `blocks` between disarming and
+/// `LAZY_STATE` insertion.
+pub(crate) fn try_arm_lazy_under_guards(
+    blocks: &[usize],
+    arm: impl FnOnce(Option<u64>) -> bool,
+) -> bool {
     if blocks.is_empty() {
         return false;
     }
@@ -1957,6 +2058,10 @@ pub(crate) fn try_arm_lazy_under_guards(blocks: &[usize], arm: impl FnOnce() -> 
     if blocks.iter().any(|&b| g.pinned(b)) {
         return false;
     }
+    let primary_block = blocks[0];
+    let was_clean_view =
+        DIR.is_guard_protected(primary_block) && DIR.is_guard_clean(primary_block);
+    let cpu_clean_after = was_clean_view.then(|| DIR.written_epoch(primary_block));
     let mut sorted = blocks.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -1967,7 +2072,7 @@ pub(crate) fn try_arm_lazy_under_guards(blocks: &[usize], arm: impl FnOnce() -> 
         DIR.set_bits_range(from, to, BitField::GuardAbsent, false, Ordering::SeqCst);
         DIR.set_bits_range(from, to, BitField::GuardAliased, false, Ordering::SeqCst);
     });
-    arm()
+    arm(cpu_clean_after)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -1975,7 +2080,7 @@ pub(crate) fn try_arm_lazy_under_guards(blocks: &[usize], arm: impl FnOnce() -> 
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    if guard_bits_fast_enabled() && DIR.all_guard_clean(first, last) {
+    if guard_bits_fast_enabled() && DIR.all_guard_clean_or_lazy(first, last) {
         return Some(Vec::new());
     }
     // `VICTORY_GUARD_ASK=1` asks Windows (`is_view`) on every guard check even
@@ -1991,7 +2096,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     install();
     if guard_bits_fast_enabled() {
-        let runs = DIR.collect_clear_runs(first, last, BitField::GuardClean);
+        let runs = DIR.collect_non_clean_non_lazy_runs(first, last);
         let mut written = Vec::new();
         if runs.is_empty() {
             return Some(written);
@@ -2019,8 +2124,9 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
     let mut uncommitted_until = first;
     let lazy = crate::lazy_back::active();
     for block in first..=last {
-        let is_clean = block < last && DIR.is_guard_clean(block);
-        let mut open = block < last && !is_clean;
+        let is_clean_or_lazy =
+            block < last && (DIR.is_guard_clean(block) || DIR.is_lazy_armed(block));
+        let mut open = block < last && !is_clean_or_lazy;
         if open && DIR.is_guard_absent(block) {
             if block >= uncommitted_until {
                 uncommitted_until = uncommitted_end(block);
@@ -2485,9 +2591,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
         return;
     }
     if crate::lazy_back::active() {
-        for &(at, n) in &ranges {
-            crate::lazy_back::materialize_range(at, n);
-        }
+        crate::lazy_back::materialize_ranges(&ranges);
     }
     let mut g = guards();
     for &(at, n) in &ranges {
@@ -2727,6 +2831,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     DIR.set_bits_range(range.start, range.end, BitField::GuardProtected, false, Ordering::SeqCst);
     DIR.set_bits_range(range.start, range.end, BitField::GuardClean, false, Ordering::SeqCst);
     DIR.set_bits_range(range.start, range.end, BitField::ColdRo, false, Ordering::SeqCst);
+    DIR.set_bits_range(range.start, range.end, BitField::LazyArmed, false, Ordering::SeqCst);
     DIR.reset_cold_range(range.start, range.end, current_frame32());
 
     if !to_restore.is_empty() {
@@ -3965,7 +4070,7 @@ mod tests {
             g.pin(b1, b1 + 1, std::time::Instant::now() + PIN);
         }
         let mut armed = false;
-        assert!(!try_arm_lazy_under_guards(&[b0, b1, b2], || {
+        assert!(!try_arm_lazy_under_guards(&[b0, b1, b2], |_| {
             armed = true;
             true
         }));
@@ -3976,7 +4081,8 @@ mod tests {
         guards().pins.clear();
         DIR.set_bit(b1, BitField::ColdRo, true, Ordering::SeqCst);
         let blocks = [b0, b1, b2];
-        let ok = try_arm_lazy_under_guards(&blocks, || {
+        let ok = try_arm_lazy_under_guards(&blocks, |cpu_clean_after| {
+            assert!(cpu_clean_after.is_some());
             for &b in &blocks {
                 assert!(!DIR.is_guard_protected(b));
                 assert!(!DIR.is_guard_clean(b));
@@ -4012,6 +4118,58 @@ mod tests {
         assert_eq!(entries2, vec![(page, now), (page + 1, now)]);
         assert_eq!(max_e2, now);
         DIR.clear_written_range(page, page + 2);
+    }
+
+    #[test]
+    fn watch_lazy_armed_view_is_lock_free_and_preserves_noaccess() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect,
+            VirtualQuery,
+        };
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (section, va, two) = two_views(BLOCK);
+        let block = va / PAGE;
+        DIR.clear_written_range(block, block + 1);
+
+        let mut old = 0u32;
+        // SAFETY: `va` is a committed section view mapped by `two_views`.
+        assert_ne!(
+            unsafe { VirtualProtect(va as *const _, PAGE, PAGE_NOACCESS, &mut old) },
+            0
+        );
+        note_lazy_view_armed(&[va]);
+        assert!(DIR.is_lazy_armed(block));
+        let defer_epoch = DIR.written_epoch(block);
+        assert!(defer_epoch > 0);
+
+        let (now, written) = writes(va, va + PAGE, true).expect("view writes");
+        assert!(now >= defer_epoch);
+        assert_eq!(written, vec![(block, defer_epoch)]);
+
+        // SAFETY: plain `VirtualQuery` into a zeroed `MEMORY_BASIC_INFORMATION`.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `va` is a valid committed address in this process.
+        let queried = unsafe { VirtualQuery(va as *const _, &mut info, size_of_val(&info)) };
+        assert_ne!(queried, 0);
+        assert_eq!(info.State, MEM_COMMIT);
+        assert_eq!(info.Protect, PAGE_NOACCESS);
+
+        clear_lazy_view_armed(&[va]);
+        assert!(!DIR.is_lazy_armed(block));
+        // SAFETY: restoring RW protection before resuming normal `PAGE_READONLY` guarding.
+        assert_ne!(
+            unsafe { VirtualProtect(va as *const _, PAGE, PAGE_READWRITE, &mut old) },
+            0
+        );
+        let (now2, written2) = writes(va, va + PAGE, true).expect("guard resumed");
+        assert!(now2 > defer_epoch);
+        assert_eq!(written2, vec![(block, now2)]);
+        assert!(DIR.is_guard_protected(block));
+        assert!(DIR.is_guard_clean(block));
+        assert!(!writable(va));
+
+        DIR.clear_written_range(block, block + 1);
+        drop_views(section, &[va, two], BLOCK);
     }
 }
 
