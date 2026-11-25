@@ -461,6 +461,15 @@ pub fn emit_with(
     emit_with_hash(c, native, p, st, io, res, options, "")
 }
 
+fn wide_lowering_enabled(hash: &str, wide_env: Option<&std::ffi::OsStr>, group_sync: u8) -> bool {
+    let checked_group = matches!(
+        hash,
+        "369cbe906ea72764" | "5dc3b25986622949" | "6f225b641c5b0708"
+    ) && group_sync != 0;
+    wide_env.is_some_and(|v| v == "1")
+        || (checked_group && wide_env.is_none_or(|v| v != "0"))
+}
+
 /// [`emit_with`] with the container hash available.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_with_hash(
@@ -541,12 +550,13 @@ pub fn emit_with_hash(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
+        // For a console wave run as two host waves this form puts group barriers inside
+        // branches and loops. Keep it opt-in outside the checked shaders: runs 121-124
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide = std::env::var_os("VICTORY_WAVE_WIDE");
+        let wide_on = wide_lowering_enabled(hash, wide.as_deref(), group_sync());
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -684,7 +694,7 @@ pub fn emit_with_hash(
         // (Grand Theft Auto VI's a53a7977fe762268, dispatched twice a frame: its light
         // loops, wave ORs over the lanes' cluster masks, sit in lane branches and needed the
         // two host waves to exchange there; 8 branches taken wave-wide.)
-        let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        let wide_last = !wide_on && wide.as_deref().is_none_or(|v| v != "0");
         if wide_last {
             let again = widen(c, native, p, why, options);
             report("wave-wide branches, last resort", &again);
@@ -2844,6 +2854,48 @@ mod barycentric_tests {
                 ran += 1;
             }
             assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+        }
+    }
+
+    #[test]
+    fn checked_single_wave_compute_hashes_enable_wide_unless_opted_out() {
+        use std::ffi::OsStr;
+
+        let checked = [
+            "369cbe906ea72764",
+            "5dc3b25986622949",
+            "6f225b641c5b0708",
+        ];
+        for hash in checked {
+            assert!(wide_lowering_enabled(hash, None, 2), "{hash} with group_sync=2");
+            assert!(wide_lowering_enabled(hash, None, 1), "{hash} with group_sync=1");
+            assert!(
+                !wide_lowering_enabled(hash, None, 0),
+                "{hash} must stay off when group_sync=0"
+            );
+            assert!(
+                !wide_lowering_enabled(hash, Some(OsStr::new("0")), 2),
+                "{hash} must opt out with VICTORY_WAVE_WIDE=0"
+            );
+            assert!(
+                wide_lowering_enabled(hash, Some(OsStr::new("1")), 0),
+                "{hash} with explicit VICTORY_WAVE_WIDE=1"
+            );
+        }
+
+        for other in ["", "f133e35efed2a48a", "a53a7977fe762268", "0123456789abcdef"] {
+            assert!(
+                !wide_lowering_enabled(other, None, 2),
+                "{other} must stay off by default"
+            );
+            assert!(
+                !wide_lowering_enabled(other, Some(OsStr::new("0")), 2),
+                "{other} with VICTORY_WAVE_WIDE=0"
+            );
+            assert!(
+                wide_lowering_enabled(other, Some(OsStr::new("1")), 2),
+                "{other} with explicit VICTORY_WAVE_WIDE=1"
+            );
         }
     }
 }
