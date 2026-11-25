@@ -84,6 +84,23 @@ static JOURNAL: std::sync::RwLock<Journal> = std::sync::RwLock::new(Journal {
     kept: false,
 });
 
+/// Mirrors `Journal::kept` so `Batch::flush` / `ask_ahead` / `ask_ahead_done`
+/// can skip range collection, `in_view` lock lookups, sorting, and exclusive
+/// `JOURNAL.write()` locks while a submission-wide `ask_once` is active.
+static ASK_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn set_kept(j: &mut Journal, kept: bool) {
+    j.kept = kept;
+    ASK_KEPT.store(kept, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a submission-wide write-watch asking (`ask_once`) currently stands.
+#[inline]
+pub(crate) fn ask_kept() -> bool {
+    ASK_KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Experiment (`VICTORY_WATCH_STATS=1`): the kernel askings by where they
 /// come from and how they end: ahead ok, ahead failed, `writes` ok,
 /// `writes` failed (then the guards), the pages asked in each, and the
@@ -225,6 +242,9 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if ask_kept() {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -290,6 +310,9 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
+    if ask_kept() {
+        return;
+    }
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if !j.kept {
         j.ahead.clear();
@@ -345,7 +368,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
                     j.ahead.push((first, last));
                 }
             }
-            j.kept = true;
+            set_kept(j, true);
             SHARED[0].fetch_add(1, Relaxed);
             return;
         }
@@ -354,7 +377,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         if n.is_power_of_two() && n >= 256 {
             tracing::info!(shared = SHARED[0].load(Relaxed), asked = n, "submissions that took the asking before them, and that asked anew (VICTORY_ASK_SHARED=1)");
         }
-        j.kept = false;
+        set_kept(j, false);
         j.ahead.clear();
     }
     ask_once_end();
@@ -381,7 +404,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             j.ahead.push((first, last));
         }
     }
-    j.kept = !j.ahead.is_empty();
+    let kept = !j.ahead.is_empty();
+    set_kept(j, kept);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -394,7 +418,7 @@ pub(crate) fn ask_once_end() {
     }
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     if j.kept {
-        j.kept = false;
+        set_kept(&mut j, false);
         j.ahead.clear();
     }
 }
@@ -404,7 +428,7 @@ pub(crate) fn ask_once_end() {
 pub(crate) fn ask_once_void() {
     ASK_STAMP.store(0, std::sync::atomic::Ordering::Relaxed);
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
-    j.kept = false;
+    set_kept(&mut j, false);
     j.ahead.clear();
 }
 

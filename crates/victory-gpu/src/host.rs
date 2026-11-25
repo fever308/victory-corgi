@@ -7169,7 +7169,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
-            let started = std::time::Instant::now();
+            let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7178,6 +7178,10 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    // `batch.title_written()` already timed and accounted its
+                    // flushed refreshes in `PREPARING[0]`; measure only this
+                    // copy step so refreshes are not double-counted.
+                    started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7190,7 +7194,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::shadow::copy_mapped_wide(dst as *mut u8, src as *const u8, len);
                     fill_taken(dst, src, len);
                     len
                 }
@@ -7297,6 +7301,93 @@ mod wide_refresh_tests {
         assert!(!wide_refresh_enabled(Some("0"), Some(16)));
         assert!(wide_refresh_enabled(Some("auto"), Some(4)));
     }
+
+    #[test]
+    fn victory_copy_try_variants_preserve_bytes_and_recover_from_faults() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        super::install_fast_copy_handler();
+
+        let variants: Vec<(&str, unsafe extern "C" fn(*mut u8, *const u8, usize) -> u32)> = {
+            let mut v: Vec<(&str, unsafe extern "C" fn(*mut u8, *const u8, usize) -> u32)> =
+                vec![("sse2", super::victory_copy_try_sse2)];
+            if std::is_x86_feature_detected!("avx2") {
+                v.push(("avx2", super::victory_copy_try_avx2));
+            }
+            v
+        };
+
+        // 1. Verify exact copies across lengths 0..=260, unaligned src/dst offsets,
+        // and multi-kilobyte spans without clobbering sentinel guard bytes.
+        let src: Vec<u8> = (0..8192usize)
+            .map(|i| ((i.wrapping_mul(53) ^ (i >> 5) ^ 0x3c) & 0xff) as u8)
+            .collect();
+        let mut dst = vec![0xEEu8; 8192];
+        for &(name, copy_fn) in &variants {
+            for dst_off in [0usize, 1, 7, 15, 16, 17, 31, 32, 33] {
+                for src_off in [0usize, 3, 15, 16, 31] {
+                    for len in [
+                        0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95,
+                        127, 128, 129, 159, 160, 161, 255, 256, 257, 4097,
+                    ] {
+                        dst.fill(0xEE);
+                        // SAFETY: disjoint buffers with `dst_off + len < 8192`.
+                        let ok = unsafe {
+                            copy_fn(
+                                dst.as_mut_ptr().add(dst_off),
+                                src.as_ptr().add(src_off),
+                                len,
+                            )
+                        };
+                        assert_eq!(ok, 1, "{name} copy failed for len={len}");
+                        assert_eq!(
+                            &dst[dst_off..dst_off + len],
+                            &src[src_off..src_off + len],
+                            "{name} mismatch dst_off={dst_off} src_off={src_off} len={len}"
+                        );
+                        assert!(
+                            dst[..dst_off].iter().all(|&b| b == 0xEE)
+                                && dst[dst_off + len..].iter().all(|&b| b == 0xEE),
+                            "{name} overwrote guard bytes dst_off={dst_off} len={len}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 2. Verify fault recovery on an uncommitted page at multiple distances
+        // (hits small tail, alignment prologue, and 128B/64B main vector loops).
+        // SAFETY: reserve 2 pages, commit only the first.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 2 * 4096, MEM_RESERVE, PAGE_NOACCESS)
+                .cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(
+                VirtualAlloc(base.cast(), 4096, MEM_COMMIT, PAGE_READWRITE),
+                base.cast()
+            );
+            base.write_bytes(0x42, 4096);
+            let mut out = vec![0u8; 2 * 4096];
+            for &(name, copy_fn) in &variants {
+                for &(start_off, len) in &[
+                    (4096usize, 16usize),
+                    (4096 - 3, 16),
+                    (4096 - 32, 64),
+                    (4096 - 100, 256),
+                    (0, 2 * 4096),
+                ] {
+                    let ok = copy_fn(out.as_mut_ptr().add(7), base.add(start_off), len);
+                    assert_eq!(
+                        ok, 0,
+                        "{name} must return 0 on unmapped page (start_off={start_off}, len={len})"
+                    );
+                }
+            }
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -7375,9 +7466,12 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        if self.refreshes.is_empty() {
+            return;
+        }
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy. Skip when `ask_once` already covers the submission.
+        let ahead = self.refreshes.len() > 1 && !crate::watch::ask_kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -7389,25 +7483,12 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
-            let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                .collect();
-            crate::shadow::wide_run(jobs);
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
-        } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
-            }
-        }
+        let started = std::time::Instant::now();
+        let items: Vec<_> = self.refreshes.drain(..).collect();
+        let copied = crate::shadow::refresh_batch(items, wide_refresh());
+        let us = started.elapsed().as_micros() as u64;
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -7452,11 +7533,24 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     if !title_dst && fast_fill() {
         // SAFETY: the destination is mapped writable memory of `len` bytes;
-        // a fault on the source is caught (`fast_fill`), and the kernel's
-        // copy below then says which pages are not there.
+        // a fault on the source is caught (`fast_fill`), and `read_sparse` /
+        // `read_pieces` handles any unmapped holes directly without repeating
+        // a failing whole-range `ReadProcessMemory` syscall.
         if unsafe { victory_copy_try(dst, src, len) } != 0 {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+        #[cfg(feature = "diagnostics")]
+        let sparse = std::time::Instant::now();
+        if len >= 64 << 10 {
+            read_sparse(src, dst, len);
+        } else {
+            read_pieces(src, dst, len);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+        return;
     }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
@@ -7489,41 +7583,208 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
 }
 
-// A copy that may fault on its source: `rep movsb` between two labels, and
-// a place to go on at if it faults (`fast_fill`'s handler). A leaf: no
-// frame, `rdi` and `rsi` kept in volatile registers.
+// Non-overlapping vectorized copies that may fault on their source: both
+// variants are pure Win64 ABI leaf functions (only volatile registers touched,
+// stack untouched) so [`fast_fill`]'s vectored exception handler can redirect
+// any faulting load inside `[start, end)` straight to the matching `fail` exit.
+// Destination-aligned 128 B/iter AVX2 (or 64 B/iter SSE2) stores saturate both
+// write-back staging RAM and write-combining ReBAR/upload VRAM far better than
+// `rep movsb`.
 std::arch::global_asm!(
-    ".globl victory_copy_try",
-    ".globl victory_copy_try_start",
-    ".globl victory_copy_try_end",
-    ".globl victory_copy_try_fail",
-    "victory_copy_try:",
-    "mov r9, rdi",
-    "mov r10, rsi",
-    "mov rdi, rcx",
-    "mov rsi, rdx",
-    "mov rcx, r8",
-    "victory_copy_try_start:",
-    "rep movsb",
-    "victory_copy_try_end:",
-    "mov rdi, r9",
-    "mov rsi, r10",
+    ".globl victory_copy_try_avx2",
+    ".globl victory_copy_try_avx2_start",
+    ".globl victory_copy_try_avx2_end",
+    ".globl victory_copy_try_avx2_fail",
+    "victory_copy_try_avx2:",
+    "victory_copy_try_avx2_start:",
+    "cmp r8, 128",
+    "jb 2f",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vmovdqu ymmword ptr [rcx], ymm0",
+    "mov rax, rcx",
+    "and rax, 31",
+    "mov r9, 32",
+    "sub r9, rax",
+    "add rcx, r9",
+    "add rdx, r9",
+    "sub r8, r9",
+    "cmp r8, 128",
+    "jb 2f",
+    ".p2align 4",
+    "1:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vmovdqu ymm1, ymmword ptr [rdx + 32]",
+    "vmovdqu ymm2, ymmword ptr [rdx + 64]",
+    "vmovdqu ymm3, ymmword ptr [rdx + 96]",
+    "vmovdqa ymmword ptr [rcx], ymm0",
+    "vmovdqa ymmword ptr [rcx + 32], ymm1",
+    "vmovdqa ymmword ptr [rcx + 64], ymm2",
+    "vmovdqa ymmword ptr [rcx + 96], ymm3",
+    "add rdx, 128",
+    "add rcx, 128",
+    "sub r8, 128",
+    "cmp r8, 128",
+    "jae 1b",
+    "2:",
+    "cmp r8, 32",
+    "jb 4f",
+    "3:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vmovdqu ymmword ptr [rcx], ymm0",
+    "add rdx, 32",
+    "add rcx, 32",
+    "sub r8, 32",
+    "cmp r8, 32",
+    "jae 3b",
+    "4:",
+    "cmp r8, 16",
+    "jb 5f",
+    "vmovdqu xmm0, xmmword ptr [rdx]",
+    "vmovdqu xmmword ptr [rcx], xmm0",
+    "add rdx, 16",
+    "add rcx, 16",
+    "sub r8, 16",
+    "5:",
+    "cmp r8, 8",
+    "jb 6f",
+    "mov rax, qword ptr [rdx]",
+    "mov qword ptr [rcx], rax",
+    "add rdx, 8",
+    "add rcx, 8",
+    "sub r8, 8",
+    "6:",
+    "cmp r8, 4",
+    "jb 7f",
+    "mov eax, dword ptr [rdx]",
+    "mov dword ptr [rcx], eax",
+    "add rdx, 4",
+    "add rcx, 4",
+    "sub r8, 4",
+    "7:",
+    "test r8, r8",
+    "jz 9f",
+    "8:",
+    "mov al, byte ptr [rdx]",
+    "mov byte ptr [rcx], al",
+    "inc rdx",
+    "inc rcx",
+    "dec r8",
+    "jnz 8b",
+    "9:",
+    "victory_copy_try_avx2_end:",
+    "vzeroupper",
     "mov eax, 1",
     "ret",
-    "victory_copy_try_fail:",
-    "mov rdi, r9",
-    "mov rsi, r10",
+    "victory_copy_try_avx2_fail:",
+    "vzeroupper",
+    "xor eax, eax",
+    "ret",
+
+    ".globl victory_copy_try_sse2",
+    ".globl victory_copy_try_sse2_start",
+    ".globl victory_copy_try_sse2_end",
+    ".globl victory_copy_try_sse2_fail",
+    "victory_copy_try_sse2:",
+    "victory_copy_try_sse2_start:",
+    "cmp r8, 64",
+    "jb 12f",
+    "movdqu xmm0, xmmword ptr [rdx]",
+    "movdqu xmmword ptr [rcx], xmm0",
+    "mov rax, rcx",
+    "and rax, 15",
+    "mov r9, 16",
+    "sub r9, rax",
+    "add rcx, r9",
+    "add rdx, r9",
+    "sub r8, r9",
+    "cmp r8, 64",
+    "jb 12f",
+    ".p2align 4",
+    "11:",
+    "movdqu xmm0, xmmword ptr [rdx]",
+    "movdqu xmm1, xmmword ptr [rdx + 16]",
+    "movdqu xmm2, xmmword ptr [rdx + 32]",
+    "movdqu xmm3, xmmword ptr [rdx + 48]",
+    "movdqa xmmword ptr [rcx], xmm0",
+    "movdqa xmmword ptr [rcx + 16], xmm1",
+    "movdqa xmmword ptr [rcx + 32], xmm2",
+    "movdqa xmmword ptr [rcx + 48], xmm3",
+    "add rdx, 64",
+    "add rcx, 64",
+    "sub r8, 64",
+    "cmp r8, 64",
+    "jae 11b",
+    "12:",
+    "cmp r8, 16",
+    "jb 14f",
+    "13:",
+    "movdqu xmm0, xmmword ptr [rdx]",
+    "movdqu xmmword ptr [rcx], xmm0",
+    "add rdx, 16",
+    "add rcx, 16",
+    "sub r8, 16",
+    "cmp r8, 16",
+    "jae 13b",
+    "14:",
+    "cmp r8, 8",
+    "jb 15f",
+    "mov rax, qword ptr [rdx]",
+    "mov qword ptr [rcx], rax",
+    "add rdx, 8",
+    "add rcx, 8",
+    "sub r8, 8",
+    "15:",
+    "cmp r8, 4",
+    "jb 16f",
+    "mov eax, dword ptr [rdx]",
+    "mov dword ptr [rcx], eax",
+    "add rdx, 4",
+    "add rcx, 4",
+    "sub r8, 4",
+    "16:",
+    "test r8, r8",
+    "jz 18f",
+    "17:",
+    "mov al, byte ptr [rdx]",
+    "mov byte ptr [rcx], al",
+    "inc rdx",
+    "inc rcx",
+    "dec r8",
+    "jnz 17b",
+    "18:",
+    "victory_copy_try_sse2_end:",
+    "mov eax, 1",
+    "ret",
+    "victory_copy_try_sse2_fail:",
     "xor eax, eax",
     "ret",
 );
 
 unsafe extern "C" {
-    /// `len` bytes from `src` to `dst`; 0 if a page faulted (some bytes may
-    /// have been written). Only with [`fast_fill`]'s handler installed.
-    fn victory_copy_try(dst: *mut u8, src: *const u8, len: usize) -> u32;
-    static victory_copy_try_start: u8;
-    static victory_copy_try_end: u8;
-    static victory_copy_try_fail: u8;
+    fn victory_copy_try_avx2(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    static victory_copy_try_avx2_start: u8;
+    static victory_copy_try_avx2_end: u8;
+    static victory_copy_try_avx2_fail: u8;
+
+    fn victory_copy_try_sse2(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    static victory_copy_try_sse2_start: u8;
+    static victory_copy_try_sse2_end: u8;
+    static victory_copy_try_sse2_fail: u8;
+}
+
+/// Copies `len` non-overlapping bytes from `src` to `dst`; returns `0` if a
+/// source page faulted (some bytes may have been written). Only valid with
+/// [`fast_fill`]'s vectored handler installed.
+#[inline]
+unsafe fn victory_copy_try(dst: *mut u8, src: *const u8, len: usize) -> u32 {
+    static USE_AVX2: OnceLock<bool> = OnceLock::new();
+    if *USE_AVX2.get_or_init(|| std::is_x86_feature_detected!("avx2")) {
+        // SAFETY: AVX2 availability verified once above.
+        unsafe { victory_copy_try_avx2(dst, src, len) }
+    } else {
+        // SAFETY: SSE2 is baseline on x86_64.
+        unsafe { victory_copy_try_sse2(dst, src, len) }
+    }
 }
 
 /// `VICTORY_FAST_COPY=1` (experiment): what is read from title memory into
@@ -7534,6 +7795,17 @@ unsafe extern "C" {
 /// there faults; a handler sends the copy to its failure exit and the
 /// kernel's copy is used as before.
 fn fast_fill() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_FAST_COPY").is_some_and(|v| v == "1");
+        if on {
+            install_fast_copy_handler();
+        }
+        on
+    })
+}
+
+fn install_fast_copy_handler() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
@@ -7546,32 +7818,40 @@ fn fast_fill() -> bool {
                 return EXCEPTION_CONTINUE_SEARCH;
             }
             let context = &mut *(*info).ContextRecord;
-            let (start, end) = (&raw const victory_copy_try_start as u64, &raw const victory_copy_try_end as u64);
-            if context.Rip < start || context.Rip >= end {
-                return EXCEPTION_CONTINUE_SEARCH;
+            let (avx_s, avx_e) = (
+                &raw const victory_copy_try_avx2_start as u64,
+                &raw const victory_copy_try_avx2_end as u64,
+            );
+            if context.Rip >= avx_s && context.Rip < avx_e {
+                context.Rip = &raw const victory_copy_try_avx2_fail as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
             }
-            context.Rip = &raw const victory_copy_try_fail as u64;
-            EXCEPTION_CONTINUE_EXECUTION
+            let (sse_s, sse_e) = (
+                &raw const victory_copy_try_sse2_start as u64,
+                &raw const victory_copy_try_sse2_end as u64,
+            );
+            if context.Rip >= sse_s && context.Rip < sse_e {
+                context.Rip = &raw const victory_copy_try_sse2_fail as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            EXCEPTION_CONTINUE_SEARCH
         }
     }
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_FAST_COPY").is_some_and(|v| v == "1");
-        if on {
-            // SAFETY: the handler only looks at the faulting address and
-            // moves a copy of ours to its failure exit.
-            unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
-        }
-        on
-    })
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // SAFETY: the handler only inspects RIP within our leaf copy routines
+        // and redirects a faulting source load to the matching failure exit.
+        unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
+    });
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
+    let fast = fast_fill();
     let mut offset = 0;
     while offset < len {
         let at = src.wrapping_add(offset);
@@ -7591,6 +7871,13 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
             unsafe { to.write_bytes(0, n) };
+        } else if fast
+            && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
+            // SAFETY: destination is writable host memory; any concurrent
+            // unmap on `at` faults into `on_fault` and falls through below.
+            && unsafe { victory_copy_try(to, at, n) } != 0
+        {
+            // Fast userspace copy succeeded for this committed sub-region.
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
             read_pieces(at, to, n);
