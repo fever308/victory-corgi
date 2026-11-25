@@ -445,12 +445,16 @@ fn physical_cores() -> Option<usize> {
     if ok == 0 {
         return None;
     }
+    let written = (len as usize).min(buf.len());
+    let size_offset = std::mem::offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size);
     let mut at = 0usize;
     let mut cores = 0usize;
-    while at + 8 <= buf.len() {
-        // SAFETY: the record's own header; `Size` is its first field.
-        let size = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(at).cast::<u32>()) } as usize;
-        if size < 8 || at + size > buf.len() {
+    while at + size_offset + size_of::<u32>() <= written {
+        // SAFETY: `Size` is at `size_offset` in each record header, within `written <= buf.len()`.
+        let size = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr().add(at + size_offset).cast::<u32>())
+        } as usize;
+        if size < size_offset + size_of::<u32>() || at + size > written {
             break;
         }
         cores += 1;
@@ -1901,6 +1905,18 @@ mod tests {
         };
         assert_eq!(second, plain);
         assert!(first.iter().all(|&b| b == 0), "the old page was written");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_cores_reports_host_core_count() {
+        let logical = std::thread::available_parallelism().unwrap().get();
+        let cores = physical_cores()
+            .expect("GetLogicalProcessorInformationEx should report physical cores");
+        assert!(
+            (1..=logical).contains(&cores),
+            "physical cores {cores} outside 1..={logical}"
+        );
     }
 
     #[test]
