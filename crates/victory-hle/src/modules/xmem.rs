@@ -669,13 +669,15 @@ pub extern "system" fn XMemMapPhysicalPages(
     pages: *const usize,
 ) -> *mut c_void {
     let base = address as usize;
+    let len = n.saturating_mul(PAGE);
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    let (span_at, span_len) = touched_span(&physical, base, len);
+    let _changing = victory_gpu::title_memory_remapping(span_at, span_len);
+    unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
     }
@@ -743,7 +745,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let (span_at, span_len) = touched_span(&physical, to, len);
+    let _changing = victory_gpu::title_memory_remapping(span_at, span_len);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -864,6 +867,35 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// The byte range `(start, len)` whose mapping `unmap` + `map` over
+/// `[base, base + len)` can temporarily take down: `[base, base + len)`
+/// itself, widened to any existing views it overlaps (since `unmap` tears
+/// down a whole view and maps the remaining edges back).
+fn touched_span(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    if len == 0 {
+        return (base, 0);
+    }
+    let end = base.saturating_add(len);
+    let mut from = base;
+    let mut to = end;
+    if let Some((&at, &(size, _))) = physical
+        .views
+        .range(..=base)
+        .next_back()
+        .filter(|&(&at, &(size, _))| at.saturating_add(size) > base)
+    {
+        from = from.min(at);
+        to = to.max(at.saturating_add(size));
+    }
+    if let Some(after) = base.checked_add(1)
+        && after < end
+        && let Some((&at, &(size, _))) = physical.views.range(after..end).next_back()
+    {
+        to = to.max(at.saturating_add(size));
+    }
+    (from, to - from)
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -1256,7 +1288,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let _reading = victory_gpu::title_memory_reading();
+                    let _reading = victory_gpu::title_memory_reading(first, PAGE);
                     // SAFETY: the page is mapped whenever no change of
                     // mapping is under way, and none is while `_reading`
                     // is held.

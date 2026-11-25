@@ -580,6 +580,7 @@ pub(crate) fn retire_born<T: 'static>(object: T, born_seq: u64) {
 }
 
 /// Drops `object` once every epoch active now has finished: at once if none is.
+#[cfg(test)]
 pub(crate) fn retire<T: 'static>(object: T) {
     retire_born(object, 0);
 }
@@ -9074,6 +9075,21 @@ impl Meter {
                 mib(mem_b),
                 mib(rebar_b),
             );
+            let [remap_n, remap_wait_us, remap_hold_us] =
+                [0, 1, 2].map(|i| crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if remap_n > 0.0 {
+                tracing::info!(
+                    "changes of title memory's mapping per frame: {remap_n:.0}, {:.1} ms of them waiting for reads in place, \
+                     {:.1} ms under way ({})",
+                    remap_wait_us / 1000.0,
+                    remap_hold_us / 1000.0,
+                    if crate::watch::by_range() {
+                        "each holds the bytes it changes; VICTORY_MAPPING_RANGES=0 holds all of title memory"
+                    } else {
+                        "all of title memory held for each; VICTORY_MAPPING_RANGES=0"
+                    }
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
