@@ -1663,6 +1663,36 @@ impl HostHeap {
         buffers.iter().copied().collect()
     }
 
+    /// A rolling slice of title slots holding buffer views starting at or after
+    /// `cursor` (wrapping to 0 at the end): takes `ceil(total / divisor)` slots
+    /// (at least `min_chunk`, at most `total`) in `O(log N + chunk)` time and
+    /// returns `(slots, next_cursor)`.
+    pub(crate) fn buffer_slots_chunk(
+        &self,
+        cursor: u32,
+        divisor: usize,
+        min_chunk: usize,
+    ) -> (Vec<u32>, u32) {
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let total = buffers.len();
+        if total == 0 {
+            return (Vec::new(), 0);
+        }
+        let want = total.div_ceil(divisor.max(1)).max(min_chunk).min(total);
+        let mut out: Vec<u32> = buffers.range(cursor..).take(want).copied().collect();
+        if out.is_empty() && cursor > 0 {
+            out = buffers.iter().take(want).copied().collect();
+        }
+        let next_cursor = match out.last().copied() {
+            Some(last) if out.len() == want => last
+                .checked_add(1)
+                .filter(|&next| buffers.range(next..).next().is_some())
+                .unwrap_or(0),
+            _ => 0,
+        };
+        (out, next_cursor)
+    }
+
     /// The title slots whose buffer view was written, or went, since the
     /// last call.
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
@@ -1777,15 +1807,26 @@ impl HostHeap {
                 // dword, either value is one the slot had).
                 unsafe { (*data as *mut u32).add(index as usize).write_volatile(s) };
             }
-            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-            buffers.insert(index);
-            if let Some(noted) = self.noted.get(index as usize) {
-                noted.fetch_or(NOTED_BUFFER, std::sync::atomic::Ordering::Release);
+            let newly_inserted = {
+                let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+                let newly_inserted = buffers.insert(index);
+                if let Some(noted) = self.noted.get(index as usize) {
+                    noted.fetch_or(NOTED_BUFFER, std::sync::atomic::Ordering::Release);
+                }
+                newly_inserted
+            };
+            // Only queue into `changed` on an actual write (`!seen`) or when a
+            // previously-untracked buffer slot is first discovered (`newly_inserted`).
+            // When `heap_buffers()` mirrors a deferred (`made == 0`) buffer slot
+            // with `for_draw = true` (`seen = true`), `index` is already in
+            // `buffers`, so skipping re-insertion prevents a redundant 2x echo
+            // on the next frame.
+            if !seen || newly_inserted {
+                self.changed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(index);
             }
-            self.changed
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(index);
         } else if self
             .noted
             .get(index as usize)
@@ -1798,11 +1839,14 @@ impl HostHeap {
                 // dword, either value is one the slot had).
                 unsafe { (*data as *mut u32).add(index as usize).write_volatile(0) };
             }
-            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-            let was = buffers.remove(&index);
-            if let Some(noted) = self.noted.get(index as usize) {
-                noted.fetch_and(!NOTED_BUFFER, std::sync::atomic::Ordering::Release);
-            }
+            let was = {
+                let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+                let was = buffers.remove(&index);
+                if let Some(noted) = self.noted.get(index as usize) {
+                    noted.fetch_and(!NOTED_BUFFER, std::sync::atomic::Ordering::Release);
+                }
+                was
+            };
             if was {
                 self.changed
                     .lock()
@@ -2426,6 +2470,7 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            let replaced_made = made[index as usize] != 0;
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -2433,6 +2478,18 @@ impl HostHeap {
                 if stale != index {
                     self.unmake(&mut made, stale);
                 }
+            }
+            // If a draw (`for_draw = true`) replaced a previously-made buffer
+            // slot before `sync_heaps` saw the write (so `sync_heaps` will
+            // skip it on the `fast` hit), still notify `buffer_changes()`.
+            // Deferred writes (`mirror(..., for_draw = false)`) leave
+            // `made[index] == 0`, so `replaced_made` is false and they do not
+            // echo back into `changed`.
+            if for_draw && replaced_made && view_stride(&view).is_some() {
+                self.changed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(index);
             }
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
@@ -2648,6 +2705,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// (address, bytes): the whole buffer the view is of, which is what
 /// [`make`] finds the host copy by. [`buffer_range`] is the part of it the
 /// view reads.
+#[cfg(test)]
 pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
     match view {
         View::Shader(r, Some(_)) | View::Unordered(r, _, Some(_)) => {
@@ -2674,7 +2732,7 @@ fn view_extent() -> bool {
 /// bytes) it reads there; `None` for other views and empty ranges.
 ///
 /// The copy is the one the view's slot shows: [`make`] finds it by the
-/// whole buffer the view is of ([`buffer_extent`]). Looked up by the range
+/// whole buffer the view is of. Looked up by the range
 /// the view reads, as it was, the copy is another one wherever the two
 /// lookups differ: for memory outside buffer objects, a view of a part of a
 /// buffer that crosses a window line (the buffer's window is two cells, the
@@ -2682,32 +2740,100 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
-    let (address, len) = buffer_range(view)?;
+    buffer_copy_with(view, view_extent(), crate::shadow::find, crate::shadow::exact)
+}
+
+fn buffer_copy_with<F, E>(
+    view: &View,
+    use_view_extent: bool,
+    mut find: F,
+    mut exact: E,
+) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>
+where
+    F: FnMut(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
+    E: FnMut(u64, u64) -> Option<std::sync::Arc<crate::shadow::Shadow>>,
+{
+    let (base, width, words, unordered): (u64, u64, &[u32; 10], bool) = match view {
+        View::Shader(r, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            (data as u64, len, desc, false)
+        }
+        View::Unordered(r, _, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+            (data as u64, len, desc, true)
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => (
+            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+            u64::from(resource[4]) | u64::from(resource[5]) << 32,
+            desc[..10].try_into().ok()?,
+            *unordered,
+        ),
+        _ => return None,
+    };
+    let (first, count, element, stride, unknown, raw) = if unordered {
+        let d = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { d.Anonymous.Buffer };
+        let element = if b.StructureByteStride > 0 {
+            u64::from(b.StructureByteStride)
+        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(d.Format.0 as u32)?.0
+        };
+        let raw = b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        (
+            b.FirstElement,
+            b.NumElements,
+            element,
+            b.StructureByteStride,
+            d.Format == DXGI_FORMAT_UNKNOWN,
+            raw,
+        )
+    } else {
+        let d = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { d.Anonymous.Buffer };
+        let raw = b.StructureByteStride == 0 && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        (
+            b.FirstElement,
+            b.NumElements,
+            element_size(&d),
+            b.StructureByteStride,
+            d.Format == DXGI_FORMAT_UNKNOWN,
+            raw,
+        )
+    };
+    let address = base + first * element;
+    let len = u64::from(count) * element;
     if len == 0 {
         return None;
     }
-    // A view off its buffer's elements is made on a copy of its own bytes
-    // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
-    // of the copy they find, so that the copy brought up to date is the
-    // one the slot shows.
-    if let Some((base, width)) = buffer_extent(view)
-        && let Some((first, count, element, stride, unknown, raw)) = buffer_fields(view)
-        && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown, raw)
-        && let Some(own) = crate::shadow::exact(start, bytes)
-    {
-        return Some((own, start, bytes));
+    let has_fields = matches!(view, View::Placed(..)) || words[1] == 1;
+    // (The console is lax: a view may begin past its buffer's end.)
+    let use_extent = use_view_extent && address >= base && address - base < width.max(1);
+    let mut searched_whole = false;
+    // Reuse a single `find(base, width)` lookup for both the `own_bytes`
+    // alignment check and the `view_extent` return path.
+    if has_fields || use_extent {
+        searched_whole = true;
+        if let Some(whole) = find(base, width) {
+            if has_fields
+                && let Some((start, bytes)) =
+                    own_bytes(whole.offset(base), base, first, count, element, stride, unknown, raw)
+                && let Some(own) = exact(start, bytes)
+            {
+                return Some((own, start, bytes));
+            }
+            if use_extent {
+                return Some((whole, address, len));
+            }
+        }
     }
-    if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
-        // (The console is lax: a view may begin past its buffer's end.)
-        && address >= base
-        && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
-    {
-        return Some((shadow, address, len));
+    if searched_whole && address == base && len == width {
+        return None;
     }
-    crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+    find(address, len).map(|shadow| (shadow, address, len))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -3065,6 +3191,7 @@ fn own_bytes_if(
 /// raw view's: 4), its structure's stride, whether it has no format, and
 /// whether it is a raw view.
 /// As [`buffer_srv`] and [`buffer_uav`] read them from the same words.
+#[cfg(test)]
 fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool, bool)> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
@@ -4947,6 +5074,301 @@ mod tests {
         assert_eq!((p_unmapped, l_unmapped, m_unmapped), (0, 0, 0));
         // SAFETY: releases the reservation above.
         unsafe { VirtualFree(unmapped, 0, MEM_RELEASE) };
+    }
+
+    /// Helper: builds a placed buffer view (SRV if `!unordered`, UAV if `unordered`).
+    fn placed_buffer_view(
+        unordered: bool,
+        base: u64,
+        width: u64,
+        first_elem: u64,
+        num_elems: u32,
+        stride: u32,
+        raw: bool,
+    ) -> View {
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
+        resource[4] = width as u32;
+        resource[5] = (width >> 32) as u32;
+        let mut desc = [0u32; 16];
+        if unordered {
+            // D3D12_UNORDERED_ACCESS_VIEW_DESC for buffer
+            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: if raw { DXGI_FORMAT_R32_TYPELESS } else { DXGI_FORMAT_UNKNOWN },
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: first_elem,
+                        NumElements: num_elems,
+                        StructureByteStride: if raw { 0 } else { stride },
+                        CounterOffsetInBytes: 0,
+                        Flags: if raw { D3D12_BUFFER_UAV_FLAG_RAW } else { D3D12_BUFFER_UAV_FLAG_NONE },
+                    },
+                },
+            };
+            // SAFETY: 40 bytes in D3D12_UNORDERED_ACCESS_VIEW_DESC layout.
+            let words: [u32; 10] = unsafe { std::ptr::from_ref(&uav).cast::<[u32; 10]>().read_unaligned() };
+            desc[..10].copy_from_slice(&words);
+        } else {
+            let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: if raw { DXGI_FORMAT_R32_TYPELESS } else { DXGI_FORMAT_UNKNOWN },
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first_elem,
+                        NumElements: num_elems,
+                        StructureByteStride: if raw { 0 } else { stride },
+                        Flags: if raw { D3D12_BUFFER_SRV_FLAG_RAW } else { D3D12_BUFFER_SRV_FLAG_NONE },
+                    },
+                },
+            };
+            // SAFETY: 40 bytes in D3D12_SHADER_RESOURCE_VIEW_DESC layout.
+            let words: [u32; 10] = unsafe { std::ptr::from_ref(&srv).cast::<[u32; 10]>().read_unaligned() };
+            desc[..10].copy_from_slice(&words);
+        }
+        desc[10] = base as u32;
+        desc[11] = (base >> 32) as u32;
+        View::Placed(unordered, resource, desc)
+    }
+
+    /// `note_buffer(..., seen=true)` must not echo an already-tracked deferred
+    /// buffer slot back into `changed`, while still tracking genuine writes,
+    /// first-seen slots, replaced made slots, and removals.
+    #[test]
+    fn note_buffer_echo_fix_and_change_tracking() {
+        let Some(heap) = HostHeap::new(false, 32) else {
+            return; // no host GPU
+        };
+        let backing = vec![0u8; 4096];
+        let base = backing.as_ptr() as u64;
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+
+        let view_a = placed_buffer_view(false, base, 4096, 0, 16, 16, false);
+        let view_b = placed_buffer_view(false, base, 4096, 4, 16, 16, false);
+
+        // Direct `note_buffer` checks:
+        assert!(heap.note_buffer(5, Some(&view_a), false).is_empty());
+        assert_eq!(heap.buffer_changes(), vec![5]);
+        assert_eq!(heap.buffer_slots(), vec![5]);
+
+        // Seen on an already-tracked buffer slot -> NO echo!
+        assert!(heap.note_buffer(5, Some(&view_a), true).is_empty());
+        assert!(heap.buffer_changes().is_empty(), "seen on existing buffer must not echo");
+
+        // Seen on a brand-new buffer slot -> MUST queue once!
+        assert!(heap.note_buffer(6, Some(&view_a), true).is_empty());
+        assert_eq!(heap.buffer_changes(), vec![6]);
+
+        // Removal queues once; repeated removal does not queue again.
+        assert!(heap.note_buffer(5, None, false).is_empty());
+        assert_eq!(heap.buffer_changes(), vec![5]);
+        assert!(heap.note_buffer(5, None, false).is_empty());
+        assert!(heap.buffer_changes().is_empty());
+
+        // End-to-end `mirror_copied` -> `buffer_changes` -> `mirror(..., true)` -> no echo!
+        let mut page = vec![0u8; 32 * 32];
+        let write_record = |page: &mut [u8], slot: usize, view: View| {
+            let [i, generation] = super::super::words_for(view);
+            let off = slot * 32;
+            page[off..off + 4].copy_from_slice(&VIEW_TAG.to_le_bytes());
+            page[off + 4..off + 8].copy_from_slice(&i.to_le_bytes());
+            page[off + 8..off + 12].copy_from_slice(&generation.to_le_bytes());
+        };
+        write_record(&mut page, 10, view_a.clone());
+        let handle_10 = page.as_ptr() as u64 + 10 * 32;
+
+        assert!(heap.mirror_copied(10, handle_10, &page[10 * 32..11 * 32]));
+        assert!(!heap.made(10), "buffer mirror_copied defers making host slot");
+        assert_eq!(heap.buffer_changes(), vec![10]);
+
+        // `heap_buffers()` mirrors slot 10 with `for_draw = true`: makes slot, NO echo!
+        assert!(heap.mirror(10, handle_10, true).is_some());
+        assert!(heap.made(10));
+        assert!(
+            heap.buffer_changes().is_empty(),
+            "mirror(for_draw=true) on deferred buffer slot must not re-queue into changed"
+        );
+
+        // Overwriting an already-made buffer slot directly before `sync_heaps`
+        // (e.g. draw `table_entry`) still notifies `buffer_changes()` once, and
+        // the subsequent `mirror(..., true)` hits `fast` with zero echo.
+        write_record(&mut page, 10, view_b);
+        assert!(heap.mirror(10, handle_10, true).is_some());
+        assert_eq!(heap.buffer_changes(), vec![10]);
+        assert!(heap.mirror(10, handle_10, true).is_some());
+        assert!(heap.buffer_changes().is_empty());
+
+        crate::shadow::unregister(base as usize, base);
+    }
+
+    /// `buffer_slots_chunk` incrementally visits every tracked buffer slot in
+    /// ascending order without duplicates and wraps cleanly even after tail
+    /// deletions.
+    #[test]
+    fn buffer_slots_chunk_sweeps_incrementally_and_wraps() {
+        let Some(heap) = HostHeap::new(false, 2048) else {
+            return; // no host GPU
+        };
+        let view = placed_buffer_view(false, 0x10000, 4096, 0, 16, 16, false);
+        let expected: Vec<u32> = (0..200u32).map(|i| i * 7 + 3).collect();
+        for &slot in &expected {
+            let _ = heap.note_buffer(slot, Some(&view), false);
+        }
+
+        let mut cursor = 0u32;
+        let mut visited = Vec::new();
+        let mut passes = 0usize;
+        loop {
+            let (chunk, next) = heap.buffer_slots_chunk(cursor, 16, 8);
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= 13, "chunk {} exceeded ceil(200/16)=13", chunk.len());
+            assert!(chunk.windows(2).all(|w| w[0] < w[1]), "chunk must be strictly sorted");
+            visited.extend_from_slice(&chunk);
+            cursor = next;
+            passes += 1;
+            if cursor == 0 {
+                break;
+            }
+            assert!(passes <= 32, "rolling sweep failed to wrap");
+        }
+        assert_eq!(visited, expected);
+        assert!(passes >= 15);
+
+        // If all slots >= cursor are deleted, wrapping still yields a non-empty chunk.
+        let (chunk, next) = heap.buffer_slots_chunk(u32::MAX - 1, 16, 8);
+        assert_eq!(chunk, &expected[..13]);
+        assert_eq!(next, expected[12] + 1);
+    }
+
+    /// `buffer_copy_with` reuses a single `shadow::find(base, width)` lookup
+    /// and matches the legacy two-`find` result across SRV, UAV, own-bytes
+    /// misaligned raw views, unbacked views, zero-length views, and textures.
+    #[test]
+    fn buffer_copy_single_find_matches_reference() {
+        let backing = vec![0u8; 16384];
+        let base = backing.as_ptr() as u64;
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+
+        let reference = |view: &View, use_extent: bool| -> Option<(Arc<Shadow>, u64, u64)> {
+            let (address, len) = buffer_range(view)?;
+            if len == 0 {
+                return None;
+            }
+            if let Some((b, w)) = buffer_extent(view)
+                && let Some((first, count, element, stride, unknown, raw)) = buffer_fields(view)
+                && let Some(whole) = crate::shadow::find(b, w)
+                && let Some((start, bytes)) =
+                    own_bytes(whole.offset(b), b, first, count, element, stride, unknown, raw)
+                && let Some(own) = crate::shadow::exact(start, bytes)
+            {
+                return Some((own, start, bytes));
+            }
+            if use_extent
+                && let Some((b, w)) = buffer_extent(view)
+                && address >= b
+                && address - b < w.max(1)
+                && let Some(shadow) = crate::shadow::find(b, w)
+            {
+                return Some((shadow, address, len));
+            }
+            crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+        };
+
+        // 1. In-extent placed buffer SRV: exactly 1 `find`, 0 `exact`.
+        let srv = placed_buffer_view(false, base, 16384, 4, 32, 16, false);
+        let (mut finds, mut exacts) = (0usize, 0usize);
+        let got = buffer_copy_with(
+            &srv,
+            true,
+            |a, l| {
+                finds += 1;
+                crate::shadow::find(a, l)
+            },
+            |a, l| {
+                exacts += 1;
+                crate::shadow::exact(a, l)
+            },
+        )
+        .expect("srv copy");
+        let want = reference(&srv, true).expect("srv ref");
+        assert_eq!(finds, 1, "in-extent SRV must call shadow::find once");
+        assert_eq!(exacts, 0);
+        assert!(Arc::ptr_eq(&got.0, &want.0));
+        assert_eq!((got.1, got.2), (want.1, want.2));
+
+        // 2. In-extent placed raw buffer UAV (16-byte aligned): 1 `find`, 0 `exact`.
+        let uav = placed_buffer_view(true, base, 16384, 4, 64, 0, true);
+        (finds, exacts) = (0, 0);
+        let got_uav = buffer_copy_with(
+            &uav,
+            true,
+            |a, l| {
+                finds += 1;
+                crate::shadow::find(a, l)
+            },
+            |a, l| {
+                exacts += 1;
+                crate::shadow::exact(a, l)
+            },
+        )
+        .expect("uav copy");
+        let want_uav = reference(&uav, true).expect("uav ref");
+        assert_eq!(finds, 1, "in-extent UAV must call shadow::find once");
+        assert_eq!(exacts, 0);
+        assert!(Arc::ptr_eq(&got_uav.0, &want_uav.0));
+        assert_eq!((got_uav.1, got_uav.2), (want_uav.1, want_uav.2));
+
+        // 3. Off-16-byte raw placed SRV (first_elem = 2 => +8 bytes): 1 `find`, 1 `exact`.
+        let unaligned_raw = placed_buffer_view(false, base, 16384, 2, 16, 0, true);
+        (finds, exacts) = (0, 0);
+        let got_own = buffer_copy_with(
+            &unaligned_raw,
+            true,
+            |a, l| {
+                finds += 1;
+                crate::shadow::find(a, l)
+            },
+            |a, l| {
+                exacts += 1;
+                crate::shadow::exact(a, l)
+            },
+        )
+        .expect("own copy");
+        let want_own = reference(&unaligned_raw, true).expect("own ref");
+        assert_eq!(finds, 1, "own_bytes view must call shadow::find once");
+        assert_eq!(exacts, 1);
+        assert!(Arc::ptr_eq(&got_own.0, &want_own.0));
+        assert_eq!((got_own.1, got_own.2), (want_own.1, want_own.2));
+
+        // 4. Unbacked whole-buffer view (`find` returns None): still only 1 `find`.
+        let unbacked = placed_buffer_view(false, base, 1024, 0, 64, 16, false);
+        (finds, exacts) = (0, 0);
+        let got_none = buffer_copy_with(
+            &unbacked,
+            true,
+            |_, _| {
+                finds += 1;
+                None
+            },
+            |_, _| {
+                exacts += 1;
+                None
+            },
+        );
+        assert!(got_none.is_none());
+        assert_eq!(finds, 1, "unbacked whole-buffer view must not repeat find");
+        assert_eq!(exacts, 0);
+
+        // 5. Zero-length view and non-buffer texture view: 0 `find`s.
+        let empty = placed_buffer_view(false, base, 16384, 0, 0, 16, false);
+        let tex = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], [0; 16]);
+        finds = 0;
+        assert!(buffer_copy_with(&empty, true, |_, _| { finds += 1; None }, |_, _| None).is_none());
+        assert!(buffer_copy_with(&tex, true, |_, _| { finds += 1; None }, |_, _| None).is_none());
+        assert_eq!(finds, 0);
+
+        crate::shadow::unregister(base as usize, base);
     }
 }
 

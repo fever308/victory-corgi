@@ -7130,6 +7130,33 @@ impl HostList {
         }
     }
 
+    /// Batched [`HostList::defer_refresh`]: takes the deferred lock once for
+    /// all `(shadow, address, len)` ranges.
+    pub(crate) fn defer_refresh_batch<'a>(
+        &self,
+        reserve: usize,
+        items: impl IntoIterator<Item = (&'a std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+    ) {
+        if bare() & 4 != 0 {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if reserve > 0 {
+            deferred.refreshed.reserve(reserve);
+            deferred.copies.reserve(reserve);
+        }
+        for (shadow, address, len) in items {
+            let clamped = shadow.clamp_len(address, len) as usize;
+            let addr = address as usize;
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, addr, clamped);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), addr, clamped));
+            }
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(

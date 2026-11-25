@@ -434,6 +434,14 @@ fn heap_pass_full() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_HEAP_PASS").is_ok_and(|v| v == "list-full"))
 }
 
+/// `VICTORY_HEAP_BUFFERS_FULL=1`: legacy fallback that clears `ranges` and
+/// rescans every buffer slot every 16 passes instead of using the incremental
+/// rolling sweep.
+fn heap_buffers_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_BUFFERS_FULL").is_some_and(|v| v == "1"))
+}
+
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
 /// they are all widened to the whole target. Grand Theft Auto VI's room at
 /// the start of the prologue lost its walls in five runs of seven, and in
@@ -785,7 +793,20 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut rtv_stack = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+        let mut rtv_len = 0usize;
+        let mut rtv_extra: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::new();
+        let mut push_rtv = |rtv: D3D12_CPU_DESCRIPTOR_HANDLE| {
+            if rtv_extra.is_empty() && rtv_len < rtv_stack.len() {
+                rtv_stack[rtv_len] = rtv;
+                rtv_len += 1;
+            } else {
+                if rtv_extra.is_empty() {
+                    rtv_extra.extend_from_slice(&rtv_stack[..rtv_len]);
+                }
+                rtv_extra.push(rtv);
+            }
+        };
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -805,7 +826,7 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    push_rtv(host.rtv(None, Some(&desc)));
                 }
                 continue;
             };
@@ -813,8 +834,13 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            push_rtv(host.rtv(Some(texture), record.desc().as_ref()));
         }
+        let rtvs: &[D3D12_CPU_DESCRIPTOR_HANDLE] = if rtv_extra.is_empty() {
+            &rtv_stack[..rtv_len]
+        } else {
+            &rtv_extra
+        };
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1300,16 +1326,26 @@ impl State {
             } else {
                 None
             };
-            let made = match key.and_then(|k| self.tables_memo.get(&k)) {
-                Some(made) => made.clone(),
-                None => {
-                    let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
-                    if let Some(k) = key
-                        && !made.iter().any(|m| m.1 == u32::MAX)
-                    {
-                        self.tables_memo.insert(k, made.clone());
+            let owned_made;
+            let made: &[(u8, u32)] = match key {
+                Some(k) => {
+                    if !self.tables_memo.contains_key(&k) {
+                        let computed =
+                            self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+                        if computed.iter().any(|m| m.1 == u32::MAX) {
+                            owned_made = computed;
+                            &owned_made
+                        } else {
+                            self.tables_memo.insert(k, computed);
+                            self.tables_memo[&k].as_slice()
+                        }
+                    } else {
+                        self.tables_memo[&k].as_slice()
                     }
-                    made
+                }
+                None => {
+                    owned_made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+                    &owned_made
                 }
             };
             #[cfg(feature = "diagnostics")]
@@ -1340,7 +1376,14 @@ impl State {
             if let Some((param, dwords)) = stage.user_data {
                 #[cfg(feature = "diagnostics")]
                 let _t = crate::copystat::sect(8);
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack = [0u32; 64];
+                let mut heap_values;
+                let values: &mut [u32] = if (dwords as usize) <= stack.len() {
+                    &mut stack[..dwords as usize]
+                } else {
+                    heap_values = vec![0u32; dwords as usize];
+                    &mut heap_values
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1756,39 +1799,64 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
-        // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
+        // Per host heap: cached `(shadow, from, to)` per buffer slot and
+        // incrementally-maintained per-shadow merged spans. Each pass inspects
+        // newly-changed slots, a bounded retry queue for slots whose host copy
+        // was not ready yet, and a 1/64th rolling slice of `buffer_slots` so
+        // stale views of released resources are pruned smoothly without
+        // periodic full-heap stalls (`VICTORY_HEAP_BUFFERS_FULL=1` restores the
+        // legacy every-16-passes full clear/rescan).
+        static RANGES: std::sync::Mutex<
+            Option<std::collections::HashMap<usize, HeapBufferCache>>,
+        > = std::sync::Mutex::new(None);
+        const SWEEP_DIVISOR: usize = 64;
+        const SWEEP_MIN: usize = 64;
+        const RETRY_PER_PASS: usize = 256;
+        const RETRY_ATTEMPTS: u8 = 4;
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let cache = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 || heap_pass_full() {
-            ranges.clear();
-            host.buffer_slots()
+            .or_default();
+        let mut changed = host.buffer_changes();
+        let full = heap_pass_full() || (heap_buffers_full() && cache.passes % 16 == 0);
+        let (slots, retry_batch): (Vec<u32>, std::collections::HashMap<u32, u8>) = if full {
+            cache.clear();
+            changed.clear();
+            (host.buffer_slots(), std::collections::HashMap::new())
         } else {
-            changed
+            changed.sort_unstable();
+            changed.dedup();
+            if !cache.retry.is_empty() {
+                for &idx in &changed {
+                    cache.retry.remove(&idx);
+                }
+            }
+            let retry_batch = cache.take_retries(RETRY_PER_PASS);
+            let (sweep, next_cursor) =
+                host.buffer_slots_chunk(cache.sweep_cursor, SWEEP_DIVISOR, SWEEP_MIN);
+            cache.sweep_cursor = next_cursor;
+            let mut slots = Vec::with_capacity(changed.len() + retry_batch.len() + sweep.len());
+            slots.extend_from_slice(&changed);
+            slots.extend(retry_batch.keys().copied());
+            slots.extend(sweep);
+            slots.sort_unstable();
+            slots.dedup();
+            (slots, retry_batch)
         };
-        *passes += 1;
+        cache.passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
+                cache.remove_slot(index);
                 continue;
             };
             let Some(view) = host.mirror(index, handle, true) else {
+                cache.remove_slot(index);
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1809,26 +1877,30 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                cache.remove_slot(index);
+                if !full
+                    && crate::descriptor::host::buffer_range(&view).is_some_and(|(_, l)| l > 0)
+                {
+                    if let Some(&rem) = retry_batch.get(&index) {
+                        if rem > 1 {
+                            cache.retry.insert(index, rem - 1);
+                        }
+                    } else if changed.binary_search(&index).is_ok() {
+                        cache.retry.insert(index, RETRY_ATTEMPTS);
+                    }
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            cache.set_slot(index, shadow, address, address + len);
         }
-        let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
-        }
-        drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        cache.reconcile_dirty();
+        let views = cache.ranges.len() as u32;
+        let copies = cache.spans.len();
+        let bytes = cache.spans_bytes;
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1837,30 +1909,36 @@ impl State {
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
-            if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
-                let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-                let every = *EVERY.get_or_init(|| {
-                    std::env::var("VICTORY_UNWATCHED_FRAMES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(1)
-                });
-                match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
-                    _ => {
-                        whole.insert(key, frame);
+        // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let every = *EVERY.get_or_init(|| {
+            std::env::var("VICTORY_UNWATCHED_FRAMES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1)
+        });
+        {
+            let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+            let whole = whole.get_or_insert_with(Default::default);
+            list.defer_refresh_batch(
+                copies,
+                cache.spans.iter().filter_map(|span| {
+                    if span.shadow.unwatched() {
+                        // By the copy's number: a copy made where one let go was
+                        // (`shadow::let_go_idle`) has never been refreshed.
+                        let key = span.shadow.id() as usize;
+                        match whole.get(&key) {
+                            Some(&last) if frame < last + every => return None,
+                            _ => {
+                                whole.insert(key, frame);
+                            }
+                        }
                     }
-                }
-            }
-            shadow.refresh(list, *from, to - from);
+                    Some((&span.shadow, span.from, span.to - span.from))
+                }),
+            );
         }
+        drop(kept);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1874,7 +1952,7 @@ impl State {
             tracing::info!(
                 slots = slots.len(),
                 views,
-                copies = spans.len(),
+                copies,
                 mb = bytes >> 20,
                 ms = started.elapsed().as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
@@ -4057,5 +4135,339 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// Cached merged `[from, to)` span for a single host shadow buffer in
+/// [`HeapBufferCache`]. Tracks `count`, `from_hits`, and `to_hits` so inserts,
+/// widenings, non-boundary updates/removals, and last-slot removals run in
+/// `O(1)` without scanning all tracked slots.
+struct CachedSpan<S> {
+    key: usize,
+    shadow: std::sync::Arc<S>,
+    from: u64,
+    to: u64,
+    count: u32,
+    from_hits: u32,
+    to_hits: u32,
+    dirty: bool,
+}
+
+/// Per-heap buffer slot & merged-span cache for [`State::heap_buffers`].
+/// Replaces full-heap every-16-frame clears and per-frame `ranges -> spans`
+/// SipHash rebuilds with an incremental rolling sweep, a bounded retry queue,
+/// and incrementally-maintained per-shadow spans.
+struct HeapBufferCache<S = crate::shadow::Shadow> {
+    passes: u64,
+    sweep_cursor: u32,
+    /// `slot -> (shadow_key, from, to)`.
+    ranges: std::collections::HashMap<u32, (usize, u64, u64)>,
+    /// Newly-written buffer slots whose `buffer_copy` returned `None`:
+    /// `slot -> remaining fast retry passes`.
+    retry: std::collections::HashMap<u32, u8>,
+    /// Dense slice of per-shadow merged spans for cache-friendly iteration.
+    spans: Vec<CachedSpan<S>>,
+    /// `shadow_key -> index in spans`.
+    spans_index: std::collections::HashMap<usize, usize>,
+    /// Sum of `to - from` across all non-dirty spans (exact once
+    /// [`Self::reconcile_dirty`] has run).
+    spans_bytes: u64,
+    /// Number of entries in `spans` with `dirty == true`.
+    dirty_spans: usize,
+}
+
+impl<S> Default for HeapBufferCache<S> {
+    fn default() -> Self {
+        Self {
+            passes: 0,
+            sweep_cursor: 0,
+            ranges: std::collections::HashMap::new(),
+            retry: std::collections::HashMap::new(),
+            spans: Vec::new(),
+            spans_index: std::collections::HashMap::new(),
+            spans_bytes: 0,
+            dirty_spans: 0,
+        }
+    }
+}
+
+impl<S> HeapBufferCache<S> {
+    fn clear(&mut self) {
+        self.ranges.clear();
+        self.retry.clear();
+        self.spans.clear();
+        self.spans_index.clear();
+        self.spans_bytes = 0;
+        self.dirty_spans = 0;
+        self.sweep_cursor = 0;
+    }
+
+    fn take_retries(&mut self, max: usize) -> std::collections::HashMap<u32, u8> {
+        if self.retry.is_empty() || max == 0 {
+            return std::collections::HashMap::new();
+        }
+        if self.retry.len() <= max {
+            return std::mem::take(&mut self.retry);
+        }
+        let keys: Vec<u32> = self.retry.keys().copied().take(max).collect();
+        let mut batch = std::collections::HashMap::with_capacity(keys.len());
+        for k in keys {
+            if let Some(rem) = self.retry.remove(&k) {
+                batch.insert(k, rem);
+            }
+        }
+        batch
+    }
+
+    fn set_slot(&mut self, slot: u32, shadow: std::sync::Arc<S>, from: u64, to: u64) {
+        let new_key = std::sync::Arc::as_ptr(&shadow) as usize;
+        if let Some(&(old_key, old_from, old_to)) = self.ranges.get(&slot) {
+            if old_key == new_key && old_from == from && old_to == to {
+                return;
+            }
+            self.ranges.insert(slot, (new_key, from, to));
+            // Add new contribution before removing old so same-shadow updates
+            // that keep or widen the boundary never mark the span dirty.
+            self.add_to_span(new_key, &shadow, from, to);
+            self.remove_from_span(old_key, old_from, old_to);
+            return;
+        }
+        self.ranges.insert(slot, (new_key, from, to));
+        self.add_to_span(new_key, &shadow, from, to);
+    }
+
+    fn remove_slot(&mut self, slot: u32) {
+        if let Some((old_key, old_from, old_to)) = self.ranges.remove(&slot) {
+            self.remove_from_span(old_key, old_from, old_to);
+        }
+    }
+
+    fn add_to_span(&mut self, key: usize, shadow: &std::sync::Arc<S>, from: u64, to: u64) {
+        if let Some(&idx) = self.spans_index.get(&key) {
+            let span = &mut self.spans[idx];
+            span.count += 1;
+            if !span.dirty {
+                let old_len = span.to - span.from;
+                if from < span.from {
+                    span.from = from;
+                    span.from_hits = 1;
+                } else if from == span.from {
+                    span.from_hits += 1;
+                }
+                if to > span.to {
+                    span.to = to;
+                    span.to_hits = 1;
+                } else if to == span.to {
+                    span.to_hits += 1;
+                }
+                let new_len = span.to - span.from;
+                if new_len != old_len {
+                    self.spans_bytes = self.spans_bytes - old_len + new_len;
+                }
+            }
+        } else {
+            let idx = self.spans.len();
+            self.spans_index.insert(key, idx);
+            self.spans.push(CachedSpan {
+                key,
+                shadow: shadow.clone(),
+                from,
+                to,
+                count: 1,
+                from_hits: 1,
+                to_hits: 1,
+                dirty: false,
+            });
+            self.spans_bytes += to - from;
+        }
+    }
+
+    fn remove_from_span(&mut self, key: usize, old_from: u64, old_to: u64) {
+        let Some(&idx) = self.spans_index.get(&key) else {
+            return;
+        };
+        let span = &mut self.spans[idx];
+        span.count -= 1;
+        if span.count == 0 {
+            if span.dirty {
+                self.dirty_spans -= 1;
+            } else {
+                self.spans_bytes -= span.to - span.from;
+            }
+            self.spans_index.remove(&key);
+            self.spans.swap_remove(idx);
+            if let Some(moved) = self.spans.get(idx) {
+                self.spans_index.insert(moved.key, idx);
+            }
+            return;
+        }
+        if !span.dirty {
+            let mut needs_rebuild = false;
+            if old_from == span.from {
+                span.from_hits -= 1;
+                if span.from_hits == 0 {
+                    needs_rebuild = true;
+                }
+            }
+            if old_to == span.to {
+                span.to_hits -= 1;
+                if span.to_hits == 0 {
+                    needs_rebuild = true;
+                }
+            }
+            if needs_rebuild {
+                self.spans_bytes -= span.to - span.from;
+                span.dirty = true;
+                self.dirty_spans += 1;
+            }
+        }
+    }
+
+    /// Recomputes min/max bounds for any spans whose unique boundary slot was
+    /// removed or shrunk. No-op (`O(1)`) when `dirty_spans == 0`.
+    fn reconcile_dirty(&mut self) {
+        if self.dirty_spans == 0 {
+            return;
+        }
+        for span in &mut self.spans {
+            if span.dirty {
+                span.from = u64::MAX;
+                span.to = 0;
+                span.from_hits = 0;
+                span.to_hits = 0;
+            }
+        }
+        for &(key, from, to) in self.ranges.values() {
+            if let Some(&idx) = self.spans_index.get(&key) {
+                let span = &mut self.spans[idx];
+                if span.dirty {
+                    if from < span.from {
+                        span.from = from;
+                        span.from_hits = 1;
+                    } else if from == span.from {
+                        span.from_hits += 1;
+                    }
+                    if to > span.to {
+                        span.to = to;
+                        span.to_hits = 1;
+                    } else if to == span.to {
+                        span.to_hits += 1;
+                    }
+                }
+            }
+        }
+        for span in &mut self.spans {
+            if span.dirty {
+                span.dirty = false;
+                self.spans_bytes += span.to - span.from;
+            }
+        }
+        self.dirty_spans = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HeapBufferCache;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn assert_matches_reference(cache: &HeapBufferCache<u64>) {
+        assert_eq!(cache.dirty_spans, 0);
+        let mut expected: HashMap<usize, (u64, u64, u32)> = HashMap::new();
+        for &(key, from, to) in cache.ranges.values() {
+            let e = expected.entry(key).or_insert((from, to, 0));
+            e.0 = e.0.min(from);
+            e.1 = e.1.max(to);
+            e.2 += 1;
+        }
+        assert_eq!(cache.spans.len(), expected.len());
+        assert_eq!(cache.spans_index.len(), expected.len());
+        let mut total_bytes = 0u64;
+        for (i, span) in cache.spans.iter().enumerate() {
+            assert!(!span.dirty);
+            assert_eq!(cache.spans_index.get(&span.key), Some(&i));
+            let &(from, to, count) = expected.get(&span.key).expect("span key in reference");
+            assert_eq!((span.from, span.to, span.count), (from, to, count));
+            total_bytes += to - from;
+        }
+        assert_eq!(cache.spans_bytes, total_bytes);
+    }
+
+    #[test]
+    fn heap_buffer_cache_maintains_spans_incrementally_and_reconciles_shrinks() {
+        let s1 = Arc::new(1u64);
+        let s2 = Arc::new(2u64);
+        let s3 = Arc::new(3u64);
+        let mut cache: HeapBufferCache<u64> = HeapBufferCache::default();
+
+        // Insert multiple slots on s1 and s2; never dirty.
+        cache.set_slot(1, s1.clone(), 100, 300);
+        cache.set_slot(2, s1.clone(), 100, 500);
+        cache.set_slot(3, s1.clone(), 200, 400);
+        cache.set_slot(10, s2.clone(), 1000, 2000);
+        cache.set_slot(20, s3.clone(), 5000, 6000);
+        assert_eq!(cache.dirty_spans, 0);
+        assert_matches_reference(&cache);
+
+        // Unchanged re-insert is a no-op and stays clean.
+        cache.set_slot(2, s1.clone(), 100, 500);
+        assert_eq!(cache.dirty_spans, 0);
+
+        // Removing a strictly interior slot stays clean (O(1), no rebuild).
+        cache.remove_slot(3);
+        assert_eq!(cache.dirty_spans, 0);
+        assert_matches_reference(&cache);
+
+        // Removing one of two slots tied at `from == 100` (slot 1 has to=300 < 500)
+        // keeps `from_hits == 1` -> still clean!
+        cache.remove_slot(1);
+        assert_eq!(cache.dirty_spans, 0);
+        assert_matches_reference(&cache);
+
+        // Widening the sole remaining slot on s1 stays clean.
+        cache.set_slot(2, s1.clone(), 50, 600);
+        assert_eq!(cache.dirty_spans, 0);
+        assert_matches_reference(&cache);
+
+        // Add another slot on s1, then shrink the unique max boundary -> marks s1 dirty.
+        cache.set_slot(4, s1.clone(), 200, 400);
+        cache.set_slot(2, s1.clone(), 100, 350);
+        assert_eq!(cache.dirty_spans, 1);
+        cache.reconcile_dirty();
+        assert_eq!(cache.dirty_spans, 0);
+        assert_matches_reference(&cache);
+
+        // Switching slot 10 (sole slot on s2) to s3 removes s2 in O(1) via swap_remove
+        // without marking anything dirty.
+        cache.set_slot(10, s3.clone(), 5500, 7000);
+        assert_eq!(cache.dirty_spans, 0);
+        assert_matches_reference(&cache);
+
+        // Removing the unique min slot on s3 marks dirty, then removing the last slot
+        // clears dirty_spans cleanly.
+        cache.remove_slot(20);
+        assert_eq!(cache.dirty_spans, 1);
+        cache.remove_slot(10);
+        assert_eq!(cache.dirty_spans, 0);
+        assert_matches_reference(&cache);
+
+        cache.clear();
+        assert!(cache.ranges.is_empty() && cache.spans.is_empty() && cache.spans_bytes == 0);
+    }
+
+    #[test]
+    fn heap_buffer_cache_retry_queue_caps_and_drains() {
+        let mut cache: HeapBufferCache<u64> = HeapBufferCache::default();
+        for i in 0..10u32 {
+            cache.retry.insert(i, 4);
+        }
+        let batch1 = cache.take_retries(4);
+        assert_eq!(batch1.len(), 4);
+        assert_eq!(cache.retry.len(), 6);
+        let batch2 = cache.take_retries(10);
+        assert_eq!(batch2.len(), 6);
+        assert!(cache.retry.is_empty());
+        assert!(cache.take_retries(4).is_empty());
     }
 }
