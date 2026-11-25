@@ -3384,6 +3384,10 @@ struct Line {
     /// With [`relay`]: the bottom-of-pipe writes of the flights being
     /// landed (taken out of `line`, not done yet), for [`late_met`].
     in_hand: Vec<(usize, crate::queue::Written, usize)>,
+    /// With [`relay`]: `(shadow_ptr, from, to)` ranges declared in
+    /// `flight.back` of flights currently being landed (`items` drained while
+    /// `settling` is true), for range-scoped `WHY_STALE` waits.
+    in_hand_back: Vec<(usize, usize, usize)>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -3399,6 +3403,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     poke: false,
     landed: Vec::new(),
     in_hand: Vec::new(),
+    in_hand_back: Vec::new(),
 });
 /// Told when a flight joins [`LINE`] or it is poked.
 static LINE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
@@ -3833,12 +3838,55 @@ mod fill_ahead {
 
 pub(crate) use fill_ahead::wrote as shaders_write;
 
+/// Whether `WHY_STALE` waits only on flights whose `flight.back` overlaps the
+/// stale ranges (`VICTORY_RANGE_SETTLE=0` falls back to full `Host::settle`).
+fn range_settle_enabled(setting: Option<&str>) -> bool {
+    setting != Some("0")
+}
+
+fn range_settle() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| range_settle_enabled(std::env::var("VICTORY_RANGE_SETTLE").ok().as_deref()))
+}
+
+/// Whether any queued flight in `line.line` or currently landing flight in
+/// `line.in_hand_back` declares a `back` range overlapping any
+/// `(shadow_ptr, from, to)` in `stale`.
+fn line_overlaps_stale(line: &Line, stale: &[(usize, usize, usize)]) -> bool {
+    if stale.is_empty() {
+        return false;
+    }
+    for &(s_ptr, a, b) in &line.in_hand_back {
+        if stale
+            .iter()
+            .any(|&(ptr, from, to)| ptr == s_ptr && a < to && from < b)
+        {
+            return true;
+        }
+    }
+    for item in &line.line {
+        let Late::Run(flight) = item else {
+            continue;
+        };
+        for (shadow, ranges, _) in &flight.back {
+            let s_ptr = std::sync::Arc::as_ptr(shadow) as usize;
+            if stale.iter().any(|&(ptr, from, to)| {
+                ptr == s_ptr && ranges.iter().any(|&(a, b)| a < to && from < b)
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// With flights in the air, after the submission's write-watch asking:
-/// whether `runs` refresh a range of a host copy that a flight's shaders
-/// may write and that the title wrote since it was last copied. The
-/// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
-/// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+/// collects `(shadow_ptr, from, to)` ranges where `runs` refresh a range of
+/// a host copy that a flight's shaders may write and that the title wrote
+/// since it was last copied. The refresh leaves ranges shaders are writing
+/// alone (`Shadow::update`), so the title's bytes there would reach the card
+/// a submission late.
+fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3855,6 +3903,11 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             }
         }
     }
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut per_shadow = Vec::new();
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -3867,9 +3920,27 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         let mut runs_left = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_LATE_MERGE_RUNS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512)
         });
-        return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
+        for (shadow, from, to) in &spans {
+            per_shadow.clear();
+            shadow.merge_ranges_under_writes(*from, *to - *from, &mut runs_left, &mut per_shadow);
+            if !per_shadow.is_empty() {
+                join_ranges(&mut per_shadow, std::iter::empty());
+                let ptr = Arc::as_ptr(shadow) as usize;
+                out.extend(per_shadow.iter().map(|&(a, b)| (ptr, a, b)));
+            }
+        }
+    } else {
+        for (shadow, from, to) in &spans {
+            per_shadow.clear();
+            shadow.stale_ranges_under_writes(*from, *to - *from, &mut per_shadow);
+            if !per_shadow.is_empty() {
+                join_ranges(&mut per_shadow, std::iter::empty());
+                let ptr = Arc::as_ptr(shadow) as usize;
+                out.extend(per_shadow.iter().map(|&(a, b)| (ptr, a, b)));
+            }
+        }
     }
-    spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
+    out
 }
 
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
@@ -4111,29 +4182,46 @@ fn late_threads() {
     });
 }
 
-/// With [`relay`]: waits until `done` says so of the line, looked at each
-/// time flights have landed. Counted as a settle for `why`, and its time
-/// as waiting for the card. The caller may hold the submission lock: the
-/// thread that lands flights never takes it.
-fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
-    let mut line = line();
+/// Waits on `cv` under `line_lock` until `done(&line)` holds, returning
+/// `Some(elapsed_us)` when it had to wait or `None` if `done` already held.
+fn wait_on_line(
+    line_lock: &Mutex<Line>,
+    cv: &std::sync::Condvar,
+    why: usize,
+    record_stats: bool,
+    done: impl Fn(&Line) -> bool,
+) -> Option<u64> {
+    let mut line = line_lock.lock().unwrap_or_else(|e| e.into_inner());
     if done(&line) {
-        return;
+        return None;
     }
-    LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
-    LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    if record_stats {
+        LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
+        LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    }
     let was_working = working(false);
     let waiting = std::time::Instant::now();
     while !done(&line) {
-        line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
+        line = cv.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     drop(line);
     stood(waiting);
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
-    LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
-    LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
-    SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    if record_stats {
+        LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
+        LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    }
+    Some(us)
+}
+
+/// With [`relay`]: waits until `done` says so of the line, looked at each
+/// time flights have landed. Counted as a settle for `why`, and its time
+/// as waiting for the card. The caller may hold the submission lock: the
+/// thread that lands flights never takes it.
+fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    wait_on_line(&LINE, &LINE_LANDED, why, true, done);
 }
 
 /// Since the last frame-rate line: ReBAR relay fetches, bytes DMAed, and wait
@@ -4207,6 +4295,19 @@ fn relay_worker() {
                         _ => None,
                     })
                     .collect();
+                line.in_hand_back.clear();
+                for item in &items {
+                    if let Late::Run(flight) = item {
+                        for (shadow, ranges, _) in &flight.back {
+                            let s_ptr = std::sync::Arc::as_ptr(shadow) as usize;
+                            for &(from, to) in ranges {
+                                if from < to {
+                                    line.in_hand_back.push((s_ptr, from, to));
+                                }
+                            }
+                        }
+                    }
+                }
                 break Ok(items);
             }
         };
@@ -4432,6 +4533,203 @@ mod late_tests {
         }
         assert!(!touches(&[], 0, usize::MAX));
     }
+
+    #[test]
+    fn range_settle_is_default_on_and_respects_disable() {
+        use super::range_settle_enabled;
+        assert!(range_settle_enabled(None));
+        assert!(range_settle_enabled(Some("1")));
+        assert!(!range_settle_enabled(Some("0")));
+        assert!(range_settle_enabled(Some("auto")));
+    }
+
+    #[test]
+    fn line_overlaps_stale_distinguishes_disjoint_and_overlapping_flights() {
+        use super::{ExecEpochGuard, Flight, Late, Line, line_overlaps_stale};
+        use crate::shadow::Shadow;
+        use std::sync::Arc;
+
+        let mut side = vec![0u8; 4 * crate::watch::PAGE];
+        let Some(shadow_a) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            0x1000_0000,
+            (4 * crate::watch::PAGE) as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            return;
+        };
+        let Some(shadow_b) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            0x1000_0000,
+            (4 * crate::watch::PAGE) as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            return;
+        };
+        let ptr_a = Arc::as_ptr(&shadow_a) as usize;
+        let ptr_b = Arc::as_ptr(&shadow_b) as usize;
+
+        let make_flight = |number: u64, back: Vec<super::Declared>| Flight {
+            number,
+            fence: number,
+            lists: Vec::new(),
+            order: Vec::new(),
+            card: None,
+            back,
+            marks: None,
+            _exec_epoch: ExecEpochGuard {
+                scope: None,
+                epoch: 0,
+            },
+        };
+
+        let mut line = Line {
+            line: vec![
+                Late::Run(make_flight(
+                    1,
+                    vec![(
+                        shadow_a.clone(),
+                        vec![(0x1000_0000, 0x1001_0000)],
+                        Vec::new(),
+                    )],
+                )),
+                Late::Run(make_flight(
+                    2,
+                    vec![(
+                        shadow_b.clone(),
+                        vec![(0x1002_0000, 0x1003_0000)],
+                        Vec::new(),
+                    )],
+                )),
+            ],
+            written: Vec::new(),
+            lists: 2,
+            target: 2,
+            settling: false,
+            poke: false,
+            landed: Vec::new(),
+            in_hand: Vec::new(),
+            in_hand_back: Vec::new(),
+        };
+
+        // Disjoint ranges on the same or other shadow must not match.
+        assert!(!line_overlaps_stale(&line, &[(ptr_a, 0x1001_0000, 0x1002_0000)]));
+        assert!(!line_overlaps_stale(&line, &[(ptr_b, 0x1000_0000, 0x1001_0000)]));
+        assert!(!line_overlaps_stale(&line, &[]));
+
+        // Overlapping range on shadow_a matches flight 1.
+        assert!(line_overlaps_stale(&line, &[(ptr_a, 0x1000_8000, 0x1001_8000)]));
+        // Overlapping range on shadow_b matches flight 2.
+        assert!(line_overlaps_stale(&line, &[(ptr_b, 0x1002_0000, 0x1002_1000)]));
+
+        // When flight 1 moves into `in_hand_back` (`settling == true`), it still overlaps
+        // until landing completes and clears `in_hand_back`.
+        line.line.remove(0);
+        line.settling = true;
+        line.in_hand_back.push((ptr_a, 0x1000_0000, 0x1001_0000));
+        assert!(line_overlaps_stale(&line, &[(ptr_a, 0x1000_0000, 0x1000_1000)]));
+        assert!(!line_overlaps_stale(&line, &[(ptr_a, 0x1001_0000, 0x1002_0000)]));
+
+        line.in_hand_back.clear();
+        line.settling = false;
+        assert!(!line_overlaps_stale(&line, &[(ptr_a, 0x1000_0000, 0x1000_1000)]));
+        assert!(line_overlaps_stale(&line, &[(ptr_b, 0x1002_0000, 0x1003_0000)]));
+    }
+
+    #[test]
+    fn range_scoped_wait_unblocks_without_draining_unrelated_flights() {
+        use super::{
+            ExecEpochGuard, Flight, Late, Line, WHY_STALE, line_overlaps_stale, wait_on_line,
+        };
+        use crate::shadow::Shadow;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let mut side = vec![0u8; 4 * crate::watch::PAGE];
+        let Some(shadow) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            0x2000_0000,
+            (4 * crate::watch::PAGE) as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            return;
+        };
+        let s_ptr = Arc::as_ptr(&shadow) as usize;
+        let stale_hit = [(s_ptr, 0x2000_0000usize, 0x2001_0000usize)];
+        let stale_disjoint = [(s_ptr, 0x2003_0000usize, 0x2004_0000usize)];
+
+        let make_flight = |number: u64, range: (usize, usize)| Flight {
+            number,
+            fence: number,
+            lists: Vec::new(),
+            order: Vec::new(),
+            card: None,
+            back: vec![(shadow.clone(), vec![range], Vec::new())],
+            marks: None,
+            _exec_epoch: ExecEpochGuard {
+                scope: None,
+                epoch: 0,
+            },
+        };
+
+        let line = Arc::new(Mutex::new(Line {
+            line: vec![
+                Late::Run(make_flight(1, (0x2000_0000, 0x2001_0000))),
+                Late::Run(make_flight(2, (0x2002_0000, 0x2003_0000))),
+            ],
+            written: vec![(0x2000_0000, 0x2001_0000), (0x2002_0000, 0x2003_0000)],
+            lists: 2,
+            target: 2,
+            settling: false,
+            poke: false,
+            landed: Vec::new(),
+            in_hand: Vec::new(),
+            in_hand_back: Vec::new(),
+        }));
+        let cv = Arc::new(Condvar::new());
+
+        // Disjoint stale range does not block at all even with both flights in flight.
+        assert_eq!(
+            wait_on_line(&line, &cv, WHY_STALE, false, |l| !line_overlaps_stale(l, &stale_disjoint)),
+            None
+        );
+
+        // Overlapping stale range blocks until flight 1 lands, even while flight 2 stays in line.
+        let stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let line_w = line.clone();
+        let cv_w = cv.clone();
+        let stage_w = stage.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            {
+                let mut l = line_w.lock().unwrap();
+                l.line.remove(0);
+                l.settling = true;
+                l.in_hand_back.push((s_ptr, 0x2000_0000, 0x2001_0000));
+                stage_w.store(1, std::sync::atomic::Ordering::Release);
+            }
+            cv_w.notify_all();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            {
+                let mut l = line_w.lock().unwrap();
+                l.in_hand_back.clear();
+                l.settling = false;
+                l.written = vec![(0x2002_0000, 0x2003_0000)];
+                stage_w.store(2, std::sync::atomic::Ordering::Release);
+            }
+            cv_w.notify_all();
+        });
+
+        let waited = wait_on_line(&line, &cv, WHY_STALE, false, |l| {
+            !line_overlaps_stale(l, &stale_hit)
+        });
+        assert!(waited.is_some());
+        assert_eq!(stage.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert_eq!(line.lock().unwrap().line.len(), 1, "unrelated flight 2 remains in LINE");
+        handle.join().unwrap();
+    }
 }
 
 /// Whether a title buffer copy that continues the one recorded before it
@@ -4521,6 +4819,66 @@ fn collect_declared_writes(
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     collect_declared_writes(runs, |_| true)
+}
+
+/// Subset of `back` belonging to card-backed host copies.
+fn collect_card_declared(back: &[Declared]) -> Vec<Declared> {
+    back.iter()
+        .filter(|(shadow, _, _)| shadow.carded())
+        .cloned()
+        .collect()
+}
+
+/// Collects per-shadow merged `[from, to)` refresh spans across `runs` for
+/// `watch::ask_once`.
+fn collect_ask_once_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step
+                && !shadow.unwatched()
+            {
+                let span = spans
+                    .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                    .or_insert((*address, *address + *len));
+                *span = (span.0.min(*address), span.1.max(*address + *len));
+            }
+        }
+    }
+    spans.into_values().collect()
+}
+
+/// Builds pre-submission ReBAR write tracking entries from `back`.
+fn build_rebar_entries(back: &[Declared]) -> Vec<RebarWriteEntry> {
+    let mut rebar_entries = Vec::new();
+    for (shadow, declared, unmarked) in back {
+        if !shadow.is_rebar() {
+            continue;
+        }
+        let ranges: Vec<(usize, usize)> = declared
+            .iter()
+            .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
+            .filter(|&(from, to)| from < to)
+            .collect();
+        let declared_spans = merge_ranges(ranges);
+        let piece_runs = spans_to_piece_runs(&declared_spans);
+        let mark_base = if crate::shadow::view_marks_on() && unmarked.is_empty() {
+            shadow.mark_base()
+        } else {
+            None
+        };
+        rebar_entries.push(RebarWriteEntry {
+            shadow: shadow.clone(),
+            declared_title: declared.clone(),
+            unmarked_title: unmarked.clone(),
+            declared_spans,
+            piece_runs,
+            compare_out_base: None,
+            compare_pieces: 0,
+            mark_base,
+        });
+    }
+    rebar_entries
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -5057,14 +5415,11 @@ impl Host {
     /// `flown`: the submission is sent ahead with [`relay`]. Its compare
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
-    fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, declared: Vec<Declared>, flown: bool) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
         }
-        // The ranges this submission's shaders may write, per copy, with the
-        // subset declared without shader view-marks.
-        let declared = collect_declared_writes(runs, |shadow| shadow.carded());
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -6013,10 +6368,12 @@ impl Host {
                 poke,
                 landed: kept,
                 in_hand,
+                in_hand_back,
                 ..
             } = &mut *line;
             kept.extend(landed);
             in_hand.clear();
+            in_hand_back.clear();
             // What is still in the air, from the flights that are.
             written.clear();
             *lists = 0;
@@ -6454,6 +6811,20 @@ impl Host {
         working(was_working);
     }
 
+    /// Settles only the flights in `LINE` whose `flight.back` overlaps `stale`
+    /// when range-scoped `settle` is enabled under [`relay_exact`], falling back
+    /// to a full [`Host::settle`] when `VICTORY_RANGE_SETTLE=0` or `!relay_exact()`.
+    fn settle_stale(&self, submitted: &mut u64, stale: &[(usize, usize, usize)]) {
+        if !late() || stale.is_empty() {
+            return;
+        }
+        if range_settle() && relay_exact() {
+            relay_wait(WHY_STALE, |line| !line_overlaps_stale(line, stale));
+        } else {
+            self.settle(submitted, WHY_STALE);
+        }
+    }
+
     /// [`Host::execute`], or with `late` the first half of
     /// [`Host::execute_late`]: the lists are prepared and sent, and what is
     /// to be done once they have run comes back with the submission lock
@@ -6463,9 +6834,34 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        // Safe pre-lock prep outside `self.submitted`: purely inspect closed `runs`
+        // and pre-allocate submission vectors without touching `LINE` or `Shadow`
+        // submission state.
+        let back = declared_writes(runs);
+        let card_declared = crate::shadow::cards().then(|| collect_card_declared(&back));
+        let ask_once_ranges = crate::watch::once().then(|| collect_ask_once_ranges(runs));
+        let mut rebar_entries = if !late {
+            build_rebar_entries(&back)
+        } else {
+            Vec::new()
+        };
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        // Where each run's lists start in `lists`.
+        let mut firsts = Vec::with_capacity(runs.len());
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // If another thread holds `self.submitted` (e.g. settling or submitting),
+        // drain pending descriptor heap syncs and waiting texture slots while
+        // waiting so descriptor prep overlaps with the holder's work.
+        let mut submitted = match self.submitted.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::descriptor::sync_heaps();
+                crate::descriptor::make_waiting();
+                self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -6530,9 +6926,6 @@ impl Host {
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
@@ -6540,36 +6933,24 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
-                    }
+        if let Some(ranges) = &ask_once_ranges {
+            crate::watch::ask_once(ranges);
+        }
+        // Behind flights: the title wrote memory that a flight's shaders
+        // may write too, and this submission refreshes it. Only the flights
+        // whose `back` overlaps the stale ranges are waited on (or all flights
+        // under `VICTORY_RANGE_SETTLE=0`), and then the asking is made again:
+        // the copy-back wrote title memory, which other copies of it must see.
+        if behind {
+            let stale = stale_under_flights(runs);
+            if !stale.is_empty() {
+                let settling = std::time::Instant::now();
+                self.settle_stale(&mut submitted, &stale);
+                settled += settling.elapsed();
+                if let Some(ranges) = &ask_once_ranges {
+                    crate::watch::ask_once(ranges);
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
-            crate::watch::ask_once(&ranges);
-            // Behind flights: the title wrote memory that a flight's shaders
-            // may write too, and this submission refreshes it. The flights
-            // are settled, and the asking made again: the copy-back wrote
-            // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
-                let settling = std::time::Instant::now();
-                self.settle(&mut submitted, WHY_STALE);
-                settled += settling.elapsed();
-                crate::watch::ask_once(&ranges);
-            }
-        } else if behind && stale_under_flights(runs) {
-            let settling = std::time::Instant::now();
-            self.settle(&mut submitted, WHY_STALE);
-            settled += settling.elapsed();
         }
         for list in runs {
             list.run_deferred(&mut batch, self, &mut submitted);
@@ -6600,40 +6981,9 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown);
+        let card = self.card_before(card_declared.unwrap_or_default(), flown);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
-        }
-        let back = declared_writes(runs);
-        let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
-        if !late {
-            for (shadow, declared, unmarked) in &back {
-                if !shadow.is_rebar() {
-                    continue;
-                }
-                let ranges: Vec<(usize, usize)> = declared
-                    .iter()
-                    .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
-                    .filter(|&(from, to)| from < to)
-                    .collect();
-                let declared_spans = merge_ranges(ranges);
-                let piece_runs = spans_to_piece_runs(&declared_spans);
-                let mark_base = if crate::shadow::view_marks_on() && unmarked.is_empty() {
-                    shadow.mark_base()
-                } else {
-                    None
-                };
-                rebar_entries.push(RebarWriteEntry {
-                    shadow: shadow.clone(),
-                    declared_title: declared.clone(),
-                    unmarked_title: unmarked.clone(),
-                    declared_spans,
-                    piece_runs,
-                    compare_out_base: None,
-                    compare_pieces: 0,
-                    mark_base,
-                });
-            }
         }
         let mut rebar_hash_plan = if rebar_entries.is_empty() {
             RebarHashPlan::default()
