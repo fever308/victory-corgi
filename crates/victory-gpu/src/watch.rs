@@ -749,12 +749,13 @@ struct Guards {
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
     aliased: BTreeSet<usize>,
-    /// Blocks the kernel is about to write for the runtime ([`writing`]),
-    /// from, to, and until when they are left writable: a read may be
-    /// asynchronous and land after the call that asked for it returned, and
-    /// the kernel does not fault into our handler, it fails. Until then
-    /// they are not made read-only, and every check reports them written.
-    pins: Vec<(usize, usize, std::time::Instant)>,
+    /// Blocks the kernel is about to write for the runtime ([`kernel_writing`]),
+    /// keyed by disjoint `[first, last)` block intervals with their expiry: a
+    /// read may be asynchronous and land after the call that asked for it
+    /// returned, and the kernel does not fault into our handler, it fails.
+    /// Until then they are not made read-only, and every check reports them
+    /// written.
+    pins: BTreeMap<usize, (usize, std::time::Instant)>,
 }
 
 // (Readers and writers: nearly every asking finds every block of its range
@@ -764,22 +765,56 @@ static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
-    pins: Vec::new(),
+    pins: BTreeMap::new(),
 });
 
-/// How long blocks stay writable after [`writing`].
+/// How long blocks stay writable after [`kernel_writing`].
 const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Guards {
-    /// Whether `block` is left writable for a kernel write.
+    /// Whether `block` is left writable for a kernel write (`O(log P)`).
     fn pinned(&self, block: usize) -> bool {
-        self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+        if self.pins.is_empty() {
+            return false;
+        }
+        self.pins
+            .range(..=block)
+            .next_back()
+            .is_some_and(|(_, &(end, _))| block < end)
+    }
+
+    /// Marks `[first, last)` pinned until at least `until`, coalescing any
+    /// overlapping or adjacent intervals so `pins` stays compact and disjoint.
+    fn pin(&mut self, mut first: usize, mut last: usize, mut until: std::time::Instant) {
+        if first >= last {
+            return;
+        }
+        let scan_from = self
+            .pins
+            .range(..=first)
+            .next_back()
+            .filter(|&(_, &(p1, _))| p1 >= first)
+            .map_or(first, |(&k, _)| k);
+        let merged: Vec<(usize, usize, std::time::Instant)> = self
+            .pins
+            .range(scan_from..=last)
+            .map(|(&p0, &(p1, u))| (p0, p1, u))
+            .collect();
+        for (p0, p1, u) in merged {
+            self.pins.remove(&p0);
+            first = first.min(p0);
+            last = last.max(p1);
+            if u > until {
+                until = u;
+            }
+        }
+        self.pins.insert(first, (last, until));
     }
 
     fn prune_pins(&mut self) {
         if !self.pins.is_empty() {
             let now = std::time::Instant::now();
-            self.pins.retain(|&(_, _, until)| until > now);
+            self.pins.retain(|_, &mut (_, until)| until > now);
         }
     }
 
@@ -789,20 +824,26 @@ impl Guards {
         if self.pins.is_empty() || first >= last {
             return;
         }
-        let mut kept = Vec::with_capacity(self.pins.len());
-        for (p0, p1, until) in self.pins.drain(..) {
-            if p1 <= first || p0 >= last {
-                kept.push((p0, p1, until));
-            } else {
-                if p0 < first {
-                    kept.push((p0, first, until));
-                }
-                if last < p1 {
-                    kept.push((last, p1, until));
-                }
+        let scan_from = self
+            .pins
+            .range(..first)
+            .next_back()
+            .filter(|&(_, &(p1, _))| p1 > first)
+            .map_or(first, |(&k, _)| k);
+        let hits: Vec<(usize, usize, std::time::Instant)> = self
+            .pins
+            .range(scan_from..last)
+            .map(|(&p0, &(p1, u))| (p0, p1, u))
+            .collect();
+        for (p0, p1, until) in hits {
+            self.pins.remove(&p0);
+            if p0 < first {
+                self.pins.insert(p0, (first, until));
+            }
+            if last < p1 {
+                self.pins.insert(last, (p1, until));
             }
         }
-        self.pins = kept;
     }
 }
 
@@ -1235,12 +1276,35 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     true
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
-/// kernel (which does not fault into our handler): opens its guarded blocks
-/// and leaves them writable for [`PIN`] across every view of their pages.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
-pub fn writing(at: usize, len: usize) {
+/// Before our own synchronous user-mode write into title memory
+/// `[at, at + len)` (GPU copy-back, `Step::Copy`): opens any guarded blocks
+/// without pinning them writable for [`PIN`] (unlike async kernel reads in
+/// [`kernel_writing`]), and uses a read-lock fast path so parallel relay
+/// workers do not contend on the guards write lock when blocks are already open.
+pub(crate) fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    let needs_open = {
+        let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+        g.protected.range(first..last).next().is_some()
+            || g.aliased.range(first..last).next().is_some()
+    };
+    if needs_open {
+        let mut g = guards();
+        open(&mut g, at, end);
+    }
+    // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, len);
+}
+
+/// Before a write into title memory `[at, at + len)` through the kernel (which
+/// does not fault into our handler): opens its guarded blocks and leaves them
+/// writable for [`PIN`] across every view of their pages. The runtime calls it
+/// (as `kernel_will_write`) before the title's kernel reads into its own memory.
+pub fn kernel_writing(at: usize, len: usize) {
     if len == 0 {
         return;
     }
@@ -1251,7 +1315,7 @@ pub fn writing(at: usize, len: usize) {
         let mut g = guards();
         g.prune_pins();
         let until = std::time::Instant::now() + PIN;
-        g.pins.push((first, last, until));
+        g.pin(first, last, until);
         open(&mut g, at, end);
         if view_guard() {
             // The same pages at their other views: the write lands in them too,
@@ -1263,7 +1327,7 @@ pub fn writing(at: usize, len: usize) {
                     for &alias in shown {
                         let alias_block = alias / BLOCK;
                         if alias_block != block {
-                            g.pins.push((alias_block, alias_block + 1, until));
+                            g.pin(alias_block, alias_block + 1, until);
                             open_here(&mut g, alias, alias.saturating_add(BLOCK));
                         }
                     }
@@ -2108,9 +2172,11 @@ mod tests {
         drop_views(section, &[guarded, other], SIZE);
     }
 
-    /// A write of the runtime's own, told at one view of the pages
-    /// (`writing`): the other views stay writable and report the pages
-    /// written while pinned, then re-guard once the pin expires.
+    /// A write of the runtime's own, told at one view of the pages:
+    /// - synchronous user-mode [`writing`] opens the other views and immediately
+    ///   re-guards on the next check without leaving a 2 s pin;
+    /// - async [`kernel_writing`] keeps all views writable and reported written
+    ///   while pinned, then re-guards cleanly once the pin expires.
     #[test]
     fn a_write_told_at_one_view_is_reported_at_the_others() {
         const SIZE: usize = 2 * BLOCK;
@@ -2118,9 +2184,13 @@ mod tests {
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()), "nothing written yet");
+        // Synchronous write (GPU copy-back): opens without pinning, so the next
+        // check reports it once and re-guards immediately.
         writing(other + BLOCK, BLOCK);
-        // While pinned (2 s grace for async kernel reads), both views stay
-        // writable and repeated checks continue to report the block written.
+        assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
+        assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
+        // Async kernel write: pinned writable for 2 s across all views.
+        kernel_writing(other + BLOCK, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert!(writable(guarded + BLOCK));
         assert!(writable(other + BLOCK));
@@ -2130,7 +2200,7 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Half a page and the next: both blocks, not just the first's.
-        writing(other + BLOCK / 2, BLOCK);
+        kernel_writing(other + BLOCK / 2, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         guards().pins.clear();
         drop_views(section, &[guarded, other], SIZE);
