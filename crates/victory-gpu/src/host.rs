@@ -6596,6 +6596,10 @@ impl Host {
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, &stale);
                 settled += settling.elapsed();
+                // `settle_stale` may land GPU writes into private write-watched
+                // title memory without updating `DIR`, so void any standing
+                // `VICTORY_ASK_SHARED` asking before re-asking.
+                crate::watch::ask_once_void();
                 if let Some(ranges) = &ask_once_ranges {
                     crate::watch::ask_once(ranges);
                 }

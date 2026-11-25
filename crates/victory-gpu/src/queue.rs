@@ -143,6 +143,26 @@ fn forces() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_FORCE").is_none_or(|v| v != "0"))
 }
 
+/// Restores `crate::watch::CURRENT_STAMP` to `0` on scope exit, even on unwind.
+#[cfg(windows)]
+struct CurrentStampGuard;
+
+#[cfg(windows)]
+impl Drop for CurrentStampGuard {
+    fn drop(&mut self) {
+        crate::watch::CURRENT_STAMP.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Runs `f` with `crate::watch::CURRENT_STAMP` set to `stamp` and resets it to
+/// `0` when `f` returns or unwinds.
+#[cfg(windows)]
+fn with_current_stamp<R>(stamp: u64, f: impl FnOnce() -> R) -> R {
+    crate::watch::CURRENT_STAMP.store(stamp, Ordering::Relaxed);
+    let _guard = CurrentStampGuard;
+    f()
+}
+
 /// A submission to a queue whose lists are cut at their waits ([`cuts`]).
 /// The lists before the first one that waits run at once if the queue
 /// holds nothing; the rest goes behind what the queue holds, part by part
@@ -151,9 +171,13 @@ fn forces() -> bool {
 /// there, now and whenever a submission has run.
 #[cfg(windows)]
 fn submit_cut(this: This, lists: &[This]) {
+    if lists.is_empty() {
+        return;
+    }
     let Some(host) = crate::host::host() else {
         return;
     };
+    let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
     // (With `async_submit` nothing runs in the title's call: all of it goes
     // to the queue's line.)
     let first = if !async_submit() && lock(&queue(this).held).is_empty() {
@@ -179,24 +203,28 @@ fn submit_cut(this: This, lists: &[This]) {
             first < lists.len()
         )
     });
-    if first > 0 && crate::host::late() {
-        // Sent to the card and not waited for: their host sides are taken
-        // from the title's lists (which it may reset before they have run)
-        // and come back, with their tables' slots, when they are settled.
-        let (taken, order) = crate::list::detach(&lists[..first]);
-        host.execute_late(taken, order);
-    } else if first > 0 {
-        let now: Vec<_> = lists[..first]
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&now);
-        // They have run: their descriptor tables' slots are free again, as
-        // on the path without cuts ([`execute`]). This path replaced that
-        // one without the call, so the lists that run at once kept their
-        // slots until the title's reset and the ring ran out as before
-        // (run 45: 3,143 of 15,942 tables refused in one frame).
-        crate::list::tables_done(&lists[..first]);
+    if first > 0 {
+        with_current_stamp(stamp, || {
+            if crate::host::late() {
+                // Sent to the card and not waited for: their host sides are taken
+                // from the title's lists (which it may reset before they have run)
+                // and come back, with their tables' slots, when they are settled.
+                let (taken, order) = crate::list::detach(&lists[..first]);
+                host.execute_late(taken, order);
+            } else {
+                let now: Vec<_> = lists[..first]
+                    .iter()
+                    .filter_map(|&l| crate::list::host_list(l))
+                    .collect();
+                host.execute(&now);
+                // They have run: their descriptor tables' slots are free again, as
+                // on the path without cuts ([`execute`]). This path replaced that
+                // one without the call, so the lists that run at once kept their
+                // slots until the title's reset and the ring ran out as before
+                // (run 45: 3,143 of 15,942 tables refused in one frame).
+                crate::list::tables_done(&lists[..first]);
+            }
+        });
     }
     if first < lists.len() {
         let parts = crate::list::detach_parts(&lists[first..]);
@@ -213,7 +241,6 @@ fn submit_cut(this: This, lists: &[This]) {
         }
         {
             let mut held = lock(&queue(this).held);
-            let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
             for (waits, taken, order) in parts {
                 held.extend(waits.into_iter().map(Held::Value));
                 held.push(Held::Stamp(stamp));
@@ -235,9 +262,13 @@ fn submit_cut(this: This, lists: &[This]) {
 /// after it; and lists named twice among those held stay in one piece.
 #[cfg(windows)]
 fn submit_split(this: This, lists: &[This]) {
+    if lists.is_empty() {
+        return;
+    }
     let Some(host) = crate::host::host() else {
         return;
     };
+    let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
     let by = crate::list::waits_by_list(lists);
     // Behind what the queue already holds, nothing runs now.
     let cut = if lock(&queue(this).held).is_empty() {
@@ -267,7 +298,7 @@ fn submit_split(this: This, lists: &[This]) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&now);
+        with_current_stamp(stamp, || host.execute(&now));
     }
     if cut < lists.len() {
         static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -298,6 +329,7 @@ fn submit_split(this: This, lists: &[This]) {
             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
             pieces.extend(waits.into_iter().map(Held::Value));
             let (taken, order) = crate::list::detach(&lists[from..to]);
+            pieces.push(Held::Stamp(stamp));
             pieces.push(Held::Run(taken, order));
             from = to;
         }
@@ -324,6 +356,27 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
         return false;
     }
     held.push(what());
+    true
+}
+
+/// Adds `Held::Stamp(stamp)` followed by `Held::Run(taken, order)` to what
+/// the queue holds, if it holds anything (under the same lock): whether it was added.
+#[cfg(windows)]
+fn hold_stamped(
+    this: This,
+    stamp: u64,
+    what: impl FnOnce() -> (Vec<crate::list::Detached>, Vec<usize>),
+) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let mut held = lock(&queue(this).held);
+    if held.is_empty() {
+        return false;
+    }
+    let (taken, order) = what();
+    held.push(Held::Stamp(stamp));
+    held.push(Held::Run(taken, order));
     true
 }
 
@@ -612,13 +665,11 @@ fn send_joined(joined: &mut Joined) {
                 n[4]
             );
         }
-        crate::watch::CURRENT_STAMP.store(stamp, Ordering::Relaxed);
-        match crate::host::host() {
+        with_current_stamp(stamp, || match crate::host::host() {
             Some(host) => host.execute_late(lists, order),
             // (Not reached: parts are only taken with a host.)
             None => crate::list::recycle(lists, &order),
-        }
-        crate::watch::CURRENT_STAMP.store(0, Ordering::Relaxed);
+        });
         joined.parts = 0;
     }
     // Behind what was just sent, in the order they were met.
@@ -967,6 +1018,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if lists.is_empty() {
+            return;
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -975,6 +1029,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             submit_split(this, lists);
             return;
         }
+        let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
         // A list that waits for a memory value not there yet: the queue
         // holds the submission, as it does behind a fence.
         if waits() && !this.is_null() {
@@ -991,10 +1046,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 }
             }
         }
-        let kept = hold(this, || {
-            let (taken, order) = crate::list::detach(lists);
-            Held::Run(taken, order)
-        });
+        let kept = hold_stamped(this, stamp, || crate::list::detach(lists));
         // Diagnostics: the order submissions are made in, next to the
         // commands of the frame's `ops` file (which are in recording order).
         #[cfg(feature = "diagnostics")]
@@ -1017,7 +1069,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&host_lists);
+        with_current_stamp(stamp, || host.execute(&host_lists));
         crate::list::tables_done(lists);
         // What the lists wrote at the bottom of the pipe may be a fence
         // another queue waits for.
@@ -1675,5 +1727,141 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn with_current_stamp_restores_zero_on_return_and_unwind() {
+        struct ResetStamp;
+        impl Drop for ResetStamp {
+            fn drop(&mut self) {
+                crate::watch::CURRENT_STAMP.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetStamp;
+        crate::watch::CURRENT_STAMP.store(0, Ordering::Relaxed);
+
+        let out = with_current_stamp(42, || {
+            assert_eq!(crate::watch::CURRENT_STAMP.load(Ordering::Relaxed), 42);
+            7u32
+        });
+        assert_eq!(out, 7);
+        assert_eq!(crate::watch::CURRENT_STAMP.load(Ordering::Relaxed), 0);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_current_stamp(99, || {
+                assert_eq!(crate::watch::CURRENT_STAMP.load(Ordering::Relaxed), 99);
+                panic!("simulated host execution panic");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            crate::watch::CURRENT_STAMP.load(Ordering::Relaxed),
+            0,
+            "CurrentStampGuard must reset CURRENT_STAMP on unwind"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn submit_cut_assigns_single_stamp_to_prefix_and_held_parts() {
+        if crate::host::host().is_none() || !cuts() || async_submit() {
+            return;
+        }
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+
+        let mut lists = [null; 3];
+        let wait_slot = if crate::device::newer() { 0x248 } else { 0x238 };
+        for l in &mut lists {
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, l),
+                S_OK
+            );
+        }
+
+        let gate_mem: u64 = 0;
+        let gate_addr = std::ptr::from_ref(&gate_mem) as u64;
+        // lists[0] has no wait (runs in prefix `first = 1`);
+        // lists[1] and lists[2] wait on unmet values so `detach_parts` produces two held parts.
+        for (i, reference) in [(1usize, 1u64), (2usize, 2u64)] {
+            let wait_value = slot::<extern "system" fn(This, u64, u32, u64)>(lists[i], wait_slot);
+            wait_value(lists[i], gate_addr, 3, reference);
+            assert!(crate::list::cut_list(lists[i]));
+        }
+        for &l in &lists {
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(l, 0x48)(l), S_OK);
+        }
+
+        // Empty submission must not mint a stamp.
+        let before = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        submit_cut(q, &[]);
+        assert_eq!(crate::watch::TITLE_SUBMITS.load(Ordering::Acquire), before);
+        assert_eq!(crate::watch::CURRENT_STAMP.load(Ordering::Relaxed), 0);
+
+        submit_cut(q, &lists);
+        let after = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        assert_eq!(
+            after,
+            before + 1,
+            "submit_cut must mint one stamp across prefix and all held parts"
+        );
+        assert_eq!(crate::watch::CURRENT_STAMP.load(Ordering::Relaxed), 0);
+
+        {
+            let held = lock(&queue(q).held);
+            let mut stamps = Vec::new();
+            let mut prev_was_stamp = false;
+            for item in held.iter() {
+                match item {
+                    Held::Stamp(s) => {
+                        stamps.push(*s);
+                        prev_was_stamp = true;
+                    }
+                    Held::Run(..) => {
+                        assert!(prev_was_stamp, "Held::Stamp must immediately precede Held::Run");
+                        prev_was_stamp = false;
+                    }
+                    _ => prev_was_stamp = false,
+                }
+            }
+            assert_eq!(stamps, vec![after, after]);
+        }
+
+        // Drain the held parts cleanly and verify CURRENT_STAMP returns to 0.
+        release_held(true);
+        assert!(lock(&queue(q).held).is_empty());
+        assert_eq!(crate::watch::CURRENT_STAMP.load(Ordering::Relaxed), 0);
+
+        for l in lists {
+            slot::<extern "system" fn(This) -> u32>(l, 0x10)(l);
+        }
+        slot::<extern "system" fn(This) -> u32>(allocator, 0x10)(allocator);
+        slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
     }
 }

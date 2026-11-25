@@ -2185,5 +2185,77 @@ mod rebar_tests {
             "unexpected D3D12 debug layer error during sync_copy_queue test"
         );
     }
+
+    #[test]
+    fn ask_once_void_forces_fresh_get_write_watch_after_settle_stale() {
+        use std::sync::atomic::Ordering;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        struct CleanupGuard {
+            base: usize,
+        }
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                crate::watch::CURRENT_STAMP.store(0, Ordering::Relaxed);
+                crate::watch::ask_once_void();
+                // SAFETY: `self.base` is a private allocation owned by this test.
+                unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+            }
+        }
+
+        // SAFETY: private write-watched page simulating title RAM.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        let _cleanup = CleanupGuard { base };
+
+        // Baseline reset so kernel write-watch bit starts clean.
+        assert!(crate::watch::writes(base, base + crate::watch::PAGE, false).is_some());
+
+        // Mint a title submission stamp and set `CURRENT_STAMP` to it so after
+        // the first `ask_once`, `CURRENT_STAMP <= ASK_STAMP` holds.
+        let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::watch::CURRENT_STAMP.store(stamp, Ordering::Relaxed);
+
+        let ranges = [(base, base + crate::watch::PAGE)];
+        crate::watch::ask_once(&ranges);
+        let (epoch1, _) = crate::watch::asked(base, base + crate::watch::PAGE)
+            .expect("first ask_once covers private range");
+
+        // Simulate `settle_stale` landing GPU writes directly into private
+        // write-watched title memory without updating `DIR`.
+        // SAFETY: committed private `PAGE_READWRITE` memory owned by this test.
+        unsafe { (base as *mut u8).write_volatile(0x5A) };
+
+        // Voiding the standing asking clears `ASK_STAMP` and `AHEAD`.
+        crate::watch::ask_once_void();
+        assert!(
+            crate::watch::asked(base, base + crate::watch::PAGE).is_none(),
+            "ask_once_void must clear standing ask_once state"
+        );
+
+        // Even with `CURRENT_STAMP` still at `stamp` (`<=` the prior `ASK_STAMP`),
+        // re-asking must perform a fresh kernel `GetWriteWatch` query and observe
+        // the newly dirtied page.
+        crate::watch::ask_once(&ranges);
+        let (epoch2, written) = crate::watch::asked(base, base + crate::watch::PAGE)
+            .expect("second ask_once re-queries private range");
+        assert!(epoch2 > epoch1);
+        assert!(
+            written
+                .iter()
+                .any(|&(p, w)| p == base / crate::watch::PAGE && w == epoch2),
+            "re-ask after ask_once_void must observe newly dirtied write-watch page"
+        );
+    }
 }
 
