@@ -57,6 +57,8 @@ mod pix;
 mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod reflection;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

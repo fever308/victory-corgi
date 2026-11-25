@@ -1704,11 +1704,13 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
-            // Title memory by address: what the shader finds it by.
+            // Title memory by address: what the shader finds it by. Its copies
+            // are given as written only to a shader that can store by address.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 #[cfg(feature = "diagnostics")]
                 let _t = crate::copystat::sect(7);
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let memory_writes = writes && (t.address_stores || !write_skip());
+                let Some(ready) = self.memory_ready(list, compute, memory_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -2203,6 +2205,10 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        // Discover raw-byte-copied buffer and placed-texture views before
+        // draining `buffer_changes()` and `heap_textures()`, so they are
+        // materialized for this frame rather than nulled out at `Host::submit`.
+        crate::descriptor::sync_heaps();
         // Per host heap: cached `(shadow, from, to)` per buffer slot and
         // incrementally-maintained per-shadow merged spans. Each pass inspects
         // newly-changed slots, a bounded retry queue for slots whose host copy
@@ -2448,6 +2454,7 @@ impl State {
             );
         }
         let began = std::time::Instant::now();
+        crate::descriptor::sync_heaps();
         PASS_BUDGET.set(Some(budget));
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);
@@ -3093,11 +3100,41 @@ impl State {
         crate::debugger::pixel::after(list, probe);
         list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.reflection(list, p);
         if self.ambient(list, p) {
             self.host_pipeline = 0;
             self.host_roots = [0; 2];
             self.host_heaps = [0; 2];
         }
+    }
+
+    /// After a dispatch of `p`: the stand-in for ray-traced reflections
+    /// ([`crate::reflection`]), if it is on and `p` is one of its passes.
+    /// What it records binds nothing (a transition and a render target
+    /// clear): the title's bindings stay.
+    fn reflection(&self, list: &HostList, p: &HostPipeline) {
+        let Some(stage) = p.stages.first().filter(|_| p.compute) else {
+            return;
+        };
+        let Some(pass) = crate::reflection::pass(&stage.shader.hash) else {
+            return;
+        };
+        let uavs: Vec<crate::reflection::Uav> = stage
+            .translated()
+            .used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+            .filter_map(|u| {
+                let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                    return None;
+                };
+                match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                    Some(View::Unordered(r, _, desc)) if r != 0 => Some((u.slot, u.table_offset_dwords, r, desc)),
+                    _ => None,
+                }
+            })
+            .collect();
+        crate::reflection::after(list, pass, &stage.shader.hash, &uavs);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -4475,6 +4512,7 @@ impl State {
         if kind == DISPATCH {
             list.count_write();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.reflection(list, p);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
