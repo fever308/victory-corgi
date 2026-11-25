@@ -920,13 +920,40 @@ pub fn map_alias_batch(ops: &[PageMapOp]) -> bool {
     let mut physical = physical();
     let mut changing: Option<victory_gpu::Remapping> = None;
     let mut ok = true;
-    for (op_idx, &op) in ops.iter().enumerate() {
+    #[cfg(feature = "diagnostics")]
+    let mut merged_unmaps = 0usize;
+    let mut op_idx = 0;
+    while op_idx < ops.len() {
         let remaining = &ops[op_idx..];
+        let op = ops[op_idx];
+        op_idx += 1;
         let (to, from, len) = (op.to as usize, op.from as usize, op.len as usize);
         if len == 0 {
             continue;
         }
         if from == 0 {
+            let mut len = len;
+            // Consecutive unmaps can remove their shared host view in one
+            // operation, without remapping a piece that is about to go away.
+            if to.is_multiple_of(PAGE) && len.is_multiple_of(PAGE) {
+                while let Some(&next) = ops.get(op_idx) {
+                    if next.from == 0
+                        && next.len != 0
+                        && next.len.is_multiple_of(PAGE as u64)
+                        && to.checked_add(len).map(|end| end as u64) == Some(next.to)
+                        && next.to.checked_add(next.len).is_some()
+                    {
+                        len += next.len as usize;
+                        op_idx += 1;
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            merged_unmaps += 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
             if has_mapped_views(&physical, to, len) {
                 ensure_remapping(&physical, remaining, &mut changing);
                 unmap(&mut physical, to, len);
@@ -972,6 +999,10 @@ pub fn map_alias_batch(ops: &[PageMapOp]) -> bool {
                 }
             }
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    if merged_unmaps != 0 {
+        tracing::debug!(merged_unmaps, "coalesced adjacent GPU page unmaps");
     }
     ok
 }
@@ -2064,6 +2095,37 @@ mod tests {
         let mut expected = vec![
             (pool as usize + PAGE, PAGE),
             (heap as usize + PAGE, 2 * PAGE),
+        ];
+        expected.sort_unstable();
+        assert_eq!(shown, expected);
+
+        // Neighboring unmaps can share a range, removing their shared host view
+        // in one operation without splitting a soon-unmapped piece. A map
+        // between them must still observe the original operation order.
+        let unmap_page = |page: usize| PageMapOp {
+            to: (heap as usize + page * PAGE) as u64,
+            from: 0,
+            len: PAGE as u64,
+            mapping: PageMapping::Consecutive,
+        };
+        assert!(map_alias_batch(&[
+            unmap_page(1),
+            unmap_page(2),
+            PageMapOp { to: unmap_page(2).to, len: PAGE as u64, ..update[0] },
+            unmap_page(3),
+        ]));
+        assert_eq!(query(heap.wrapping_byte_add(PAGE)).host.State, MEM_RESERVE);
+        // SAFETY: pages 0 and 2 are still mapped read-write.
+        unsafe {
+            assert_eq!(heap.cast::<u8>().read(), 0x11);
+            assert_eq!(heap.cast::<u8>().add(2 * PAGE).read(), 0x22);
+        }
+        assert_eq!(query(heap.wrapping_byte_add(3 * PAGE)).host.State, MEM_RESERVE);
+        let mut shown = shown_at(&pages[1..2], 0, PAGE);
+        shown.sort_unstable();
+        let mut expected = vec![
+            (pool as usize + PAGE, PAGE),
+            (heap as usize + 2 * PAGE, PAGE),
         ];
         expected.sort_unstable();
         assert_eq!(shown, expected);
