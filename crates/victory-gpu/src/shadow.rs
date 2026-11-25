@@ -205,6 +205,8 @@ pub(crate) struct Shadow {
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
+    /// Monotonic resource creation sequence for epoch-based retirement.
+    born_seq: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
@@ -2361,9 +2363,8 @@ pub(crate) fn let_go_idle() {
     for shadow in gone {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
-        // Nothing runs now and nothing names it: freed at once unless a
-        // submission is running after all.
-        crate::host::retire(shadow);
+        let born = shadow.born_seq;
+        crate::host::retire_born(shadow, born);
     }
 }
 
@@ -2481,6 +2482,7 @@ impl Shadow {
             gpu,
             start,
             len,
+            born_seq: crate::host::birth_seq(),
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
@@ -3823,7 +3825,14 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let shadow = {
+        let mut map = buffers();
+        map.remove(&(start, resource)).and_then(|e| e.shadow)
+    };
+    if let Some(shadow) = shadow {
+        let born = shadow.born_seq;
+        crate::host::retire_born(shadow, born);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3865,7 +3874,8 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     let n = gone.len() as u64;
     for shadow in gone {
-        crate::host::retire(shadow);
+        let born = shadow.born_seq;
+        crate::host::retire_born(shadow, born);
     }
     n
 }
@@ -4310,7 +4320,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len, None));
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -4505,7 +4515,7 @@ mod card_merge_tests {
             // The title's byte, refreshed into the CPU's side and sent up in send 7.
             title[title_byte] ^= 0x5a;
             side[title_byte] = title[title_byte];
-            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64, None);
             shadow.card = Some(Card {
                 staging: staging.clone(),
                 before: Mutex::new(None),
@@ -4866,5 +4876,87 @@ mod tests {
 
         drop(shadow);
         unregister(resource, start);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unregister_drops_shadow_immediately_when_idle() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0101_usize;
+        register(resource, start, data.len() as u64);
+        let weak = {
+            let shadow = find(start, 64).expect("shadow");
+            Arc::downgrade(&shadow)
+        };
+        assert_eq!(weak.strong_count(), 1);
+        unregister(resource, start);
+        assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unregister_retires_shadow_until_active_epoch_finishes() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0102_usize;
+        register(resource, start, data.len() as u64);
+        let weak = {
+            let shadow = find(start, 64).expect("shadow");
+            Arc::downgrade(&shadow)
+        };
+        assert_eq!(weak.strong_count(), 1);
+
+        let list = host.new_list().expect("host list");
+        list.mark_work();
+
+        unregister(resource, start);
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "unregistered shadow must wait for active epochs that recorded after its birth"
+        );
+
+        list.close();
+        list.reset();
+        assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unregister_drops_new_shadow_despite_older_pinned_list() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let stale = host.new_list().expect("stale list");
+        stale.mark_work();
+
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0103_usize;
+        register(resource, start, data.len() as u64);
+        let weak = {
+            let shadow = find(start, 64).expect("shadow");
+            Arc::downgrade(&shadow)
+        };
+        assert_eq!(weak.strong_count(), 1);
+
+        unregister(resource, start);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "shadow created after stale list's last work must not leak behind it"
+        );
+        stale.close();
+        stale.reset();
     }
 }

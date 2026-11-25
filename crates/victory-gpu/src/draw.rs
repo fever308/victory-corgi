@@ -809,6 +809,7 @@ impl State {
                 }
                 continue;
             };
+            list.keep(texture);
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
@@ -818,6 +819,7 @@ impl State {
         self.depth_state = DEPTH_WRITE;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
+            list.keep(texture);
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
             if crate::resource::depth_and_unordered(record.resource) {
@@ -1193,6 +1195,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        list.mark_work();
         // Depth planes compute wrote in this list through their twins: given to the planes
         // first, so this draw or dispatch reads (or tests) what was written. The passes set
         // state of ours: the title's is set again, and what follows sets the pipeline, root

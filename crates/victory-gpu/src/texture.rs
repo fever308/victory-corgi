@@ -56,6 +56,8 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Monotonic resource creation sequence for epoch-based retirement.
+    born_seq: u64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
@@ -642,13 +644,18 @@ pub(crate) fn unfilled(resource: usize) {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     unfilled(resource);
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
-    }
+    let staging = {
+        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_mut().and_then(|map| map.remove(&resource))
+    };
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
         set.remove(&resource);
+    }
+    drop(set);
+    if let Some(staging) = staging {
+        let born = staging.born_seq;
+        crate::host::retire_born(staging, born);
     }
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
@@ -1612,6 +1619,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        born_seq: crate::host::birth_seq(),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
@@ -1735,5 +1743,129 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_texture() -> (This, &'static ID3D12Resource) {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::Interface;
+
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+        let host_tex = crate::resource::host_resource(tex).expect("host texture");
+        (tex, host_tex)
+    }
+
+    #[test]
+    fn forget_drops_staging_immediately_when_idle() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let (tex, host_tex) = test_texture();
+        let weak = {
+            let s = staging(tex, host_tex).expect("staging");
+            Arc::downgrade(&s)
+        };
+        assert_eq!(weak.strong_count(), 1);
+        forget(tex as usize);
+        assert_eq!(weak.strong_count(), 0);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
+    }
+
+    #[test]
+    fn forget_retires_staging_until_active_epoch_finishes() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let (tex, host_tex) = test_texture();
+        let weak = {
+            let s = staging(tex, host_tex).expect("staging");
+            Arc::downgrade(&s)
+        };
+        assert_eq!(weak.strong_count(), 1);
+
+        let list = host.new_list().expect("host list");
+        list.mark_work();
+
+        forget(tex as usize);
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "forgotten texture staging must wait for active epochs that recorded after its birth"
+        );
+
+        list.close();
+        list.reset();
+        assert_eq!(weak.strong_count(), 0);
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
+    }
+
+    #[test]
+    fn forget_drops_new_staging_despite_older_pinned_list() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let stale = host.new_list().expect("stale list");
+        stale.mark_work();
+
+        let (tex, host_tex) = test_texture();
+        let weak = {
+            let s = staging(tex, host_tex).expect("staging");
+            Arc::downgrade(&s)
+        };
+        assert_eq!(weak.strong_count(), 1);
+
+        forget(tex as usize);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "staging created after stale list's last work must not leak behind it"
+        );
+        stale.close();
+        stale.reset();
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
     }
 }

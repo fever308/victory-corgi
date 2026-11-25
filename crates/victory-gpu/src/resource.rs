@@ -1131,6 +1131,7 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) born_seq: u64,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -1806,7 +1807,8 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            let born = host.born_seq;
+            crate::host::retire_born(host, born);
         }
     }
     if went > 0 {
@@ -1962,6 +1964,7 @@ impl HostTexture {
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
+            born_seq: crate::host::birth_seq(),
             bytes,
             filled: false,
             tiled: None,
@@ -1979,6 +1982,7 @@ impl HostTexture {
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
+            born_seq: crate::host::birth_seq(),
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
@@ -2476,14 +2480,9 @@ impl Drop for Resource {
                 );
             }
         }
-        // A running submission may still read the host copy (and a depth
-        // texture's colour twin).
-        if let Some((host, twin)) = made {
-            crate::host::retire(host);
-            if let Some(twin) = twin {
-                crate::host::retire(twin);
-            }
-        }
+        // Forget descriptor/staging/target entries before retiring the host
+        // copy so no concurrent bindless sweep can observe it after retirement
+        // snapshots active epochs.
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
@@ -2491,6 +2490,16 @@ impl Drop for Resource {
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
+        }
+        // A running submission or list that recorded work after this host copy
+        // was created may still read it (and a depth texture's colour twin).
+        if let Some((host, twin)) = made {
+            let born = host.born_seq;
+            crate::host::retire_born(host, born);
+            if let Some(twin) = twin {
+                let twin_born = twin.colour.born_seq;
+                crate::host::retire_born(twin, twin_born);
+            }
         }
     }
 }

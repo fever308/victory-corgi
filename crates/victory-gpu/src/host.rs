@@ -169,31 +169,143 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
-/// Host objects the title let go of while a submission may still use them
-/// (a texture its descriptors name, a descriptor slot's old resource), by
-/// the submission count they wait for. The title's descriptor writes and
-/// releases reach the host at once, from its own threads, while the host
-/// runs a submission: freeing there is a GPU page fault on the freed
-/// texture (a device hang).
-/// (In parts by thread, each under its own lock: the recording threads
-/// retire at once.)
-static RETIRED: [Mutex<Vec<(u64, Retired)>>; 16] = [const { Mutex::new(Vec::new()) }; 16];
-
-/// This thread's part of [`RETIRED`].
-fn retired_part() -> usize {
-    thread_local! {
-        static PART: usize = {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            NEXT.fetch_add(1, Ordering::Relaxed) % 16
-        };
-    }
-    PART.with(|p| *p)
-}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// A retired object, dropped on whatever thread finishes the submission.
+/// Warn once when pinned epochs hold back this many retired host objects
+/// (for example, an unreset command list or a submission stalled behind an
+/// unsignalled fence).
+const RETIRED_WARN_THRESHOLD: usize = 4096;
+
+/// Monotonic sequence bumped whenever a tracked host resource (`HostTexture`,
+/// `Shadow`, `Staging`) is created. Starts at 1 so `0` means "unbounded /
+/// existed before any sequence" (used by legacy [`retire`]).
+static RESOURCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Returns a strictly increasing birth sequence for a newly allocated host
+/// resource. Active command lists whose last recorded command occurred before
+/// this sequence cannot reference the resource and do not block its release.
+pub(crate) fn birth_seq() -> u64 {
+    RESOURCE_SEQ.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// Sentinel work sequence shared by active [`Host::execute`] submissions so
+/// any object retired while the GPU is executing stays alive until execution
+/// finishes.
+fn exec_work_seq() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    static SEQ: OnceLock<std::sync::Arc<std::sync::atomic::AtomicU64>> = OnceLock::new();
+    SEQ.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)))
+        .clone()
+}
+
+struct ActiveEpoch {
+    /// Highest [`RESOURCE_SEQ`] observed when this epoch's owner recorded work
+    /// (or `u64::MAX` for an active [`Host::execute`] submission).
+    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Slab indices in [`RetireState::retired`] waiting on this epoch.
+    waiting: Vec<usize>,
+}
+
+struct RetiredEntry {
+    remaining: usize,
+    object: Option<Retired>,
+}
+
+/// Host objects the title let go of while an open list or a queued/running
+/// submission may still use them (a texture its descriptors name, a descriptor
+/// slot's old resource, a buffer shadow, or texture staging). The title's
+/// descriptor writes and releases reach the host at once, from its own threads,
+/// while lists are recorded or submissions run for most of a second in the
+/// world: freeing there was a GPU page fault on the freed texture
+/// (DXGI_ERROR_DEVICE_HUNG, 2026-11-24, RX 7600).
+///
+/// Each retired object tracks only the specific active epochs whose recorded
+/// `work_seq` is at or after the object's `born_seq` (or all active epochs when
+/// `born_seq == 0`). When an epoch finishes, only the objects waiting on it
+/// decrement their blocker count and drop when it hits zero — avoiding global
+/// head-of-line blocking when an older unreset list or stalled wait stays
+/// pinned while newer resources are created and freed.
+///
+/// Lock invariant: `RETIRE_STATE` is a strict leaf lock — never lock anything
+/// else while holding it, and ALWAYS drop retired objects AFTER releasing it.
+struct RetireState {
+    next_epoch: u64,
+    active_epochs: std::collections::BTreeMap<u64, ActiveEpoch>,
+    retired: Vec<Option<RetiredEntry>>,
+    free_slots: Vec<usize>,
+    pending_count: usize,
+    warned: bool,
+}
+
+impl RetireState {
+    const fn new() -> Self {
+        Self {
+            next_epoch: 1,
+            active_epochs: std::collections::BTreeMap::new(),
+            retired: Vec::new(),
+            free_slots: Vec::new(),
+            pending_count: 0,
+            warned: false,
+        }
+    }
+}
+
+static RETIRE_STATE: Mutex<RetireState> = Mutex::new(RetireState::new());
+
+/// RAII guard pinning an active GPU execution epoch until the submission
+/// finishes (or lands, for `late` flights).
+struct ExecEpochGuard {
+    #[cfg(test)]
+    scope: Option<std::sync::Arc<Mutex<RetireState>>>,
+    epoch: u64,
+}
+
+impl Drop for ExecEpochGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(scope) = self.scope.as_deref() {
+            release_epoch_in(scope, self.epoch);
+            return;
+        }
+        release_epoch_in(&RETIRE_STATE, self.epoch);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RETIRE_SCOPE: std::cell::RefCell<Option<std::sync::Arc<Mutex<RetireState>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct RetireTestScope {
+    prev: Option<std::sync::Arc<Mutex<RetireState>>>,
+}
+
+#[cfg(test)]
+impl Drop for RetireTestScope {
+    fn drop(&mut self) {
+        RETIRE_SCOPE.with(|cell| *cell.borrow_mut() = self.prev.take());
+    }
+}
+
+#[cfg(test)]
+fn current_retire_scope() -> Option<std::sync::Arc<Mutex<RetireState>>> {
+    RETIRE_SCOPE.with(|cell| cell.borrow().clone())
+}
+
+/// Isolates retirement epochs and queued drops on the current test thread (and
+/// any `HostList` created or acquired on it) from concurrent GPU tests.
+#[cfg(test)]
+pub(crate) fn isolated_retire_scope() -> RetireTestScope {
+    let fresh = std::sync::Arc::new(Mutex::new(RetireState::new()));
+    let prev = RETIRE_SCOPE.with(|cell| cell.borrow_mut().replace(fresh));
+    RetireTestScope { prev }
+}
+
+/// A retired object, dropped on whatever thread finishes its last blocking
+/// epoch.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
 // reference-counted wrappers holding them, dropped once.
@@ -203,6 +315,25 @@ unsafe impl Send for Retired {}
 pub(crate) fn now_ms() -> u64 {
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// Acquires a monotonically increasing epoch (never 0) that keeps retired
+/// objects alive until [`release_epoch_in`] is called with it.
+fn acquire_epoch_in(
+    retire_state: &Mutex<RetireState>,
+    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> u64 {
+    let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
+    let e = state.next_epoch;
+    state.next_epoch += 1;
+    state.active_epochs.insert(
+        e,
+        ActiveEpoch {
+            work_seq,
+            waiting: Vec::new(),
+        },
+    );
+    e
 }
 
 /// This moment, for telling later how long ago it was ([`long_ago`]): the
@@ -322,41 +453,129 @@ fn sweep() {
     crate::tiles::give_back_let_go();
 }
 
-/// Drops `object` once every submission running now has finished: at once
-/// if none is.
-pub(crate) fn retire<T: 'static>(object: T) {
-    let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
-        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+/// Releases `epoch` and drops every retired object whose last blocking epoch
+/// was `epoch` (outside `retire_state`).
+fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
+    let done: Vec<Retired> = {
+        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = state.active_epochs.remove(&epoch) else {
+            return;
+        };
+        let mut done = Vec::new();
+        for idx in active.waiting {
+            if let Some(entry) = state.retired.get_mut(idx).and_then(Option::as_mut) {
+                entry.remaining -= 1;
+                if entry.remaining == 0 {
+                    if let Some(obj) = entry.object.take() {
+                        done.push(obj);
+                    }
+                    state.retired[idx] = None;
+                    state.free_slots.push(idx);
+                    state.pending_count = state.pending_count.saturating_sub(1);
+                }
+            }
+        }
+        done
+    };
+    drop(done);
+}
+
+/// Objects [`retire_born`] dropped at once (no blocking epoch was active) and
+/// kept until their blocking epochs finished, since the start.
+static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T, born_seq: u64) {
+    // Pair with `work_seq` updates in `HostList::mark_work` and `RESOURCE_SEQ`
+    // increments in `birth_seq`.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let warn = {
+        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = state.free_slots.pop().unwrap_or(state.retired.len());
+        let mut blockers = 0usize;
+        for entry in state.active_epochs.values_mut() {
+            if born_seq == 0 || entry.work_seq.load(Ordering::Acquire) >= born_seq {
+                entry.waiting.push(slot);
+                blockers += 1;
+            }
+        }
+        if blockers == 0 {
+            if slot < state.retired.len() {
+                state.free_slots.push(slot);
+            }
+            drop(state);
+            RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+            drop(object);
+            return;
+        }
+        let item = Some(RetiredEntry {
+            remaining: blockers,
+            object: Some(Retired(Box::new(object))),
+        });
+        if slot == state.retired.len() {
+            state.retired.push(item);
+        } else {
+            state.retired[slot] = item;
+        }
+        state.pending_count += 1;
+        RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+        if !state.warned && state.pending_count >= RETIRED_WARN_THRESHOLD {
+            state.warned = true;
+            let (oldest_epoch, oldest_work_seq) = state
+                .active_epochs
+                .iter()
+                .next()
+                .map_or((0, 0), |(&e, entry)| {
+                    (e, entry.work_seq.load(Ordering::Relaxed))
+                });
+            Some((
+                state.pending_count,
+                oldest_epoch,
+                oldest_work_seq,
+                RESOURCE_SEQ.load(Ordering::Relaxed),
+                state.active_epochs.len(),
+                state.next_epoch.saturating_sub(1),
+            ))
+        } else {
+            None
+        }
+    };
+    if let Some((
+        pending,
+        oldest_epoch,
+        oldest_work_seq,
+        current_seq,
+        active_epochs,
+        latest_epoch,
+    )) = warn
+    {
+        tracing::warn!(
+            pending,
+            oldest_epoch,
+            oldest_work_seq,
+            current_seq,
+            active_epochs,
+            latest_epoch,
+            "retired host resource queue grew past threshold; an unreset command list or stalled wait may be pinning epochs"
+        );
+    }
+}
+
+/// Drops `object` once every active epoch that could have observed a resource
+/// born at `born_seq` (`work_seq >= born_seq`, or all active epochs when
+/// `born_seq == 0`) has finished: at once if none matches.
+pub(crate) fn retire_born<T: 'static>(object: T, born_seq: u64) {
+    #[cfg(test)]
+    if let Some(scope) = current_retire_scope() {
+        retire_in(&scope, object, born_seq);
         return;
     }
-    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED[retired_part()]
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    retire_in(&RETIRE_STATE, object, born_seq);
 }
 
-/// Drops what waited for submissions up to `finished`.
-fn bury(finished: u64) {
-    for part in &RETIRED {
-        let done: Vec<(u64, Retired)> = {
-            let mut retired = part.lock().unwrap_or_else(|e| e.into_inner());
-            if retired.is_empty() {
-                continue;
-            }
-            let (done, keep) = std::mem::take(&mut *retired).into_iter().partition(|(at, _)| *at <= finished);
-            *retired = keep;
-            done
-        };
-        drop(done);
-    }
+/// Drops `object` once every epoch active now has finished: at once if none is.
+pub(crate) fn retire<T: 'static>(object: T) {
+    retire_born(object, 0);
 }
-
-/// Objects [`retire`] dropped at once (no submission was running) and
-/// kept until a running submission finished, since the start.
-static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// What the layer did to the host's objects lately, newest last (sweeps
 /// that let host copies go, pipeline library calls, saves and trims): said
@@ -971,8 +1190,9 @@ pub(crate) struct HostList {
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
-    /// Upload memory for data the list's draws make (expanded vertices),
-    /// reused after a reset.
+    /// Upload memory for data the list's draws make (expanded vertices): keeps
+    /// at most one warm chunk across resets and drops all chunks when parked in
+    /// the pool.
     scratch: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
@@ -997,6 +1217,22 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Active retirement epoch pinned while this list has recorded work or is
+    /// queued/executing (0 when idle).
+    epoch: std::sync::atomic::AtomicU64,
+    /// Highest [`RESOURCE_SEQ`] observed when this list recorded work; shared
+    /// with [`RetireState`] while `epoch != 0` so newer resources are not
+    /// blocked by stale lists.
+    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Queued or executing submissions currently pinning this list.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// Serializes `in_flight` transitions with `epoch` updates so a concurrent
+    /// `end_submit` never clears an epoch pinned by a new `begin_submit`.
+    epoch_lock: Mutex<()>,
+    /// Test-only isolated retirement state captured when the list is created or
+    /// acquired so parallel GPU tests do not pin each other's drops.
+    #[cfg(test)]
+    retire_scope: Option<std::sync::Arc<Mutex<RetireState>>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1015,6 +1251,12 @@ pub(crate) struct HostList {
     /// list's last wait for every earlier shader write: the title's barrier
     /// groups wait only then (`crate::list`). Set when made or reset.
     shader_writes: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for HostList {
+    fn drop(&mut self) {
+        self.release_epoch();
+    }
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2374,7 +2616,7 @@ fn gpu_upload_probe(device: &ID3D12Device) {
         }
         made
     };
-    let source: Vec<u8> = (0..BYTES).map(|i| (i * 2_654_435_761usize >> 13) as u8).collect();
+    let source: Vec<u8> = (0..BYTES).map(|i| ((i * 2_654_435_761usize) >> 13) as u8).collect();
     let mut back = vec![0u8; BYTES];
     let mut results = Vec::new();
     for (name, kind) in [("upload heap (system memory)", D3D12_HEAP_TYPE_UPLOAD), ("GPU upload heap (video memory)", D3D12_HEAP_TYPE_GPU_UPLOAD)] {
@@ -2604,6 +2846,7 @@ struct Sent {
     back: Vec<Declared>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    exec_epoch: ExecEpochGuard,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -2617,6 +2860,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    _exec_epoch: ExecEpochGuard,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -3747,6 +3991,12 @@ impl Host {
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 _alive: Counted::new(),
+                epoch: std::sync::atomic::AtomicU64::new(0),
+                work_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                epoch_lock: Mutex::default(),
+                #[cfg(test)]
+                retire_scope: current_retire_scope(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4696,7 +4946,6 @@ impl Host {
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             fills_verify(last);
-            bury(last);
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -4910,6 +5159,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                _exec_epoch: sent.exec_epoch,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -4954,6 +5204,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                _exec_epoch: sent.exec_epoch,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5101,7 +5352,6 @@ impl Host {
             }
             if last > 0 {
                 FINISHED.store(last, Ordering::Release);
-                bury(last);
             }
             line().landed.extend(landed);
         }
@@ -5173,6 +5423,23 @@ impl Host {
         fills_begin();
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
+        #[cfg(test)]
+        let exec_scope = runs
+            .iter()
+            .find_map(|l| l.retire_scope.clone())
+            .or_else(current_retire_scope);
+        let exec_epoch = {
+            #[cfg(test)]
+            let exec_state: &Mutex<RetireState> = exec_scope.as_deref().unwrap_or(&RETIRE_STATE);
+            #[cfg(not(test))]
+            let exec_state: &Mutex<RetireState> = &RETIRE_STATE;
+            let epoch = acquire_epoch_in(exec_state, exec_work_seq());
+            ExecEpochGuard {
+                #[cfg(test)]
+                scope: exec_scope,
+                epoch,
+            }
+        };
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let lock = (started - called).as_micros() as u64;
@@ -5302,6 +5569,7 @@ impl Host {
                 card,
                 back,
                 writes,
+                exec_epoch,
             };
             working(was_working);
             return Some((submitted, sent));
@@ -5398,7 +5666,6 @@ impl Host {
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
-        bury(this_submission);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -5487,6 +5754,8 @@ impl Host {
             crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         }
         working(was_working);
+        drop(submitted);
+        drop(exec_epoch);
         None
     }
 
@@ -5802,18 +6071,131 @@ impl HostList {
         was
     }
 
-    pub(crate) fn reset(&self) {
-        self.buffer_writes.store(true, Ordering::Relaxed);
-        self.shader_writes.store(true, Ordering::Relaxed);
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        self._alive.used();
+    fn retire_state(&self) -> &Mutex<RetireState> {
+        #[cfg(test)]
+        if let Some(scope) = self.retire_scope.as_deref() {
+            return scope;
+        }
+        &RETIRE_STATE
+    }
+
+    fn ensure_epoch(&self, _guard: &std::sync::MutexGuard<'_, ()>) {
+        if self.epoch.load(Ordering::Acquire) == 0 {
+            let e = acquire_epoch_in(self.retire_state(), self.work_seq.clone());
+            self.epoch.store(e, Ordering::Release);
+        }
+    }
+
+    /// Pins a retirement epoch for this list once it records GPU work, and
+    /// advances `work_seq` lock-free when new resources have been created
+    /// since the last command on this list.
+    pub(crate) fn mark_work(&self) {
+        let seq = RESOURCE_SEQ.load(Ordering::Acquire);
+        if self.epoch.load(Ordering::Acquire) != 0 {
+            if self.work_seq.load(Ordering::Relaxed) < seq {
+                self.work_seq.fetch_max(seq, Ordering::AcqRel);
+            }
+            return;
+        }
+        let guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.work_seq.fetch_max(seq, Ordering::AcqRel);
+        self.ensure_epoch(&guard);
+    }
+
+    /// Pins an epoch and increments the in-flight submission count for this
+    /// list before queuing it on a command queue timeline.
+    #[allow(dead_code)]
+    pub(crate) fn begin_submit(&self) {
+        let guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.ensure_epoch(&guard);
+    }
+
+    /// Releases a queued submission pin and, if it was the last in-flight
+    /// submission for this list, releases the list's retirement epoch.
+    /// Keeps `work_seq` intact so a subsequent resubmission of the same closed
+    /// list still protects resources recorded into it.
+    #[allow(dead_code)]
+    pub(crate) fn end_submit(&self) {
+        let released = {
+            let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.epoch.swap(0, Ordering::AcqRel)
+            } else {
+                0
+            }
+        };
+        if released != 0 {
+            release_epoch_in(self.retire_state(), released);
+        }
+    }
+
+    /// Releases a queued submission pin for a cancelled (unexecuted) submission
+    /// without clearing the list's recording epoch.
+    #[allow(dead_code)]
+    pub(crate) fn cancel_submit(&self) {
+        let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_epoch(&self) -> bool {
+        self.epoch.load(Ordering::Acquire) != 0
+    }
+
+    fn release_epoch(&self) {
+        self.release_epoch_inner(false);
+    }
+
+    fn release_epoch_inner(&self, clear_work_seq: bool) {
+        let released = {
+            let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                if clear_work_seq {
+                    self.work_seq.store(0, Ordering::Relaxed);
+                }
+                self.epoch.swap(0, Ordering::AcqRel)
+            } else {
+                0
+            }
+        };
+        if released != 0 {
+            release_epoch_in(self.retire_state(), released);
+        }
+    }
+
+    /// Clears per-recording tracking state shared between [`Self::reset`] and
+    /// [`Self::release_for_pool`].
+    fn clear_tracking(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Releases all retained memory and retirement pins before parking an idle,
+    /// finished list in the idle list pool.
+    pub(crate) fn release_for_pool(&self) {
+        self.clear_tracking();
+        {
+            let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            give_chunks(std::mem::take(&mut scratch.chunks));
+            (scratch.current, scratch.used) = (0, 0);
+        }
+        self.release_epoch_inner(true);
+    }
+
+    /// Only after the list's last submission finished (every one is waited
+    /// for).
+    pub(crate) fn reset(&self) {
+        self.buffer_writes.store(true, Ordering::Relaxed);
+        self.shader_writes.store(true, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        self._alive.used();
+        self.clear_tracking();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -5821,6 +6203,10 @@ impl HostList {
             // scratch memory any more, and the next list to ask takes it.
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
+            } else if scratch.chunks.len() > 1 {
+                // Keep at most one warm 4 MiB upload chunk so steady-state active
+                // lists avoid re-allocating while multi-chunk spikes are freed.
+                give_chunks(scratch.chunks.drain(1..).collect());
             }
         }
         // SAFETY: the list is not executing.
@@ -5834,6 +6220,7 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+        self.release_epoch_inner(true);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -9280,7 +9667,415 @@ mod spare {
 }
 
 #[cfg(test)]
-mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
+pub(crate) struct DropCounter(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl DropCounter {
+    pub(crate) fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (Self(drops.clone()), drops)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::*;
+
+    #[test]
+    fn retire_drops_immediately_when_no_epoch_is_active() {
+        let _retire = isolated_retire_scope();
+        let (counter, drops) = DropCounter::new();
+        retire(counter);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn idle_list_does_not_block_retirement() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let idle = host.new_list().expect("host list");
+        let (counter, drops) = DropCounter::new();
+        retire(counter);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(idle);
+    }
+
+    #[test]
+    fn open_marked_list_pins_retired_objects_across_other_executions() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let open = host.new_list().expect("open list");
+        open.mark_work();
+
+        let (c1, d1) = DropCounter::new();
+        retire(c1);
+        assert_eq!(d1.load(Ordering::SeqCst), 0);
+
+        // Submitting and executing a DIFFERENT list must not drop objects
+        // retired while `open` is still active.
+        let other = host.new_list().expect("other list");
+        other.mark_work();
+        other.close();
+        host.execute(&[&other]);
+        other.reset();
+        drop(other);
+        assert_eq!(
+            d1.load(Ordering::SeqCst),
+            0,
+            "executing another list must not release an open list's epoch"
+        );
+
+        // Closing and resetting the open list releases its epoch.
+        open.close();
+        open.reset();
+        assert_eq!(d1.load(Ordering::SeqCst), 1);
+
+        // Marking work again and dropping the list also releases its epoch.
+        open.mark_work();
+        let (c2, d2) = DropCounter::new();
+        retire(c2);
+        assert_eq!(d2.load(Ordering::SeqCst), 0);
+        drop(open);
+        assert_eq!(d2.load(Ordering::SeqCst), 1);
+
+        // A closed list pinned via begin_submit stays active across execution
+        // until end_submit.
+        let submitted = host.new_list().expect("submitted list");
+        submitted.mark_work();
+        submitted.begin_submit();
+        let (c3, d3) = DropCounter::new();
+        retire(c3);
+        submitted.close();
+        host.execute(&[&submitted]);
+        assert_eq!(d3.load(Ordering::SeqCst), 0);
+        submitted.end_submit();
+        assert_eq!(d3.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn active_execution_epoch_pins_objects_retired_during_execute() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drops_during = drops.clone();
+        // Use an unmarked deferred step without `begin_submit()` so `list`
+        // itself pins no epoch; only `Host::execute`'s `exec_epoch` keeps the
+        // object alive until execution finishes.
+        list.defer_host(move || {
+            let counter = DropCounter(drops_during.clone());
+            retire(counter);
+            assert_eq!(drops_during.load(Ordering::SeqCst), 0);
+        });
+        assert!(!list.has_epoch());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_pinned_list_does_not_block_newer_born_retirements() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        // Simulate an early command list (e.g. oldest_epoch=2) that recorded
+        // work once and stays unreset indefinitely.
+        let stale = host.new_list().expect("stale list");
+        stale.mark_work();
+
+        // A resource born after `stale` last recorded work must drop
+        // immediately once no newer epoch is active, without head-of-line
+        // blocking behind `stale`.
+        let born1 = birth_seq();
+        let (c1, d1) = DropCounter::new();
+        retire_born(c1, born1);
+        assert_eq!(
+            d1.load(Ordering::SeqCst),
+            1,
+            "stale pinned epoch must not block a resource created after its last work"
+        );
+
+        // A resource born before a newer active list must wait for that newer
+        // list, then drop as soon as the newer list finishes — still while
+        // `stale` remains pinned.
+        let born2 = birth_seq();
+        let active = host.new_list().expect("active list");
+        active.mark_work();
+        let (c2, d2) = DropCounter::new();
+        retire_born(c2, born2);
+        assert_eq!(d2.load(Ordering::SeqCst), 0);
+        active.close();
+        active.reset();
+        assert_eq!(
+            d2.load(Ordering::SeqCst),
+            1,
+            "resource must drop once its own blocking epoch finishes"
+        );
+
+        // If the older open list subsequently records new work after `born3`,
+        // its `work_seq` advances and `c3` MUST wait for `stale` to finish.
+        let born3 = birth_seq();
+        stale.mark_work();
+        let (c3, d3) = DropCounter::new();
+        retire_born(c3, born3);
+        assert_eq!(
+            d3.load(Ordering::SeqCst),
+            0,
+            "an open list that records work after birth_seq must pin that resource"
+        );
+        stale.close();
+        stale.reset();
+        assert_eq!(d3.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resubmitted_closed_list_preserves_work_seq_until_second_completion() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let born = birth_seq();
+        let list = host.new_list().expect("reused list");
+        list.mark_work();
+        list.close();
+
+        // First submission completes and releases the epoch, but keeps
+        // `work_seq` because the list was not reset.
+        list.begin_submit();
+        host.execute(&[&list]);
+        list.end_submit();
+        assert!(!list.has_epoch());
+
+        // Second submission re-acquires an epoch preserving `work_seq >= born`.
+        list.begin_submit();
+        let (c, d) = DropCounter::new();
+        retire_born(c, born);
+        assert_eq!(
+            d.load(Ordering::SeqCst),
+            0,
+            "resubmitted closed list must keep resources from its recording alive"
+        );
+        host.execute(&[&list]);
+        assert_eq!(d.load(Ordering::SeqCst), 0);
+        list.end_submit();
+        assert_eq!(d.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn host_list_reset_trims_excess_scratch_chunks() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+
+        // Allocate 3 x 3 MiB so 3 distinct 4 MiB scratch chunks are created.
+        for _ in 0..3 {
+            let (gpu, ptr) = list.scratch(3 << 20).expect("scratch allocation");
+            assert_ne!(gpu, 0);
+            assert!(!ptr.is_null());
+        }
+        assert!(
+            list.scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .chunks
+                .len()
+                >= 2,
+            "multi-chunk scratch spike should allocate at least two chunks"
+        );
+
+        let errors_before = host.d3d12_errors();
+        list.close();
+        list.reset();
+
+        {
+            let scratch = list.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                scratch.chunks.len() <= 1,
+                "reset should keep at most one warm scratch chunk (or 0 when pooled)"
+            );
+            assert_eq!((scratch.current, scratch.used), (0, 0));
+        }
+
+        // Subsequent allocations succeed cleanly with zero D3D12 errors.
+        let (gpu, ptr) = list.scratch(4096).expect("warm scratch allocation");
+        assert_ne!(gpu, 0);
+        assert!(!ptr.is_null());
+        assert_eq!(
+            list.scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .chunks
+                .len(),
+            1
+        );
+
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn release_for_pool_clears_scratch_uploads_and_tracked_resources_immediately() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+
+        // Track a title texture on the list, then release the title object so
+        // only the list's tracked state and epoch keep HostTexture alive.
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let iid = ID3D12Resource::IID;
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                (&raw const iid).cast(),
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        list.transition(tex, SHADER_RESOURCE);
+        let weak_tex = std::sync::Arc::downgrade(
+            &crate::resource::host_copy(tex).expect("tracked host texture"),
+        );
+        let release =
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(tex, 0x10);
+        assert_eq!(release(tex), 0);
+        assert!(weak_tex.upgrade().is_some());
+
+        // Populate scratch chunks, uploads, kept objects, deferred work,
+        // pipelines, and a pinned retirement epoch.
+        assert!(list.scratch(3 << 20).is_some());
+        assert!(list.scratch(3 << 20).is_some());
+        let (upload_res, _) = list.upload(host, 4096).expect("list upload");
+        list.keep(&upload_res);
+        drop(upload_res);
+        list.mark_work();
+        list.used_pipeline("recycle_test_pipeline");
+        let (deferred_counter, deferred_drops) = DropCounter::new();
+        list.defer_host(move || {
+            let _ = &deferred_counter;
+        });
+        let (retired_counter, retired_drops) = DropCounter::new();
+        retire(retired_counter);
+        assert!(list.has_epoch());
+        assert_eq!(retired_drops.load(Ordering::SeqCst), 0);
+
+        let errors_before = host.d3d12_errors();
+        list.close();
+        host.execute(&[&list]);
+
+        assert!(weak_tex.upgrade().is_some());
+        assert_eq!(deferred_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(retired_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            list.scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .chunks
+                .len(),
+            2
+        );
+
+        list.release_for_pool();
+
+        assert!(
+            weak_tex.upgrade().is_none(),
+            "tracked HostTexture must drop immediately when list is released for pool"
+        );
+        assert_eq!(
+            deferred_drops.load(Ordering::SeqCst),
+            1,
+            "deferred closures must drop immediately when list is released for pool"
+        );
+        assert_eq!(
+            retired_drops.load(Ordering::SeqCst),
+            1,
+            "list epoch must release immediately when list is released for pool"
+        );
+        assert!(
+            list.scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .chunks
+                .is_empty(),
+            "pooled list must hold 0 scratch chunks"
+        );
+        assert!(
+            list.states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        assert!(
+            list.pipelines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        assert!(!list.has_epoch());
+        {
+            let deferred = list.deferred();
+            assert!(deferred.uploads.is_empty());
+            assert!(deferred.kept.is_empty());
+            assert!(deferred.copies.is_empty());
+        }
+
+        // Verify D3D12 reset + recording + execution succeed cleanly with zero
+        // debug-layer errors.
+        list.reset();
+        let (gpu, ptr) = list.scratch(4096).expect("scratch after pool reuse");
+        assert_ne!(gpu, 0);
+        assert!(!ptr.is_null());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+}
+
+#[cfg(test)]
+mod batch {
+    // Batch::texture_due lives here; `mod tests` is already taken above
     use super::Batch;
     use std::sync::Arc;
 
