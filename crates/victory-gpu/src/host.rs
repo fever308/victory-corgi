@@ -253,6 +253,13 @@ impl RetireState {
 
 static RETIRE_STATE: Mutex<RetireState> = Mutex::new(RetireState::new());
 
+/// Live retirement telemetry: `(pending_objects, active_epochs, oldest_epoch)`.
+fn retire_stats() -> (usize, usize, u64) {
+    let state = RETIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let oldest = state.active_epochs.keys().next().copied().unwrap_or(0);
+    (state.pending_count, state.active_epochs.len(), oldest)
+}
+
 /// RAII guard pinning an active GPU execution epoch until the submission
 /// finishes (or lands, for `late` flights).
 struct ExecEpochGuard {
@@ -8946,6 +8953,21 @@ impl Meter {
                 making = crate::pipeline::making(),
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
+            );
+            let (buf_n, buf_b, loose_n, loose_b, loose_pin, rebar_b) = crate::shadow::cache_stats();
+            let (stg_n, stg_b, stg_pin) = crate::texture::cache_stats();
+            let (mem_n, mem_b) = crate::memory::cache_stats();
+            let (ret_pending, ret_epochs, ret_oldest) = retire_stats();
+            let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+            tracing::info!(
+                "gpu memory caches: buffers={:.0} MiB ({buf_n}), loose={:.0} MiB ({loose_n}, {loose_pin} pinned), \
+                 staging={:.0} MiB ({stg_n}, {stg_pin} pinned), raw_mem={:.0} MiB ({mem_n}), \
+                 rebar={:.0} MiB, retired={ret_pending} (epochs={ret_epochs} oldest={ret_oldest})",
+                mib(buf_b),
+                mib(loose_b),
+                mib(stg_b),
+                mib(mem_b),
+                mib(rebar_b),
             );
             #[cfg(feature = "diagnostics")]
             {

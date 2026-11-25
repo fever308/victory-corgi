@@ -5,13 +5,42 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use crate::shadow::Shadow;
+
+/// Host resource kept alive by a descriptor heap slot. Shadows are held via
+/// `Arc<Shadow>` so loose-shadow LRU eviction never evicts a window still
+/// referenced by a live descriptor slot.
+enum KeptObject {
+    Resource(#[allow(dead_code)] ID3D12Resource),
+    Shadow(#[allow(dead_code)] Arc<Shadow>),
+}
+
+impl KeptObject {
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Resource(a), Self::Resource(b)) => {
+                windows::core::Interface::as_raw(a) == windows::core::Interface::as_raw(b)
+            }
+            (Self::Shadow(a), Self::Shadow(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn as_resource(&self) -> &ID3D12Resource {
+        match self {
+            Self::Resource(r) => r,
+            Self::Shadow(s) => &s.buffer,
+        }
+    }
+}
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -42,7 +71,7 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// (In `KEPT_SHARDS` parts by slot number, each under a lock of its
     /// own: five recording threads make slots at once.)
-    kept: Vec<Mutex<std::collections::HashMap<u32, ID3D12Resource>>>,
+    kept: Vec<Mutex<std::collections::HashMap<u32, KeptObject>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1506,7 +1535,7 @@ impl HostHeap {
             Some(view) => null_for(&view, self.cpu(index)),
             None => null_view(self.cpu(index)),
         }
-        self.keep(index, None);
+        self.keep(index, Kept::Empty);
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -1695,20 +1724,65 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), clearing and retiring any resources kept in those slots
+    /// before making the slots reusable.
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
+        let end_rel = at.saturating_add(n).min(self.dynamic);
+        let start_abs = first;
+        let end_abs = self.count + end_rel;
+        // Clear retained resources BEFORE marking the dynamic range free, so a
+        // concurrent `dynamic()` caller cannot race on the same slots.
+        let mut retired = Vec::new();
+        if end_abs > start_abs {
+            let count = (end_abs - start_abs) as usize;
+            if count <= KEPT_SHARDS {
+                for idx in start_abs..end_abs {
+                    let mut shard = self.kept[idx as usize % KEPT_SHARDS]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(old) = shard.remove(&idx) {
+                        retired.push(old);
+                    }
+                }
+            } else {
+                for shard_lock in &self.kept {
+                    let mut shard = shard_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if shard.is_empty() {
+                        continue;
+                    }
+                    let mut remove_keys = Vec::new();
+                    for &k in shard.keys() {
+                        if k >= start_abs && k < end_abs {
+                            remove_keys.push(k);
+                        }
+                    }
+                    for k in remove_keys {
+                        if let Some(old) = shard.remove(&k) {
+                            retired.push(old);
+                        }
+                    }
+                }
+            }
+        }
+        {
+            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slots) = guard.1.get_mut(at as usize..end_rel as usize) {
+                let given = slots.iter().filter(|taken| **taken).count() as u32;
+                self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+                self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+                slots.fill(false);
+            }
+        }
+        if !retired.is_empty() {
+            let seq = crate::host::birth_seq();
+            for old in retired {
+                crate::host::retire_born(old, seq);
+            }
         }
     }
 
@@ -1719,7 +1793,7 @@ impl HostHeap {
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
-        self.keep(index, kept.flatten());
+        self.keep(index, kept.unwrap_or(Kept::Empty));
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -1729,36 +1803,45 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
-        self.keep(index, None);
+        self.keep(index, Kept::Empty);
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's).
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept[index as usize % KEPT_SHARDS].lock().unwrap_or_else(|e| e.into_inner());
-        // The resource the slot keeps already (a slot made again from
-        // another view of it, at every draw for some): nothing to let go.
-        if let (Some(new), Some(old)) = (&resource, kept.get(&index))
-            && windows::core::Interface::as_raw(new) == windows::core::Interface::as_raw(old)
-        {
-            return;
-        }
-        let old = match resource {
-            Some(resource) => kept.insert(index, resource),
-            None => kept.remove(&index),
+    /// Slot `index` now views `kept` (or nothing of the host's).
+    fn keep(&self, index: u32, kept: Kept) {
+        let slot_entry = match kept {
+            Kept::Empty => None,
+            Kept::Resource(resource) => Some(KeptObject::Resource(resource)),
+            Kept::Shadow(shadow) => Some(KeptObject::Shadow(shadow)),
         };
-        drop(kept);
+        let old = {
+            let mut shard = self.kept[index as usize % KEPT_SHARDS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // The resource the slot keeps already (a slot made again from
+            // another view of it, at every draw for some): nothing to let go.
+            if let (Some(new), Some(old)) = (&slot_entry, shard.get(&index))
+                && new.same_as(old)
+            {
+                return;
+            }
+            match slot_entry {
+                Some(entry) => shard.insert(index, entry),
+                None => shard.remove(&index),
+            }
+        };
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire(old);
+            crate::host::retire_born(old, crate::host::birth_seq());
         }
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
-    /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
+    /// of `shadow` from byte `offset` (a multiple of 16): a root SRV with a
     /// size, whose reads past it return zeros instead of reaching whatever
-    /// the host placed after the buffer.
-    pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+    /// the host placed after the buffer. Keeps the backing `Arc<Shadow>` alive
+    /// so loose shadow eviction never discards a buffer still referenced here.
+    pub(crate) fn raw_shadow_at(&self, index: u32, shadow: &Arc<Shadow>, offset: u64, len: u64) {
         let Some(host) = host() else { return };
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -1777,23 +1860,25 @@ impl HostHeap {
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+                .CreateShaderResourceView(&shadow.buffer, Some(&desc), self.cpu(index))
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Kept::Shadow(shadow.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
         null_buffer_view(self.cpu(index));
-        self.keep(index, None);
+        self.keep(index, Kept::Empty);
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
-    /// `len` bytes of `buffer` from byte `offset` (a multiple of 16): a
+    /// `len` bytes of `shadow` from byte `offset` (a multiple of 16): a
     /// root UAV with a size, whose accesses past it do nothing instead of
-    /// reaching whatever the host placed after the buffer.
-    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+    /// reaching whatever the host placed after the buffer. Keeps the backing
+    /// `Arc<Shadow>` alive so loose shadow eviction never discards a buffer
+    /// still referenced here.
+    pub(crate) fn raw_shadow_uav_at(&self, index: u32, shadow: &Arc<Shadow>, offset: u64, len: u64) {
         let Some(host) = host() else { return };
         let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -1812,19 +1897,19 @@ impl HostHeap {
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device.CreateUnorderedAccessView(
-                buffer,
+                &shadow.buffer,
                 None::<&ID3D12Resource>,
                 Some(&desc),
                 self.cpu(index),
             )
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Kept::Shadow(shadow.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
-        self.keep(index, None);
+        self.keep(index, Kept::Empty);
         let Some(host) = host() else { return };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -1860,7 +1945,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
+        self.keep(index, Kept::Empty);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -2028,7 +2113,7 @@ impl HostHeap {
                 && fallback_view(&words, self.cpu(index))
             {
                 made[index as usize] = 0;
-                self.keep(index, None);
+                self.keep(index, Kept::Empty);
                 EMPTY_AT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
@@ -2047,7 +2132,7 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            self.keep(index, kept.flatten());
+            self.keep(index, kept.unwrap_or(Kept::Empty));
             // Made: from here on without the lock.
             if !later {
                 self.fast[index as usize].store(key, std::sync::atomic::Ordering::Release);
@@ -2073,7 +2158,10 @@ impl HostHeap {
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
         let kept = self.kept[index as usize % KEPT_SHARDS].lock().unwrap_or_else(|e| e.into_inner());
         let shown = kept.get(&index)?;
-        Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        Some(
+            windows::core::Interface::as_raw(shown.as_resource())
+                == windows::core::Interface::as_raw(buffer),
+        )
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -2276,7 +2364,11 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 }
 
 /// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+enum Kept {
+    Empty,
+    Resource(ID3D12Resource),
+    Shadow(Arc<Shadow>),
+}
 
 /// Whether the pass over records copied in as bytes also mirrors slots
 /// that draws read through tables lately (`VICTORY_HEAP_SYNC_TABLES=1`;
@@ -2579,7 +2671,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Kept::Shadow(shadow))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -2670,7 +2762,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Kept::Shadow(shadow))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -2837,7 +2929,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            Some(Kept::Shadow(shadow))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -2904,7 +2996,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some(Kept::Resource(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -3005,7 +3097,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Kept::Resource(texture.clone()))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -3016,13 +3108,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Kept::Empty)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some(Kept::Empty)
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
@@ -3984,6 +4076,57 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn kept_slot_holds_shadow_arc_and_release_clears_kept() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+
+        let backing = vec![0x5Au8; 4096];
+        let base = backing.as_ptr() as u64;
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+        let shadow = crate::shadow::find(base, 256).expect("registered shadow");
+        let base_count = Arc::strong_count(&shadow);
+
+        let slot = heap.dynamic(2).expect("dynamic slots");
+        heap.raw_shadow_at(slot, &shadow, 0, 256);
+        assert_eq!(
+            Arc::strong_count(&shadow),
+            base_count + 1,
+            "descriptor SRV slot must hold Arc<Shadow> so loose LRU sees it in use"
+        );
+        heap.raw_shadow_uav_at(slot + 1, &shadow, 0, 256);
+        assert_eq!(
+            Arc::strong_count(&shadow),
+            base_count + 2,
+            "descriptor UAV slot must hold Arc<Shadow> so loose LRU sees it in use"
+        );
+
+        // Releasing the dynamic slot range clears `kept` and retires entries.
+        heap.release(slot, 2);
+        assert_eq!(
+            Arc::strong_count(&shadow),
+            base_count,
+            "releasing dynamic slots must drop kept shadows"
+        );
+
+        // Overwriting a slot with a null view releases the kept shadow.
+        let slot2 = heap.dynamic(1).expect("second dynamic slot");
+        heap.raw_shadow_at(slot2, &shadow, 0, 256);
+        assert_eq!(Arc::strong_count(&shadow), base_count + 1);
+        heap.make_null(slot2);
+        assert_eq!(
+            Arc::strong_count(&shadow),
+            base_count,
+            "overwriting descriptor slot must release old shadow"
+        );
+
+        heap.release(slot2, 1);
+        drop(shadow);
+        crate::shadow::unregister(base as usize, base);
     }
 }
 

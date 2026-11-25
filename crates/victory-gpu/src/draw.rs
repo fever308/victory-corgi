@@ -1605,7 +1605,7 @@ impl State {
                     // not on 16 bytes got a null view at first: the
                     // builder's counters are at such addresses.)
                     let bias = offset & 15;
-                    host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
+                    host.raw_shadow_uav_at(index, s, offset - bias, s.left(*a).min(limit) + bias);
                 }
                 if shadow.is_none() {
                     host.null_raw_uav_at(index);
@@ -1677,9 +1677,9 @@ impl State {
                             // From the 16 bytes below; the shader adds the
                             // rest (`victory_shader::emit::USER_VIEW_BIAS`).
                             let bias = offset & 15;
-                            host.raw_at(index, &s.buffer, offset - bias, s.left(*a) + bias);
+                            host.raw_shadow_at(index, s, offset - bias, s.left(*a) + bias);
                         } else if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a));
+                            host.raw_shadow_at(index, s, offset, s.left(*a));
                         } else {
                             // Raw views start on 16 bytes; one from the
                             // aligned start would shift every read.

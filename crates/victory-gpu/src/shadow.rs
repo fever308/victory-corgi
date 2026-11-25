@@ -18,9 +18,10 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
@@ -254,6 +255,8 @@ pub(crate) struct Shadow {
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
     /// Present when `buffer` lives in ReBAR `D3D12_HEAP_TYPE_GPU_UPLOAD` VRAM.
     rebar: Option<RebarShadow>,
+    /// Monotonic tick of the last loose-cache access (0 for registered buffers).
+    last_used: AtomicU64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2273,8 +2276,9 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
+            .entries
             .values()
             .map(|s| {
                 let low = s.asked[0].load(Ordering::Relaxed);
@@ -2297,8 +2301,8 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    for s in loose.values() {
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    for s in loose.entries.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
@@ -2338,12 +2342,13 @@ pub(crate) fn let_go_idle() {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-        if map.is_empty() {
+        let mut guard = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        if guard.entries.is_empty() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
+        let idle: Vec<(u64, u64)> = guard
+            .entries
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
@@ -2352,7 +2357,13 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        idle.into_iter()
+            .filter_map(|key| {
+                let s = guard.entries.remove(&key)?;
+                guard.total_bytes = guard.total_bytes.saturating_sub(s.len);
+                Some(s)
+            })
+            .collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2374,10 +2385,11 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
+            .entries
             .values()
             .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
             .map(|s| s.len)
@@ -2504,7 +2516,15 @@ impl Shadow {
                 mirror: Mutex::new(None),
                 hashes: Mutex::new(None),
             }),
+            last_used: AtomicU64::new(0),
         }
+    }
+
+    fn touch(&self) {
+        self.last_used.store(
+            LOOSE_TICK.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     /// Whether this copy lives in ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) VRAM.
@@ -3855,13 +3875,18 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-        let keys: Vec<(u64, u64)> = map
+        let mut guard = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = guard
+            .entries
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
-        gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        gone.extend(keys.into_iter().filter_map(|key| {
+            let s = guard.entries.remove(&key)?;
+            guard.total_bytes = guard.total_bytes.saturating_sub(s.len);
+            Some(s)
+        }));
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
@@ -3885,8 +3910,8 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    spans.extend(loose.entries.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
 
@@ -4044,12 +4069,120 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
+/// gets copies of the aligned windows it touches, bounded by a RAM-scaled
+/// LRU cache.
 /// A window nothing names any more is let go ([`let_go_idle`]).
 /// shortcut: a window is 4 MiB however little of it is read (the memory
 /// line says how much was ever asked for, and how much was ever copied);
 /// [`window`] cuts the windows of asks that give a length on a finer grid.
 const WINDOW: u64 = 4 << 20;
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+
+/// Monotonic access clock for LRU eviction of loose shadow windows.
+static LOOSE_TICK: AtomicU64 = AtomicU64::new(1);
+
+fn total_physical_ram_bytes() -> Option<u64> {
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    // SAFETY: `status` is initialized with `dwLength` set to its byte size as
+    // required by `GlobalMemoryStatusEx`.
+    let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
+    (ok != 0 && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+}
+
+fn loose_budget_for_ram(total_ram_bytes: Option<u64>) -> u64 {
+    match total_ram_bytes {
+        None => 256 * MIB,
+        Some(ram) if ram <= 16 * GIB => 128 * MIB,
+        Some(ram) if ram <= 32 * GIB => 256 * MIB,
+        Some(_) => 512 * MIB,
+    }
+}
+
+fn loose_budget() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let ram = total_physical_ram_bytes();
+        let budget = loose_budget_for_ram(ram);
+        tracing::info!(
+            total_ram_mib = ram.map(|b| b / MIB),
+            budget_mib = budget / MIB,
+            "loose shadow cache budget"
+        );
+        budget
+    })
+}
+
+struct LooseCache {
+    entries: BTreeMap<(u64, u64), Arc<Shadow>>,
+    total_bytes: u64,
+}
+
+impl LooseCache {
+    const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Evicts least-recently-used idle windows while `total_bytes > budget`,
+    /// never evicting `keep`, entries still held outside the cache
+    /// (`Arc::strong_count > 1`), or entries with pending GPU copy-back ranges.
+    fn evict_over_budget(&mut self, keep: (u64, u64), budget: u64) -> Vec<Arc<Shadow>> {
+        if self.total_bytes <= budget {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(u64, (u64, u64))> = self
+            .entries
+            .iter()
+            .filter_map(|(&key, shadow)| {
+                if key == keep || Arc::strong_count(shadow) != 1 {
+                    return None;
+                }
+                if !shadow
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty()
+                {
+                    return None;
+                }
+                Some((shadow.last_used.load(Ordering::Relaxed), key))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(tick, _)| tick);
+        let mut evicted = Vec::new();
+        for (_, key) in candidates {
+            if self.total_bytes <= budget {
+                break;
+            }
+            if let Some(shadow) = self.entries.remove(&key) {
+                self.total_bytes = self.total_bytes.saturating_sub(shadow.len);
+                evicted.push(shadow);
+            }
+        }
+        if !evicted.is_empty() {
+            tracing::debug!(
+                evicted = evicted.len(),
+                total_bytes = self.total_bytes,
+                budget,
+                "evicted idle loose shadow windows"
+            );
+        }
+        evicted
+    }
+}
 
 /// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
 /// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
@@ -4144,8 +4277,8 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    cover(loose.keys().copied())
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    cover(loose.entries.keys().copied())
 }
 
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
@@ -4176,9 +4309,20 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 
 /// Copies of title memory outside buffers, by (start, length).
 // (Readers and writers: nearly every ask finds its window made.)
-static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
+static LOOSE: std::sync::RwLock<LooseCache> = std::sync::RwLock::new(LooseCache::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    loose_in(&LOOSE, address, end, unsized_ask, any, loose_budget())
+}
+
+fn loose_in(
+    cache: &std::sync::RwLock<LooseCache>,
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    any: bool,
+    budget: u64,
+) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Which window the ask is given, among those `map` holds.
@@ -4198,6 +4342,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
+        shadow.touch();
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         shadow.asked[0].fetch_min(address, Ordering::Relaxed);
         shadow.asked[1].fetch_max(end, Ordering::Relaxed);
@@ -4207,64 +4352,113 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // Made already, nearly always: found beside the other threads that ask.
     {
-        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&pick(&map)) {
+        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = guard.entries.get(&pick(&guard.entries)) {
             note(shadow);
             return Some(shadow.clone());
         }
     }
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
-    let (start, len) = pick(&map);
-    if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
-        return Some(shadow.clone());
-    }
-    // In place, if asked for and the window's memory can be opened: the
-    // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
-        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
-        map.insert((start, len), shadow.clone());
-        return Some(shadow);
-    }
-    // Keep unbounded loose 4 MiB windows in system memory (unless `window_card_for`
-    // places them on the card) so they cannot starve registered title buffers out
-    // of the bounded ReBAR budget.
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the one just made is the CPU's side.
-    let (buffer, card) = match window_card_for(len) {
-        Some(on_card) => {
-            crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
-            let card = Card {
-                staging: buffer,
-                before: Mutex::default(),
-                dirty: Mutex::default(),
-                sent: Mutex::default(),
-                size: len,
-            };
-            (on_card, Some(card))
+    let (shadow, evicted) = {
+        let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+        let (start, len) = pick(&guard.entries);
+        let key = (start, len);
+        if let Some(shadow) = guard.entries.get(&key) {
+            note(shadow);
+            return Some(shadow.clone());
         }
-        None => (buffer, None),
+        // In place, if asked for and the window's memory can be opened: the
+        // window is the title's own memory, with nothing to copy.
+        let shadow = if let Some(placed) = crate::inplace::place_for(start, len, true) {
+            Arc::new(Shadow::placed(placed, start, len, true))
+        } else {
+            // Keep unbounded loose 4 MiB windows in system memory (unless
+            // `window_card_for` places them on the card) so they cannot starve
+            // registered title buffers out of the bounded ReBAR budget.
+            let (buffer, data) = host()?.shared_buffer(len)?;
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+            // With room for windows on the card (`window_card_most`): shaders get a
+            // buffer there, and the one just made is the CPU's side.
+            let (buffer, card) = match window_card_for(len) {
+                Some(on_card) => {
+                    crate::host::name(&on_card, || {
+                        format!("title memory {start:#x}+{len:#x} on the card")
+                    });
+                    let card = Card {
+                        staging: buffer,
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        size: len,
+                    };
+                    (on_card, Some(card))
+                }
+                None => (buffer, None),
+            };
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            tracing::debug!(
+                start = format_args!("{start:#x}"),
+                len,
+                "loose memory copied to the host"
+            );
+            let mut shadow = Shadow::new(buffer, data, gpu, start, len, None);
+            shadow.window = true;
+            shadow.card = card;
+            let shadow = Arc::new(shadow);
+            if shadow.card.is_some() {
+                CARDED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(Arc::downgrade(&shadow));
+            }
+            shadow
+        };
+        note(&shadow);
+        guard.entries.insert(key, shadow.clone());
+        guard.total_bytes = guard.total_bytes.saturating_add(len);
+        let evicted = guard.evict_over_budget(key, budget);
+        (shadow, evicted)
     };
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len, None);
-    shadow.window = true;
-    shadow.card = card;
-    let shadow = Arc::new(shadow);
-    if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    for old in evicted {
+        let born = old.born_seq;
+        crate::host::retire_born(old, born);
     }
-    note(&shadow);
-    map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// Live byte and entry counts across registered buffers, loose windows, and
+/// ReBAR shadow reservations for periodic memory diagnostics.
+pub(crate) fn cache_stats() -> (usize, u64, usize, u64, usize, u64) {
+    let (buffers_count, buffers_bytes) = {
+        let map = buffers();
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for entry in map.values() {
+            if let Some(s) = &entry.shadow {
+                count += 1;
+                bytes = bytes.saturating_add(s.len);
+            }
+        }
+        (count, bytes)
+    };
+    let (loose_count, loose_bytes, loose_pinned) = {
+        let cache = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let pinned = cache
+            .entries
+            .values()
+            .filter(|s| Arc::strong_count(s) > 1)
+            .count();
+        (cache.entries.len(), cache.total_bytes, pinned)
+    };
+    let rebar_bytes = REBAR_SHADOW_BYTES.load(Ordering::Relaxed);
+    (
+        buffers_count,
+        buffers_bytes,
+        loose_count,
+        loose_bytes,
+        loose_pinned,
+        rebar_bytes,
+    )
 }
 
 /// Copies of single buffer views' own bytes ([`exact`]), by (start,
@@ -4555,8 +4749,9 @@ pub(crate) fn near(va: u64) -> String {
         .collect();
     all.extend(
         LOOSE
-            .write()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
@@ -4958,5 +5153,146 @@ mod tests {
         );
         stale.close();
         stale.reset();
+    }
+
+    #[test]
+    fn loose_budget_scales_across_ram_tiers() {
+        assert_eq!(loose_budget_for_ram(None), 256 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(8 * GIB)), 128 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(16 * GIB)), 128 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(16 * GIB + 1)), 256 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(32 * GIB)), 256 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(32 * GIB + 1)), 512 * MIB);
+        assert_eq!(loose_budget_for_ram(Some(64 * GIB)), 512 * MIB);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loose_evicts_lru_idle_windows_over_budget_and_skips_in_use_or_pending() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let cache = std::sync::RwLock::new(LooseCache::new());
+        let budget = 2 * WINDOW;
+        let base = 0x1000_0000_0000_u64;
+        let win = |i: u64| base + i * WINDOW;
+
+        let weak0 = Arc::downgrade(
+            &loose_in(&cache, win(0), win(0) + 64, false, false, budget).expect("win 0"),
+        );
+        let weak1 = Arc::downgrade(
+            &loose_in(&cache, win(1), win(1) + 64, false, false, budget).expect("win 1"),
+        );
+        assert_eq!(weak0.strong_count(), 1);
+        assert_eq!(weak1.strong_count(), 1);
+
+        // Touch window 0 so window 1 becomes the least-recently-used entry.
+        drop(loose_in(&cache, win(0), win(0) + 64, false, false, budget).expect("touch win 0"));
+
+        // Inserting window 2 exceeds the 2-window budget and immediately drops
+        // idle LRU window 1 through `retire`.
+        let weak2 = Arc::downgrade(
+            &loose_in(&cache, win(2), win(2) + 64, false, false, budget).expect("win 2"),
+        );
+        assert_eq!(weak1.strong_count(), 0, "idle LRU window 1 must be evicted");
+        assert_eq!(weak0.strong_count(), 1, "MRU window 0 must stay cached");
+        assert_eq!(weak2.strong_count(), 1, "new window 2 must stay cached");
+        {
+            let guard = cache.read().unwrap();
+            assert_eq!(guard.total_bytes, budget);
+            assert_eq!(guard.entries.len(), 2);
+        }
+
+        // Inserting window 3 evicts idle LRU window 0.
+        let weak3 = Arc::downgrade(
+            &loose_in(&cache, win(3), win(3) + 64, false, false, budget).expect("win 3"),
+        );
+        {
+            let guard = cache.read().unwrap();
+            assert!(!guard.entries.contains_key(&(win(0), WINDOW)));
+            assert_eq!(guard.total_bytes, budget);
+        }
+        assert_eq!(weak0.strong_count(), 0, "idle LRU window 0 must be evicted");
+
+        // Pin window 2 via an external Arc (strong_count > 1) and window 3 via
+        // a pending GPU UAV copy-back range; neither may be evicted.
+        let held2 = loose_in(&cache, win(2), win(2) + 64, false, false, budget).expect("hold win 2");
+        {
+            let s3 = loose_in(&cache, win(3), win(3) + 64, false, false, budget)
+                .expect("mark win 3 pending");
+            s3.pending
+                .lock()
+                .unwrap()
+                .push((win(3) as usize, win(3) as usize + 64));
+        }
+        let weak4 = Arc::downgrade(
+            &loose_in(&cache, win(4), win(4) + 64, false, false, budget).expect("win 4"),
+        );
+        assert_eq!(
+            weak2.strong_count(),
+            2,
+            "in-use window 2 must not be evicted"
+        );
+        assert_eq!(
+            weak3.strong_count(),
+            1,
+            "window 3 with pending copy-back must not be evicted"
+        );
+        assert_eq!(weak4.strong_count(), 1);
+        {
+            let guard = cache.read().unwrap();
+            assert_eq!(guard.entries.len(), 3);
+            assert_eq!(guard.total_bytes, 3 * WINDOW);
+        }
+
+        // Once window 2 is released and window 3's pending copy-back clears,
+        // the next insert drains both stale windows back down to budget.
+        drop(held2);
+        weak3
+            .upgrade()
+            .expect("win 3 still live")
+            .pending
+            .lock()
+            .unwrap()
+            .clear();
+        let weak5 = Arc::downgrade(
+            &loose_in(&cache, win(5), win(5) + 64, false, false, budget).expect("win 5"),
+        );
+        assert_eq!(weak2.strong_count(), 0);
+        assert_eq!(weak3.strong_count(), 0);
+        assert_eq!(weak4.strong_count(), 1);
+        assert_eq!(weak5.strong_count(), 1);
+        {
+            let guard = cache.read().unwrap();
+            assert_eq!(guard.entries.len(), 2);
+            assert_eq!(guard.total_bytes, budget);
+        }
+
+        // Re-accessing previously evicted window 1 cleanly recreates its shadow.
+        let recreated = loose_in(&cache, win(1) + 128, win(1) + 256, false, false, budget)
+            .expect("recreate win 1");
+        assert_eq!(recreated.start, win(1));
+        assert_eq!(recreated.len, WINDOW);
+        assert_ne!(recreated.gpu(win(1) + 128), 0);
+        assert_eq!(weak4.strong_count(), 0);
+        assert_eq!(weak5.strong_count(), 1);
+        drop(recreated);
+        // Evicted window while an active list recorded after its birth stays
+        // retired until that list resets.
+        let list = host.new_list().expect("host list");
+        list.mark_work();
+        drop(loose_in(&cache, win(6), win(6) + 64, false, false, budget).expect("win 6"));
+        assert_eq!(weak5.strong_count(), 1, "evicted window waits for active epoch");
+        list.close();
+        list.reset();
+        assert_eq!(weak5.strong_count(), 0);
+        {
+            let guard = cache.read().unwrap();
+            assert_eq!(guard.entries.len(), 2);
+            assert_eq!(guard.total_bytes, budget);
+            assert!(guard.entries.contains_key(&(win(1), WINDOW)));
+            assert!(guard.entries.contains_key(&(win(6), WINDOW)));
+        }
     }
 }

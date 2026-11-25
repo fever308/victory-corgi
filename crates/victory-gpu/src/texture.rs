@@ -16,12 +16,60 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+/// Monotonic tick stamped on every staging cache hit or insert for LRU eviction.
+static USE_TICK: AtomicU64 = AtomicU64::new(1);
+
+fn next_use_tick() -> u64 {
+    USE_TICK.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Host physical RAM reported by Windows, or `None` if the query fails.
+fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: `MEMORYSTATUSEX` is plain data and `dwLength` is initialized
+    // before calling `GlobalMemoryStatusEx`.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: valid out pointer with `dwLength` matching `MEMORYSTATUSEX`.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0 && status.ullTotalPhys != 0).then_some(status.ullTotalPhys)
+}
+
+/// Upload-heap byte budget for [`STAGING`], scaled to host physical RAM.
+fn staging_budget_for_ram(total_ram_bytes: Option<u64>) -> u64 {
+    match total_ram_bytes {
+        None => 512 * MIB,
+        Some(ram) if ram <= 16 * GIB => 256 * MIB,
+        Some(ram) if ram <= 32 * GIB => 512 * MIB,
+        Some(_) => GIB,
+    }
+}
+
+/// Cached staging upload-heap byte budget for this host.
+fn staging_budget() -> u64 {
+    static BUDGET: OnceLock<u64> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let ram = total_physical_ram();
+        let budget = staging_budget_for_ram(ram);
+        tracing::info!(
+            total_ram_mib = ram.map(|b| b / MIB),
+            budget_mib = budget / MIB,
+            "texture staging cache budget"
+        );
+        budget
+    })
+}
 
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -34,9 +82,6 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
-    /// Its bytes.
-    #[cfg(feature = "diagnostics")]
-    size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -58,6 +103,8 @@ pub(crate) struct Staging {
     used: std::sync::atomic::AtomicU64,
     /// Monotonic resource creation sequence for epoch-based retirement.
     born_seq: u64,
+    /// Monotonic [`USE_TICK`] stamped on every staging cache hit or insert.
+    last_used: AtomicU64,
     /// Levels on demand (`crate::tiles`): the texture's host copy was made
     /// without memory of its own when the staging buffer was made.
     on_demand: bool,
@@ -99,7 +146,70 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+/// Bounded LRU cache of per-texture upload staging buffers.
+///
+/// Evicted entries with `Arc::strong_count == 1` are safe to drop directly
+/// without going through [`crate::host::retire`]:
+/// - `Staging.buffer` is only used by [`upload`], which immediately moves its
+///   `Arc<Staging>` into `list.deferred.copies` via
+///   `list.defer_texture(staging)` until `list.reset()` or `list.drop()`.
+/// - `Host::execute` holds `&HostList` until the GPU fence completes, so any
+///   staging buffer referenced by an open or in-flight command list has
+///   `Arc::strong_count >= 2` and is skipped by eviction.
+/// - No descriptor heap ever references `Staging.buffer`.
+#[derive(Default)]
+struct StagingCache {
+    entries: HashMap<usize, Arc<Staging>>,
+    total_bytes: u64,
+}
+
+impl StagingCache {
+    fn insert(&mut self, key: usize, staging: Arc<Staging>) {
+        self.total_bytes = self.total_bytes.saturating_add(staging.bytes);
+        if let Some(previous) = self.entries.insert(key, staging) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
+        }
+    }
+
+    fn remove(&mut self, key: usize) -> Option<Arc<Staging>> {
+        let removed = self.entries.remove(&key)?;
+        self.total_bytes = self.total_bytes.saturating_sub(removed.bytes);
+        Some(removed)
+    }
+
+    /// Evicts least-recently-used idle entries (`Arc::strong_count == 1`)
+    /// other than `keep_key` until `self.total_bytes <= budget` or no idle
+    /// candidates remain. Callers must drop the returned `Vec` after releasing
+    /// the [`STAGING`] lock.
+    fn evict_to_budget(&mut self, budget: u64, keep_key: usize) -> Vec<Arc<Staging>> {
+        if self.total_bytes <= budget {
+            return Vec::new();
+        }
+        let mut candidates: Vec<(u64, usize)> = self
+            .entries
+            .iter()
+            .filter_map(|(&key, staging)| {
+                if key == keep_key || Arc::strong_count(staging) != 1 {
+                    return None;
+                }
+                Some((staging.last_used.load(Ordering::Relaxed), key))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(tick, _)| tick);
+        let mut evicted = Vec::new();
+        for (_, key) in candidates {
+            if self.total_bytes <= budget {
+                break;
+            }
+            if let Some(staging) = self.remove(key) {
+                evicted.push(staging);
+            }
+        }
+        evicted
+    }
+}
+
+static STAGING: Mutex<Option<StagingCache>> = Mutex::new(None);
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -468,8 +578,10 @@ impl Drop for Staging {
 /// The bytes of title memory the staged texture at `memory` is read from
 /// (for the texture debugger's verifier).
 pub(crate) fn memory_size(memory: usize) -> Option<usize> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()?
+    let cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .as_ref()?
+        .entries
         .values()
         .find(|s| s.memory as usize == memory)
         .map(|s| s.layout.size as usize)
@@ -484,7 +596,7 @@ pub(crate) fn memory() -> [u64; 3] {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map_or(0, |map| map.len() as u64);
+        .map_or(0, |cache| cache.entries.len() as u64);
     [STAGED[0].load(Relaxed), STAGED[1].load(Relaxed), kept]
 }
 
@@ -508,29 +620,41 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(map) = map.as_mut() else {
-        return;
-    };
-    if map.is_empty() {
-        return;
-    }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-    // A list that recorded an upload or a check holds the staging until it
-    // is reset: one only the table holds is named by no list, recorded or
-    // running.
-    let (mut went, mut bytes) = (0u64, 0u64);
-    map.retain(|_, s| {
-        let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
-        if !keep {
-            LET_GO[0].fetch_add(1, Relaxed);
-            LET_GO[1].fetch_add(s.bytes, Relaxed);
-            went += 1;
-            bytes += s.bytes;
+    let (dropped, went, bytes) = {
+        let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cache) = cache.as_mut() else {
+            return;
+        };
+        if cache.entries.is_empty() {
+            return;
         }
-        keep
-    });
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+        // A list that recorded an upload or a check holds the staging until it
+        // is reset: one only the table holds is named by no list, recorded or
+        // running.
+        let idle: Vec<usize> = cache
+            .entries
+            .iter()
+            .filter(|(_, s)| {
+                Arc::strong_count(s) == 1
+                    && crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        let mut dropped = Vec::with_capacity(idle.len());
+        let (mut went, mut bytes) = (0u64, 0u64);
+        for key in idle {
+            if let Some(s) = cache.remove(key) {
+                LET_GO[0].fetch_add(1, Relaxed);
+                LET_GO[1].fetch_add(s.bytes, Relaxed);
+                went += 1;
+                bytes += s.bytes;
+                dropped.push(s);
+            }
+        }
+        (dropped, went, bytes)
+    };
+    drop(dropped);
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -645,8 +769,8 @@ pub(crate) fn unfilled(resource: usize) {
 pub(crate) fn forget(resource: usize) {
     unfilled(resource);
     let staging = {
-        let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_mut().and_then(|map| map.remove(&resource))
+        let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        cache.as_mut().and_then(|cache| cache.remove(resource))
     };
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
@@ -1016,6 +1140,11 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// Marks this staging entry as most recently used.
+    fn touch(&self) {
+        self.last_used.store(next_use_tick(), Ordering::Relaxed);
+    }
+
     /// Whether this staging buffer needs to be copied into its host texture
     /// now (first upload or detiled since the last upload), marking it
     /// uploaded. Called from `HostList::prelude` after `refresh` has run.
@@ -1321,16 +1450,17 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
-    }
+    let removed = {
+        let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        cache.as_mut().and_then(|cache| cache.remove(resource as usize))
+    };
+    drop(removed);
 }
 
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
+    let cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let (at, len) = cache.as_ref()?.entries.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
 }
 
@@ -1374,22 +1504,24 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let staging = map.as_ref()?.get(&(resource as usize))?;
+    let cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = cache.as_ref()?.entries.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
+    let cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .as_ref()
+        .is_some_and(|cache| cache.entries.contains_key(&(resource as usize)))
 }
 
 /// The bytes of a title texture's memory, and whether all of it is mapped,
 /// if the texture has been staged for upload.
 pub(crate) fn staged(resource: This) -> Option<(u64, bool)> {
     let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        map.as_ref()?.get(&(resource as usize))?.clone()
+        let cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        cache.as_ref()?.entries.get(&(resource as usize))?.clone()
     };
     let size = s.layout.size as usize;
     Some((size as u64, committed(s.memory, size)))
@@ -1547,16 +1679,13 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
-/// The staging state of a title texture, made on first use.
-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
-    // Asked before the table is locked: the sweep lets go of a staging
-    // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize)) {
-        return Some(s.clone());
-    }
+/// Allocates a fresh staging buffer for a title texture without inserting it
+/// into [`STAGING`].
+fn create_staging(
+    resource: This,
+    texture: &ID3D12Resource,
+    on_demand: bool,
+) -> Option<Arc<Staging>> {
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
     else {
@@ -1606,8 +1735,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
-        size: total,
         data,
         footprints,
         rows,
@@ -1620,12 +1747,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         born_seq: crate::host::birth_seq(),
+        last_used: AtomicU64::new(next_use_tick()),
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
     });
-    map.insert(resource as usize, s.clone());
     crate::texdebug::created(memory as usize, total, || {
         format!(
             "{}x{}x{} f{} mips {} dim {}",
@@ -1633,6 +1760,46 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         )
     });
     Some(s)
+}
+
+/// The staging state of a title texture, made on first use (or after LRU
+/// eviction).
+fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    // Asked before the table is locked: the sweep lets go of a staging
+    // buffer with its texture's host side locked, in that order.
+    let on_demand = crate::resource::host_tiled(resource).is_some();
+    let key = resource as usize;
+    let (s, evicted) = {
+        let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.get_or_insert_with(StagingCache::default);
+        if let Some(s) = cache.entries.get(&key) {
+            s.touch();
+            return Some(s.clone());
+        }
+        let s = create_staging(resource, texture, on_demand)?;
+        cache.insert(key, s.clone());
+        let evicted = cache.evict_to_budget(staging_budget(), key);
+        (s, evicted)
+    };
+    // Drop evicted staging buffers after releasing `STAGING` so freeing D3D12
+    // upload resources does not stall concurrent cache lookups.
+    drop(evicted);
+    Some(s)
+}
+
+/// Live entry count, total bytes, and in-use (`strong_count > 1`) entry count
+/// in [`STAGING`] for periodic memory diagnostics.
+pub(crate) fn cache_stats() -> (usize, u64, usize) {
+    let cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(cache) = cache.as_ref() else {
+        return (0, 0, 0);
+    };
+    let pinned = cache
+        .entries
+        .values()
+        .filter(|s| Arc::strong_count(s) > 1)
+        .count();
+    (cache.entries.len(), cache.total_bytes, pinned)
 }
 
 #[cfg(test)]
@@ -1867,5 +2034,163 @@ mod tests {
         stale.reset();
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
         assert_eq!(release(tex), 0);
+    }
+
+    #[test]
+    fn staging_budget_scales_across_ram_tiers() {
+        assert_eq!(staging_budget_for_ram(None), 512 * MIB);
+        assert_eq!(staging_budget_for_ram(Some(8 * GIB)), 256 * MIB);
+        assert_eq!(staging_budget_for_ram(Some(16 * GIB)), 256 * MIB);
+        assert_eq!(staging_budget_for_ram(Some(16 * GIB + 1)), 512 * MIB);
+        assert_eq!(staging_budget_for_ram(Some(32 * GIB)), 512 * MIB);
+        assert_eq!(staging_budget_for_ram(Some(32 * GIB + 1)), GIB);
+        assert_eq!(staging_budget_for_ram(Some(64 * GIB)), GIB);
+    }
+
+    #[test]
+    fn staging_evicts_lru_idle_entries_when_over_budget_and_skips_in_use_entries() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+
+        let (t1, h1) = test_texture();
+        let (t2, h2) = test_texture();
+        let (t3, h3) = test_texture();
+        let (t4, h4) = test_texture();
+
+        let (mem1, desc1) = crate::resource::texture_memory(t1).expect("texture memory");
+        let size1 = crate::resource::texture_layout(&desc1)
+            .expect("texture layout")
+            .size as usize;
+        // SAFETY: committed title memory for `t1` holds at least `size1` writable bytes.
+        unsafe { std::slice::from_raw_parts_mut(mem1.cast_mut(), size1).fill(0x5a) };
+
+        let read_rgba_pixels = |s: &Staging| -> Vec<u8> {
+            let fp = s.footprints[0];
+            let pitch = fp.Footprint.RowPitch as usize;
+            let row_bytes = fp.Footprint.Width as usize * 4;
+            let rows = s.rows[0] as usize;
+            let mut out = Vec::with_capacity(row_bytes * rows);
+            // SAFETY: `s.data` is a mapped upload buffer covering footprint 0.
+            let mapped =
+                unsafe { std::slice::from_raw_parts(s.data.add(fp.Offset as usize), pitch * rows) };
+            for row in 0..rows {
+                out.extend_from_slice(&mapped[row * pitch..row * pitch + row_bytes]);
+            }
+            out
+        };
+
+        let s1 = create_staging(t1, h1, false).expect("staging 1");
+        s1.refresh();
+        assert_eq!(read_rgba_pixels(&s1), vec![0x5a; 64]);
+
+        let s2 = create_staging(t2, h2, false).expect("staging 2");
+        let s3 = create_staging(t3, h3, false).expect("staging 3");
+        let entry_bytes = s1.bytes;
+        assert!(entry_bytes > 0);
+        assert_eq!(s2.bytes, entry_bytes);
+        assert_eq!(s3.bytes, entry_bytes);
+
+        let mut cache = StagingCache::default();
+        cache.insert(t1 as usize, s1.clone());
+        cache.insert(t2 as usize, s2.clone());
+        cache.insert(t3 as usize, s3.clone());
+        assert_eq!(cache.total_bytes, 3 * entry_bytes);
+
+        // Touch `t1` so LRU order is `t2` (oldest) < `t3` < `t1` (newest).
+        s1.touch();
+
+        // Hold `t2` in an open `HostList` so its strong count is 2 (in-use).
+        let list = host.new_list().expect("host list");
+        list.defer_texture(s2.clone());
+
+        let (w1, w2, w3) = (
+            Arc::downgrade(&s1),
+            Arc::downgrade(&s2),
+            Arc::downgrade(&s3),
+        );
+        drop((s1, s2, s3));
+        assert_eq!(w1.strong_count(), 1);
+        assert_eq!(w2.strong_count(), 2);
+        assert_eq!(w3.strong_count(), 1);
+
+        // Insert `t4`, pushing `total_bytes` to 4 * `entry_bytes`.
+        let s4 = create_staging(t4, h4, false).expect("staging 4");
+        assert_eq!(s4.bytes, entry_bytes);
+        cache.insert(t4 as usize, s4);
+        assert_eq!(cache.total_bytes, 4 * entry_bytes);
+
+        // Budget of 3 entries must skip in-use `t2` and evict oldest idle `t3`,
+        // leaving newer `t1` and kept `t4`.
+        let evicted = cache.evict_to_budget(3 * entry_bytes, t4 as usize);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(cache.total_bytes, 3 * entry_bytes);
+        assert!(!cache.entries.contains_key(&(t3 as usize)));
+        assert!(cache.entries.contains_key(&(t2 as usize)));
+        assert!(cache.entries.contains_key(&(t1 as usize)));
+        assert!(cache.entries.contains_key(&(t4 as usize)));
+        drop(evicted);
+        assert_eq!(
+            w3.strong_count(),
+            0,
+            "evicted idle staging must drop immediately"
+        );
+        assert_eq!(w2.strong_count(), 2);
+        assert_eq!(w1.strong_count(), 1);
+
+        // Tightening to 2 entries evicts `t1` while still protecting in-use `t2`.
+        let evicted = cache.evict_to_budget(2 * entry_bytes, t4 as usize);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(cache.total_bytes, 2 * entry_bytes);
+        assert!(!cache.entries.contains_key(&(t1 as usize)));
+        assert!(cache.entries.contains_key(&(t2 as usize)));
+        assert!(cache.entries.contains_key(&(t4 as usize)));
+        drop(evicted);
+        assert_eq!(
+            w1.strong_count(),
+            0,
+            "evicted idle staging must drop immediately"
+        );
+
+        // Tightening to 1 entry while `t2` is still in-use evicts nothing:
+        // neither in-use `t2` nor `keep_key` `t4` may be evicted.
+        let evicted = cache.evict_to_budget(entry_bytes, t4 as usize);
+        assert!(evicted.is_empty());
+        assert_eq!(cache.total_bytes, 2 * entry_bytes);
+
+        // Resetting `list` drops its reference to `t2`; now `t2` becomes idle
+        // and is evicted on the next budget pass.
+        list.close();
+        list.reset();
+        assert_eq!(w2.strong_count(), 1);
+        let evicted = cache.evict_to_budget(entry_bytes, t4 as usize);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(cache.total_bytes, entry_bytes);
+        assert!(!cache.entries.contains_key(&(t2 as usize)));
+        assert!(cache.entries.contains_key(&(t4 as usize)));
+        drop(evicted);
+        assert_eq!(w2.strong_count(), 0);
+
+        // Re-creating and refreshing evicted `t1` fully re-detiles its title
+        // memory without zeroing or stale contents.
+        let recreated = create_staging(t1, h1, false).expect("recreated staging");
+        recreated.refresh();
+        assert_eq!(read_rgba_pixels(&recreated), vec![0x5a; 64]);
+        drop(recreated);
+
+        // Also run a live upload + GPU execution for `t1` after eviction.
+        let upload_list = host.new_list().expect("upload list");
+        upload(&upload_list, t1, h1);
+        upload_list.close();
+        host.execute(&[&upload_list]);
+        upload_list.reset();
+        forget(t1 as usize);
+
+        drop(cache);
+        for tex in [t1, t2, t3, t4] {
+            let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
+            assert_eq!(release(tex), 0);
+        }
     }
 }

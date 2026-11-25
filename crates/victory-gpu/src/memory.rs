@@ -287,7 +287,7 @@ pub(crate) fn ready(
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        heap.raw_shadow_uav_at(base + 1 + n as u32, shadow, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone
@@ -316,4 +316,18 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+/// Live count and total byte span of raw-memory directory copies for periodic
+/// memory diagnostics.
+pub(crate) fn cache_stats() -> (usize, u64) {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_ref() else {
+        return (0, 0);
+    };
+    let bytes = m
+        .copies
+        .iter()
+        .fold(0u64, |acc, s| acc.saturating_add(s.span().1));
+    (m.copies.len(), bytes)
 }
