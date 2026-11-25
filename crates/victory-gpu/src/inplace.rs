@@ -167,6 +167,28 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Opens a single in-place D3D12 heap over our own `MapViewOfFile` view
+/// `[view_addr, view_addr + len)` and places one buffer over it, updating
+/// [`STATS`] so [`title_memory_freeing`] and [`gone`] stay balanced.
+pub(crate) fn place_stretch(
+    device: &ID3D12Device,
+    view_addr: usize,
+    len: u64,
+) -> windows::core::Result<Placed> {
+    let heap = open(device, From::Part(view_addr, len as usize))?;
+    let buffer = place(device, &heap, 0, len)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    STATS[1].fetch_add(len, Ordering::Relaxed);
+    Ok(Placed {
+        buffer,
+        heap,
+        gpu,
+        bias: 0,
+    })
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -387,6 +409,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
             "a section handle's number came round again: our own view of the earlier section is forgotten"
         );
     }
+    crate::shadow::stretch_section_reused(section);
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -731,6 +754,82 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&VIEWS.read().unwrap_or_else(|e| e.into_inner()).views, at, len)
+}
+
+/// The longest stretch of views around `[at, end)` that follow one another
+/// in the address space and in one section alike, within `reach` bytes of
+/// `at` rounded down to it: its start, its end, the section and the offset
+/// in it. `None` if the range is not in one such stretch.
+pub(crate) fn stretch(at: usize, end: usize, reach: usize) -> Option<(usize, usize, usize, u64)> {
+    if at >= end || reach == 0 {
+        return None;
+    }
+    let views = views_read();
+    let (&first, &(n, section, offset)) = views.views.range(..=at).next_back()?;
+    if first.saturating_add(n) <= at {
+        return None;
+    }
+    let (low, high) = (at - at % reach, (at - at % reach).checked_add(reach)?);
+    if end > high {
+        return None;
+    }
+    // Up from the view holding `at`.
+    let (mut stop, mut next) = (first.saturating_add(n), offset + n as u64);
+    for (&a, &(n, s, o)) in views.views.range(first + 1..high) {
+        if a != stop || s != section || o != next {
+            break;
+        }
+        (stop, next) = (a.saturating_add(n), o + n as u64);
+    }
+    if stop < end {
+        return None;
+    }
+    // And down from it.
+    let (mut start, mut from) = (first, offset);
+    for (&a, &(n, s, o)) in views.views.range(low..first).rev() {
+        if a.saturating_add(n) != start || s != section || o + n as u64 != from {
+            break;
+        }
+        (start, from) = (a, o);
+    }
+    let start_in = start.max(low);
+    Some((
+        start_in,
+        stop.min(high),
+        section,
+        from + (start_in - start) as u64,
+    ))
+}
+
+/// Diagnostics: how `[at, at + len)` is made of views of physical pages:
+/// the views, their sections, the longest view, and the runs of views that
+/// follow one another in their section too (one run: the range is one
+/// stretch of a section).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn layout(at: usize, len: usize) -> (usize, usize, usize, usize) {
+    let views = views_read();
+    let end = at.saturating_add(len);
+    let first = views
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(a, (n, _, _))| a.saturating_add(*n) > at)
+        .map(|(a, _)| *a)
+        .unwrap_or(at);
+    let (mut count, mut longest, mut runs) = (0, 0, 0);
+    let mut sections = std::collections::BTreeSet::new();
+    let mut before: Option<(usize, usize, u64)> = None;
+    for (&a, &(n, section, offset)) in views.views.range(first..end) {
+        count += 1;
+        longest = longest.max(n);
+        sections.insert(section);
+        let follows = before.is_some_and(|(pa, ps, po)| pa == a && ps == section && po == offset);
+        if !follows {
+            runs += 1;
+        }
+        before = Some((a.saturating_add(n), section, offset + n as u64));
+    }
+    (count, sections.len(), longest, runs)
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and
@@ -1354,6 +1453,29 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
     lines
 }
 
+/// Every 5 seconds while `VICTORY_STRETCH` holds active stretches, log
+/// how many stretches and megabytes are mapped in place.
+fn say_stretches() {
+    let (count, bytes) = crate::shadow::stretch_stats();
+    if count == 0 {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 5_000
+        || LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    tracing::info!(
+        "title memory stretches in place (VICTORY_STRETCH): {count} active, {:.1} MB",
+        bytes as f64 / 1e6
+    );
+}
+
 /// Called once a second by the thread that submits, before a submission
 /// (`host::sweep`): with [`probe_level`], the probe at the first call, the
 /// census (on a thread of its own: it asks Windows about every copy) 30
@@ -1362,6 +1484,7 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
+    say_stretches();
     if probe_level() == 0 {
         return;
     }
@@ -1445,6 +1568,38 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// Views that follow one another in memory and in their section make a
+    /// stretch; a gap in either ends it.
+    #[test]
+    fn a_stretch_is_views_that_follow_in_memory_and_in_the_section() {
+        let base = 0x7a00_0000_0000usize;
+        let (section, other) = (0x51, 0x52);
+        for k in 0..3 {
+            title_memory_view(base + k * K64, K64, section, (k * K64) as u64);
+        }
+        // Next in memory, not in the section.
+        title_memory_view(base + 3 * K64, K64, section, (9 * K64) as u64);
+        // Next in the section's offsets, of another section.
+        title_memory_view(base + 4 * K64, K64, other, (10 * K64) as u64);
+        let reach = 1 << 30;
+        assert_eq!(
+            stretch(base + K64 + 8, base + K64 + 16, reach),
+            Some((base, base + 3 * K64, section, 0))
+        );
+        assert_eq!(
+            stretch(base + 3 * K64, base + 3 * K64 + 1, reach),
+            Some((base + 3 * K64, base + 4 * K64, section, (9 * K64) as u64))
+        );
+        assert_eq!(layout(base, 5 * K64), (5, 2, K64, 3));
+        assert_eq!(layout(base, 3 * K64), (3, 1, K64, 1));
+        // Across the gap: no stretch holds it.
+        assert_eq!(stretch(base + 2 * K64, base + 3 * K64 + 1, reach), None);
+        // Outside every view.
+        assert_eq!(stretch(base + 6 * K64, base + 6 * K64 + 1, reach), None);
+        views_gone(base, 5 * K64);
+        assert_eq!(stretch(base, base + 1, reach), None);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.

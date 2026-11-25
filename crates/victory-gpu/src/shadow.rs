@@ -216,6 +216,27 @@ impl RebarShadow {
     }
 }
 
+/// Our own `MapViewOfFile` view backing a `VICTORY_STRETCH` in-place heap.
+/// Unmapped on drop after `Shadow::buffer` and `Shadow::place` have released
+/// the placed resource and `ID3D12Heap`.
+struct StretchView {
+    addr: usize,
+    section: usize,
+}
+
+impl Drop for StretchView {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        // SAFETY: our own view mapped in `through_another_view`, no longer held
+        // by any D3D12 resource or heap (`buffer` and `place` drop earlier).
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.addr as *mut _,
+            });
+        }
+    }
+}
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -282,6 +303,9 @@ pub(crate) struct Shadow {
     /// bit per 64 KiB title page this copy touches; `None` when view marks are
     /// off, for in-place buffers, or if the bitmap is full.
     marks: Option<u32>,
+    /// Our own `MapViewOfFile` view backing a `VICTORY_STRETCH` in-place heap;
+    /// must remain the last field so `buffer` and `place` drop before unmapping.
+    stretch_view: Option<StretchView>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2936,6 +2960,7 @@ impl Shadow {
             }),
             last_used: AtomicU64::new(0),
             marks: mark_base,
+            stretch_view: None,
         }
     }
 
@@ -5005,6 +5030,15 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }));
     }
     {
+        let mut stretches = STRETCHES.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<u64> = stretches
+            .range(..end)
+            .filter(|(_, s)| s.start + s.len > at)
+            .map(|(k, _)| *k)
+            .collect();
+        gone.extend(keys.into_iter().filter_map(|k| stretches.remove(&k)));
+    }
+    {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
@@ -5021,6 +5055,28 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     n
 }
 
+/// Retires any active `VICTORY_STRETCH` window opened on `section` when the
+/// runtime reports that `section`'s handle number has been reused for a new
+/// section (`crate::inplace::title_memory_section`).
+pub(crate) fn stretch_section_reused(section: usize) {
+    let gone: Vec<Arc<Shadow>> = {
+        let mut stretches = STRETCHES.write().unwrap_or_else(|e| e.into_inner());
+        if stretches.is_empty() {
+            return;
+        }
+        let keys: Vec<u64> = stretches
+            .iter()
+            .filter(|(_, s)| s.stretch_view.as_ref().is_some_and(|v| v.section == section))
+            .map(|(&k, _)| k)
+            .collect();
+        keys.into_iter().filter_map(|k| stretches.remove(&k)).collect()
+    };
+    for shadow in gone {
+        let born = shadow.born_seq;
+        crate::host::retire_born(shadow, born);
+    }
+}
+
 /// For the in-place census (`crate::inplace`): the title buffers (start,
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
@@ -5028,6 +5084,8 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.entries.keys().map(|&(start, len)| (start, len, true)));
+    let stretches = STRETCHES.read().unwrap_or_else(|e| e.into_inner());
+    spans.extend(stretches.values().map(|s| (s.start, s.len, true)));
     spans
 }
 
@@ -5425,7 +5483,222 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 // (Readers and writers: nearly every ask finds its window made.)
 static LOOSE: std::sync::RwLock<LooseCache> = std::sync::RwLock::new(LooseCache::new());
 
+/// Contiguous section-view stretches mapped once in place (`VICTORY_STRETCH`),
+/// keyed by start address. Kept separate from [`LOOSE`] so multi-megabyte
+/// zero-copy streaming stretches do not evict or count against the host RAM
+/// copy budget.
+static STRETCHES: std::sync::RwLock<BTreeMap<u64, Arc<Shadow>>> =
+    std::sync::RwLock::new(BTreeMap::new());
+
+/// Maximum reach of one stretch window (aligned down/up to 1 GiB).
+const STRETCH_REACH: usize = 1 << 30;
+/// Stretches shorter than this are copied: each window is a host heap.
+const STRETCH_LEAST: usize = 4 << 20;
+
+/// Whether contiguous 64 KiB section stretches are opened in place
+/// (`VICTORY_STRETCH=0` turns it off).
+fn stretch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRETCH").is_none_or(|v| v != "0"))
+}
+
+/// Active stretch count and total bytes covered (`VICTORY_STRETCH`).
+pub(crate) fn stretch_stats() -> (usize, u64) {
+    let map = STRETCHES.read().unwrap_or_else(|e| e.into_inner());
+    let bytes = map.values().map(|s| s.len).sum();
+    (map.len(), bytes)
+}
+
+fn note_window_use(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    shadow.touch();
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn stretch_find_in(
+    stretches: &std::sync::RwLock<BTreeMap<u64, Arc<Shadow>>>,
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+) -> Option<Arc<Shadow>> {
+    let map = stretches.read().unwrap_or_else(|e| e.into_inner());
+    let s = map
+        .range(..=address)
+        .rev()
+        .take(8)
+        .map(|(_, s)| s)
+        .find(|s| s.start + s.len >= end)?;
+    note_window_use(s, address, end, unsized_ask);
+    Some(s.clone())
+}
+
+/// A window on title memory the title shows page by page: Grand Theft Auto
+/// VI maps its streaming heaps one 64 KiB view at a time, every view its
+/// own allocation, which the host cannot open as one heap, though the pages
+/// follow one another in their section (1,200 views for 75 MiB, one stretch
+/// of one section). The stretch is mapped once more, whole, at an address of
+/// ours, and the host heap is opened there: the same pages, so nothing is
+/// copied, and the title's own views stay as they are. When the title maps
+/// other pages there, the window goes as any other ([`in_place_let_go`]) and
+/// our view is unmapped on drop ([`StretchView`]).
+fn through_another_view(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    address: u64,
+    end: u64,
+) -> Option<Shadow> {
+    use windows_sys::Win32::System::Memory::{
+        FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+    };
+    let (start, stop, section, offset) =
+        crate::inplace::stretch(address as usize, end as usize, STRETCH_REACH)?;
+    let len = stop - start;
+    if len < STRETCH_LEAST {
+        return None;
+    }
+    // SAFETY: a section the runtime told us of, alive while it has views;
+    // the stretch is inside it.
+    let view = unsafe {
+        MapViewOfFile(
+            section as _,
+            FILE_MAP_WRITE,
+            (offset >> 32) as u32,
+            offset as u32,
+            len,
+        )
+    };
+    if view.Value.is_null() {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            start = format_args!("{start:#x}"),
+            len,
+            "a stretch of title memory could not be mapped again"
+        );
+        return None;
+    }
+    // Read-only guards would refuse the GPU's writes.
+    crate::watch::writing(start, len);
+    let mut shadow = match crate::inplace::place_stretch(device, view.Value as usize, len as u64) {
+        Ok(placed) => Shadow::placed(placed, start as u64, len as u64, true),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                start = format_args!("{start:#x}"),
+                len,
+                "a stretch of title memory refused by the host GPU"
+            );
+            // SAFETY: our view, used by nothing.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view.Value,
+                });
+            }
+            return None;
+        }
+    };
+    shadow.stretch_view = Some(StretchView {
+        addr: view.Value as usize,
+        section,
+    });
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 32 || count.is_power_of_two() {
+        tracing::info!(
+            count,
+            start = format_args!("{start:#x}"),
+            len,
+            "title memory in place through a view of ours"
+        );
+    }
+    Some(shadow)
+}
+
+fn stretch_create_in(
+    stretches: &std::sync::RwLock<BTreeMap<u64, Arc<Shadow>>>,
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    enabled: bool,
+) -> Option<Arc<Shadow>> {
+    if !enabled {
+        return None;
+    }
+    let h = host()?;
+    let (window, retired) = {
+        let mut map = stretches.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = map
+            .range(..=address)
+            .rev()
+            .take(8)
+            .map(|(_, s)| s)
+            .find(|s| s.start + s.len >= end)
+        {
+            note_window_use(s, address, end, unsized_ask);
+            return Some(s.clone());
+        }
+        let window = Arc::new(through_another_view(&h.device, address, end)?);
+        note_window_use(&window, address, end, unsized_ask);
+        let (w_start, w_end) = (window.start, window.start + window.len);
+        let overlap: Vec<u64> = map
+            .range(..w_end)
+            .filter(|(_, s)| s.start + s.len > w_start)
+            .map(|(&k, _)| k)
+            .collect();
+        let retired: Vec<Arc<Shadow>> = overlap.into_iter().filter_map(|k| map.remove(&k)).collect();
+        map.insert(w_start, window.clone());
+        (window, retired)
+    };
+    for old in retired {
+        let born = old.born_seq;
+        crate::host::retire_born(old, born);
+    }
+    Some(window)
+}
+
+fn loose_pick(
+    map: &BTreeMap<(u64, u64), Arc<Shadow>>,
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    any: bool,
+) -> (u64, u64) {
+    let (cell, _) = window_of(address, end, WINDOW);
+    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    if unsized_ask && tails() {
+        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+    } else if any && fine() && !unsized_ask {
+        // The windows that begin in the ask's cell at or below the ask (one
+        // that begins in a cell below and reaches this far is passed over:
+        // the ask then makes its own).
+        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+        holder(there, address, end).unwrap_or(named)
+    } else {
+        named
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    if stretch_enabled() {
+        if let Some(s) = stretch_find_in(&STRETCHES, address, end, unsized_ask) {
+            return Some(s);
+        }
+        // Check LOOSE read-only first so stretches that the host GPU refused
+        // and fell back to LOOSE are not retried on every ask.
+        {
+            let guard = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(shadow) = guard.entries.get(&loose_pick(&guard.entries, address, end, unsized_ask, any)) {
+                note_window_use(shadow, address, end, unsized_ask);
+                return Some(shadow.clone());
+            }
+        }
+        if let Some(s) = stretch_create_in(&STRETCHES, address, end, unsized_ask, true) {
+            return Some(s);
+        }
+    }
     loose_in(&LOOSE, address, end, unsized_ask, any, loose_budget())
 }
 
@@ -5437,47 +5710,20 @@ fn loose_in(
     any: bool,
     budget: u64,
 ) -> Option<Arc<Shadow>> {
-    let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    // Which window the ask is given, among those `map` holds.
-    let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
-        if unsized_ask && tails() {
-            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-        } else if any && fine() && !unsized_ask {
-            // The windows that begin in the ask's cell at or below the ask (one
-            // that begins in a cell below and reaches this far is passed over:
-            // the ask then makes its own).
-            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-            holder(there, address, end).unwrap_or(named)
-        } else {
-            named
-        }
-    };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.touch();
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
     // Made already, nearly always: found beside the other threads that ask.
     {
         let guard = cache.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = guard.entries.get(&pick(&guard.entries)) {
-            note(shadow);
+        if let Some(shadow) = guard.entries.get(&loose_pick(&guard.entries, address, end, unsized_ask, any)) {
+            note_window_use(shadow, address, end, unsized_ask);
             return Some(shadow.clone());
         }
     }
     let (shadow, evicted) = {
         let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
-        let (start, len) = pick(&guard.entries);
+        let (start, len) = loose_pick(&guard.entries, address, end, unsized_ask, any);
         let key = (start, len);
         if let Some(shadow) = guard.entries.get(&key) {
-            note(shadow);
+            note_window_use(shadow, address, end, unsized_ask);
             return Some(shadow.clone());
         }
         // In place, if asked for and the window's memory can be opened: the
@@ -5527,7 +5773,7 @@ fn loose_in(
             }
             shadow
         };
-        note(&shadow);
+        note_window_use(&shadow, address, end, unsized_ask);
         guard.entries.insert(key, shadow.clone());
         guard.total_bytes = guard.total_bytes.saturating_add(len);
         let evicted = guard.evict_over_budget(key, budget);
@@ -6132,6 +6378,13 @@ pub(crate) fn near(va: u64) -> String {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .entries
+            .values()
+            .map(|s| (s.gpu, s.start, s.len)),
+    );
+    all.extend(
+        STRETCHES
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
     );
@@ -7437,5 +7690,159 @@ mod tests {
         );
 
         unregister(resource, start);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stretch_opens_contiguous_section_views_and_unmaps_cleanly() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_COMMIT, MEM_FREE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
+            VirtualQuery,
+        };
+        if host().is_none() {
+            return;
+        }
+        const LEN: usize = STRETCH_LEAST;
+        const PAGES: usize = LEN / PAGE;
+        // SAFETY: committed pagefile section closed at the end of the test.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                LEN as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let section_id = section as usize;
+        let title_base = 0x79e0_0000_0000usize;
+
+        crate::inplace::title_memory_section(section_id, LEN as u64, true);
+        for k in 0..PAGES {
+            crate::inplace::title_memory_view(
+                title_base + k * PAGE,
+                PAGE,
+                section_id,
+                (k * PAGE) as u64,
+            );
+        }
+
+        // `VICTORY_STRETCH=0` opt-out skips stretch creation.
+        assert_eq!(
+            stretch_enabled(),
+            std::env::var_os("VICTORY_STRETCH").is_none_or(|v| v != "0")
+        );
+        assert!(
+            stretch_create_in(
+                &STRETCHES,
+                title_base as u64,
+                title_base as u64 + 64,
+                false,
+                false,
+            )
+            .is_none()
+        );
+        assert_eq!(stretch_stats(), (0, 0));
+
+        // Contiguous 64 KiB views open one in-place stretch heap over our own view.
+        let s = stretch_create_in(
+            &STRETCHES,
+            title_base as u64 + 128,
+            title_base as u64 + 256,
+            false,
+            true,
+        )
+        .expect("contiguous 4 MiB section views should open a stretch");
+        assert!(s.place.is_some());
+        assert_eq!(s.span(), (title_base as u64, LEN as u64));
+        let view_addr = s
+            .stretch_view
+            .as_ref()
+            .expect("stretch must track its mapped view")
+            .addr;
+        assert_eq!(stretch_stats(), (1, LEN as u64));
+
+        // Later asks anywhere in the stretch reuse the same `Arc<Shadow>`.
+        let hit = stretch_find_in(
+            &STRETCHES,
+            (title_base + 2 * (1 << 20)) as u64,
+            (title_base + 2 * (1 << 20) + 64) as u64,
+            false,
+        )
+        .expect("subsequent ask inside stretch must hit");
+        assert!(Arc::ptr_eq(&s, &hit));
+        drop(hit);
+
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: querying our live mapped view.
+        assert_ne!(
+            unsafe { VirtualQuery(view_addr as *const _, &mut info, size_of_val(&info)) },
+            0
+        );
+        assert_eq!(info.State, MEM_COMMIT);
+
+        let weak = Arc::downgrade(&s);
+        drop(s);
+
+        // Path A: remapping a single 64 KiB page inside the 4 MiB stretch lets go
+        // of the stretch and unmaps our view cleanly once dropped.
+        crate::watch::title_memory_remapped(title_base + PAGE, PAGE);
+        assert_eq!(stretch_stats(), (0, 0));
+        assert_eq!(weak.strong_count(), 0, "remapped stretch must drop and unmap");
+
+        let mut after: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: querying after `StretchView::drop` unmapped `view_addr`.
+        if unsafe { VirtualQuery(view_addr as *const _, &mut after, size_of_val(&after)) } != 0 {
+            assert!(
+                after.State == MEM_FREE || after.AllocationBase as usize != view_addr,
+                "stretch view must be unmapped after drop"
+            );
+        }
+
+        // Path B: re-register views and verify section-handle reuse retires the
+        // active stretch cleanly and unmaps its view too.
+        for k in 0..PAGES {
+            crate::inplace::title_memory_view(
+                title_base + k * PAGE,
+                PAGE,
+                section_id,
+                (k * PAGE) as u64,
+            );
+        }
+        let s2 = stretch_create_in(
+            &STRETCHES,
+            title_base as u64,
+            title_base as u64 + 64,
+            false,
+            true,
+        )
+        .expect("recreated stretch");
+        let view_addr2 = s2.stretch_view.as_ref().unwrap().addr;
+        let weak2 = Arc::downgrade(&s2);
+        drop(s2);
+        assert_eq!(stretch_stats(), (1, LEN as u64));
+
+        crate::inplace::title_memory_section(section_id, LEN as u64, true);
+        assert_eq!(stretch_stats(), (0, 0));
+        assert_eq!(
+            weak2.strong_count(),
+            0,
+            "section handle reuse must retire and drop stretch"
+        );
+        let mut after2: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(view_addr2 as *const _, &mut after2, size_of_val(&after2)) } != 0
+        {
+            assert!(
+                after2.State == MEM_FREE || after2.AllocationBase as usize != view_addr2,
+                "reused-section stretch view must be unmapped after drop"
+            );
+        }
+
+        crate::watch::title_memory_remapped(title_base, LEN);
+        // SAFETY: section created in this test.
+        unsafe { CloseHandle(section) };
     }
 }
