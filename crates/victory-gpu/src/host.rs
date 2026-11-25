@@ -1998,7 +1998,7 @@ impl Drop for Counted {
 /// A chunk of upload memory for lists' scratch data: the buffer, its
 /// mapping and its host GPU address.
 struct Chunk {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
 }
@@ -2105,7 +2105,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
-        _buffer: buffer,
+        buffer,
         data: data as usize,
         gpu,
     })
@@ -8332,9 +8332,28 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// `size` bytes of mapped upload memory, 512-byte aligned for a placed
+    /// footprint, alive until the list is reset: the buffer, the offset in
+    /// it and the CPU pointer.
+    pub(crate) fn upload_scratch(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(size, 512, |buffer, at, _, data| (buffer.clone(), at, data))
+    }
+
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    /// `len` bytes of upload memory at a multiple of `align` until the list
+    /// is reset, handed to `f` with the buffer, the offset in it, the host GPU
+    /// address and the CPU pointer.
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        align: u64,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -8343,12 +8362,15 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let made = f(&buffer, 0, gpu, data);
             self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            return Some(made);
         }
-        // The chunk in use while `len` fits in what is left of it, else the
-        // next one (a list's first chunk may be a small one).
-        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+        // The chunk in use while `len` at `align` fits in what is left of it,
+        // else the next one (a list's first chunk may be a small one).
+        while s.current < s.chunks.len()
+            && s.used.next_multiple_of(align) + len > s.chunks[s.current].1
+        {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -8361,10 +8383,11 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let chunk = &s.chunks[s.current].0;
+        let at = s.used.next_multiple_of(align);
+        let made = f(&chunk.buffer, at, chunk.gpu + at, (chunk.data + at as usize) as *mut u8);
+        s.used = at + len;
+        Some(made)
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -12143,6 +12166,50 @@ mod retire_tests {
                 .len(),
             1
         );
+
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn upload_scratch_aligns_placements_and_falls_back_when_oversized() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let errors_before = host.d3d12_errors();
+
+        // First 256-byte scratch leaves `used = 256`, which is not 512-byte aligned.
+        let (gpu0, _) = list.scratch(256).expect("initial scratch");
+        assert_eq!(gpu0 % 256, 0);
+
+        let (buf1, at1, ptr1) = list.upload_scratch(128).expect("aligned sub-allocated upload");
+        assert_eq!(at1, 512, "texture placement offset must round up to 512 bytes");
+        assert_eq!(at1 % 512, 0);
+        assert!(!ptr1.is_null());
+        assert_eq!(
+            list.deferred().uploads.len(),
+            0,
+            "sub-allocated staging must not allocate a dedicated upload buffer"
+        );
+        // SAFETY: `buf1` is a live resource and `ptr1` points to 256+ writable bytes.
+        unsafe {
+            assert_eq!(buf1.GetGPUVirtualAddress() + at1, gpu0 + at1);
+            ptr1.write_bytes(0x5a, 128);
+        }
+
+        // Oversized copy falls back to a dedicated upload buffer at offset 0.
+        let (buf_big, at_big, ptr_big) = list
+            .upload_scratch(SCRATCH_CHUNK + 512)
+            .expect("oversized fallback upload");
+        assert_eq!(at_big, 0);
+        assert!(!ptr_big.is_null());
+        assert_ne!(buf_big.as_raw(), buf1.as_raw());
+        assert_eq!(list.deferred().uploads.len(), 1);
+        // SAFETY: `ptr_big` is mapped for at least `SCRATCH_CHUNK + 512` bytes.
+        unsafe { ptr_big.write_bytes(0x3c, 16) };
 
         list.close();
         host.execute(&[&list]);
