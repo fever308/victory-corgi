@@ -1399,6 +1399,26 @@ fn root_limits_on() -> bool {
 thread_local! {
     /// A test's choice for [`root_limits_on`], for its thread only.
     pub(super) static TEST_ROOT_LIMITS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`nan_guard_mode`], for its thread only.
+    static TEST_NAN_GUARD: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+fn parse_nan_guard_mode(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("0") => 0,
+        Some("stores" | "1") => 2,
+        _ => 1,
+    }
+}
+
+fn nan_guard_mode() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = TEST_NAN_GUARD.get() {
+        return mode;
+    }
+    // 0: off; unset: colour exports only; `stores` or `1`: typed stores as well.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_nan_guard_mode(std::env::var("VICTORY_NAN_GUARD").ok().as_deref()))
 }
 
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
@@ -3996,6 +4016,44 @@ impl<'a> Lower<'a> {
         let hi = self.s.m.bin(c, Bin::LShr, m, k32);
         self.s.flags |= flags::INT64;
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+    }
+
+    /// `VICTORY_NAN_GUARD` (on unless `0`): a float a pixel program exports to a colour
+    /// target (and, with `stores` or `1`, a store writes to a typed image or buffer), with NaN
+    /// made 0 and an infinity ±65504, so one bad pixel does not stay in a history the title
+    /// blends into each frame.
+    /// `strict` (float targets): every NaN. Otherwise (typed stores, only with
+    /// `VICTORY_NAN_GUARD=stores` or `1`) only the NaNs the GPU makes (0x7FC00000, either sign)
+    /// and infinities. Typed stores go out as `.f32` whatever the view's format, so on that path
+    /// the integer words 0x7F800000, 0xFF800000, 0x7FC00000 and 0xFFC00000 change too
+    /// (0xFF800000 is an opaque blue as packed RGBA8): it stays opt-in until the view's
+    /// format is known here.
+    // shortcut: raw buffer stores are left as they are (no type to go by).
+    fn nan_guard(&mut self, f: V, strict: bool) -> V {
+        let mode = nan_guard_mode();
+        if mode == 0 || (!strict && mode < 2) {
+            return f;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let nan = if strict {
+            self.s.m.cmp(c, pred::IUGT, abs, inf_bits)
+        } else {
+            let quiet = self.s.m.i32(0x7FC0_0000);
+            self.s.m.cmp(c, pred::EQ, abs, quiet)
+        };
+        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
+        let sign_bit = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
+        let big = self.s.m.i32(65504f32.to_bits());
+        let big = self.s.m.bin(c, Bin::Or, sign, big);
+        let zero = self.s.m.i32(0);
+        let r = self.s.m.select(c, inf, big, bits);
+        let r = self.s.m.select(c, nan, zero, r);
+        self.as_float(r)
     }
 
     /// `0 × anything = 0`, as in D3D9.
@@ -10705,6 +10763,7 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
+            let vals: Vec<V> = vals.into_iter().map(|v| self.nan_guard(v, false)).collect();
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
@@ -11648,7 +11707,12 @@ impl<'a> Lower<'a> {
                 args.push(h);
                 args.extend([element, iu]);
                 for x in vals {
-                    args.push(if halves { x } else { self.as_float(x) });
+                    args.push(if halves {
+                        x
+                    } else {
+                        let f = self.as_float(x);
+                        self.nan_guard(f, false)
+                    });
                 }
                 // Element byte size comes from the view-stride table (16 bytes max).
                 (byte, bytes) = match self.s.view_index.get(&h).copied() {
@@ -12045,9 +12109,12 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            let pixel = self.s.pixel;
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            let (kind, comp) = (el.kind, el.comp);
+            let target = !mesh && pixel && kind == 16 && comp == 9;
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -12058,6 +12125,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            let x = if target { self.nan_guard(x, true) } else { x };
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
@@ -13361,5 +13429,171 @@ mod tests {
         assert!(limited.user_data.iter().any(|u| u.root == RootType::Other(USER_ROOT_LIMIT) && u.slot == 3));
         assert!(limited.funcs.iter().any(|f| f == "dx.op.binary.i32"));
         assert!(!plain.user_data.iter().any(|u| u.root == RootType::Other(USER_ROOT_LIMIT)));
+    }
+
+    #[test]
+    fn nan_guard_modes_parse_and_gate_colour_exports_and_typed_stores() {
+        use super::{TEST_NAN_GUARD, parse_nan_guard_mode};
+
+        assert_eq!(parse_nan_guard_mode(None), 1);
+        assert_eq!(parse_nan_guard_mode(Some("")), 1);
+        assert_eq!(parse_nan_guard_mode(Some("0")), 0);
+        assert_eq!(parse_nan_guard_mode(Some(" 0 ")), 0);
+        assert_eq!(parse_nan_guard_mode(Some("stores")), 2);
+        assert_eq!(parse_nan_guard_mode(Some(" stores ")), 2);
+        assert_eq!(parse_nan_guard_mode(Some("1")), 2);
+        assert_eq!(parse_nan_guard_mode(Some(" 1 ")), 2);
+
+        // Pixel shader exporting a float value loaded from user data to SV_Target0:
+        // mode 1 (default) guards the export, mode 0 leaves it unguarded.
+        let ps_words: [u32; 5] = [
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0xF800_000F, // exp mrt0 v0, v0, v0, v0 done
+            0x0000_0000,
+            0xBF81_0000, // s_endpgm
+            0xBF81_0000,
+        ];
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words[..4].iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let ps_p = ir::build(&ps_native.code, false, 4).unwrap();
+        let ps_st = structure::structure(&ps_p).unwrap();
+        let ps_res = resource::track(&ps_p, &ps_native.layout, ps_native.stage, Some(&ps_st)).unwrap();
+        let ps_io = io::raise(&ps_p, &ps_native).unwrap();
+        let target = super::super::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let lower_ps_mode = |mode: u8| {
+            TEST_NAN_GUARD.set(Some(mode));
+            let res = lower(&Parts {
+                native: &ps_native,
+                p: &ps_p,
+                st: &ps_st,
+                io: &ps_io,
+                res: &ps_res,
+                inputs: vec![],
+                outputs: vec![target.clone()],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+            })
+            .unwrap();
+            TEST_NAN_GUARD.set(None);
+            res
+        };
+        let ps_off = lower_ps_mode(0);
+        let ps_default = lower_ps_mode(1);
+        let ps_stores = lower_ps_mode(2);
+        assert_ne!(ps_off.dxil, ps_default.dxil, "default mode must guard colour exports");
+        assert_eq!(ps_default.dxil, ps_stores.dxil, "colour exports use strict guard in both mode 1 and mode 2");
+
+        // Compute shader performing a typed buffer store (`buffer_store_format_xyzw` -> `bufferStore.f32`):
+        // mode 1 (default) leaves typed stores unguarded, mode 2 (`stores` / `1`) guards them.
+        let cs_words: [u32; 9] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 2 << 18 | 8 << 6 | 2,
+            125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0x7E02_0201, // v_mov_b32 v1, s1
+            0x7E04_0202, // v_mov_b32 v2, s2
+            0x7E06_0203, // v_mov_b32 v3, s3
+            0x38 << 26 | 0x07 << 18, // buffer_store_format_xyzw v[0:3], off, s[8:11], 0
+            0x80 << 24 | 2 << 16,
+        ];
+        let mut cs_code: Vec<u8> = cs_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        cs_code.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
+        let cs_native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: cs_code,
+        };
+        let cs_p = ir::build(&cs_native.code, false, 8).unwrap();
+        let cs_st = structure::structure(&cs_p).unwrap();
+        let cs_res = resource::track(&cs_p, &cs_native.layout, cs_native.stage, Some(&cs_st)).unwrap();
+        let cs_io = io::raise(&cs_p, &cs_native).unwrap();
+        let lower_cs_mode = |mode: u8| {
+            TEST_NAN_GUARD.set(Some(mode));
+            let res = lower(&Parts {
+                native: &cs_native,
+                p: &cs_p,
+                st: &cs_st,
+                io: &cs_io,
+                res: &cs_res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                view_marks: false,
+            })
+            .unwrap();
+            TEST_NAN_GUARD.set(None);
+            res
+        };
+        let cs_off = lower_cs_mode(0);
+        let cs_default = lower_cs_mode(1);
+        let cs_stores = lower_cs_mode(2);
+        assert!(cs_default.funcs.iter().any(|f| f == "dx.op.bufferStore.f32"));
+        assert_eq!(cs_off.dxil, cs_default.dxil, "default mode must leave typed stores unguarded");
+        assert_ne!(cs_default.dxil, cs_stores.dxil, "stores/1 mode must guard typed stores");
     }
 }

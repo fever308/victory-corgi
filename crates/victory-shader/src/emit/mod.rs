@@ -461,13 +461,85 @@ pub fn emit_with(
     emit_with_hash(c, native, p, st, io, res, options, "")
 }
 
-fn wide_lowering_enabled(hash: &str, wide_env: Option<&std::ffi::OsStr>, group_sync: u8) -> bool {
-    let checked_group = matches!(
+thread_local! {
+    /// Wave-wide branches for the program being translated on this thread
+    /// ([`with_wave_wide`]), with `VICTORY_WAVE_WIDE` unset.
+    static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn parse_wave_wide_only(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+fn matches_wave_wide_only(hash: &str, only: &[String]) -> bool {
+    if only.is_empty() {
+        return false;
+    }
+    let hash = hash.to_lowercase();
+    only.iter().any(|o| hash.starts_with(o.as_str()))
+}
+
+fn wave_wide_only_list() -> &'static [String] {
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    ONLY.get_or_init(|| {
+        parse_wave_wide_only(std::env::var("VICTORY_WAVE_WIDE_ONLY").ok().as_deref())
+    })
+}
+
+/// Whether `VICTORY_WAVE_WIDE_ONLY=<hash prefix>,...` names the container whose hash (as a
+/// run's log names it: the first 16 hex digits of its BLAKE3) is `hash`. Those programs alone
+/// get the wave-wide form that `VICTORY_WAVE_WIDE=1` gives every program: a console wave64
+/// program in thread groups of one console wave, whose per-lane branches around its
+/// cross-lane code are taken by the whole wave ([`widen`]). The form is off by default
+/// outside verified hashes because it once left a dispatch on the card until the device was
+/// reset, so it is turned on only for programs checked one by one.
+pub fn wave_wide_only(hash: &str) -> bool {
+    matches_wave_wide_only(hash, wave_wide_only_list())
+}
+
+/// Runs `f` (a translation on this thread) with the wave-wide form on when `on`
+/// ([`wave_wide_only`]).
+pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let before = WIDE_HERE.replace(on);
+    let r = f();
+    WIDE_HERE.set(before);
+    r
+}
+
+fn wide_lowering_enabled(
+    hash: &str,
+    wide_env: Option<&std::ffi::OsStr>,
+    wide_only: &[String],
+    wide_here: bool,
+    group_sync: u8,
+) -> bool {
+    if wide_env.is_some_and(|v| v == "1") {
+        return true;
+    }
+    if wide_env.is_some_and(|v| v == "0") {
+        return false;
+    }
+    if !wide_only.is_empty() {
+        return wide_here || matches_wave_wide_only(hash, wide_only);
+    }
+    if wide_here {
+        return true;
+    }
+    // Verified water-shading compute hashes safe with wave-wide lowering.
+    // Note: 5dc3b25986622949 and 6f225b641c5b0708 are intentionally excluded
+    // (caused black rectangles on water).
+    matches!(
         hash,
-        "369cbe906ea72764" | "5dc3b25986622949" | "6f225b641c5b0708"
-    ) && group_sync != 0;
-    wide_env.is_some_and(|v| v == "1")
-        || (checked_group && wide_env.is_none_or(|v| v != "0"))
+        "6871d6e4b3ac9a10"
+            | "926c46bab3b86bd6"
+            | "369cbe906ea72764"
+            | "2cc4c197ee29e291"
+    ) && group_sync != 0
 }
 
 /// [`emit_with`] with the container hash available.
@@ -556,7 +628,13 @@ pub fn emit_with_hash(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide = std::env::var_os("VICTORY_WAVE_WIDE");
-        let wide_on = wide_lowering_enabled(hash, wide.as_deref(), group_sync());
+        let wide_on = wide_lowering_enabled(
+            hash,
+            wide.as_deref(),
+            wave_wide_only_list(),
+            WIDE_HERE.get(),
+            group_sync(),
+        );
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -2862,40 +2940,95 @@ mod barycentric_tests {
         use std::ffi::OsStr;
 
         let checked = [
+            "6871d6e4b3ac9a10",
+            "926c46bab3b86bd6",
             "369cbe906ea72764",
-            "5dc3b25986622949",
-            "6f225b641c5b0708",
+            "2cc4c197ee29e291",
         ];
         for hash in checked {
-            assert!(wide_lowering_enabled(hash, None, 2), "{hash} with group_sync=2");
-            assert!(wide_lowering_enabled(hash, None, 1), "{hash} with group_sync=1");
             assert!(
-                !wide_lowering_enabled(hash, None, 0),
+                wide_lowering_enabled(hash, None, &[], false, 2),
+                "{hash} with group_sync=2"
+            );
+            assert!(
+                wide_lowering_enabled(hash, None, &[], false, 1),
+                "{hash} with group_sync=1"
+            );
+            assert!(
+                !wide_lowering_enabled(hash, None, &[], false, 0),
                 "{hash} must stay off when group_sync=0"
             );
             assert!(
-                !wide_lowering_enabled(hash, Some(OsStr::new("0")), 2),
+                !wide_lowering_enabled(hash, Some(OsStr::new("0")), &[], false, 2),
                 "{hash} must opt out with VICTORY_WAVE_WIDE=0"
             );
             assert!(
-                wide_lowering_enabled(hash, Some(OsStr::new("1")), 0),
+                wide_lowering_enabled(hash, Some(OsStr::new("1")), &[], false, 0),
                 "{hash} with explicit VICTORY_WAVE_WIDE=1"
+            );
+        }
+
+        // Explicitly excluded hashes that caused black rectangles on water must be false.
+        for excluded in ["5dc3b25986622949", "6f225b641c5b0708"] {
+            assert!(
+                !wide_lowering_enabled(excluded, None, &[], false, 2),
+                "{excluded} must be excluded from default wide allowlist"
+            );
+            assert!(
+                !wide_lowering_enabled(excluded, None, &[], false, 1),
+                "{excluded} must stay off with group_sync=1"
             );
         }
 
         for other in ["", "f133e35efed2a48a", "a53a7977fe762268", "0123456789abcdef"] {
             assert!(
-                !wide_lowering_enabled(other, None, 2),
+                !wide_lowering_enabled(other, None, &[], false, 2),
                 "{other} must stay off by default"
             );
             assert!(
-                !wide_lowering_enabled(other, Some(OsStr::new("0")), 2),
+                !wide_lowering_enabled(other, Some(OsStr::new("0")), &[], false, 2),
                 "{other} with VICTORY_WAVE_WIDE=0"
             );
             assert!(
-                wide_lowering_enabled(other, Some(OsStr::new("1")), 2),
+                wide_lowering_enabled(other, Some(OsStr::new("1")), &[], false, 2),
                 "{other} with explicit VICTORY_WAVE_WIDE=1"
             );
         }
+    }
+
+    #[test]
+    fn wave_wide_only_overrides_default_allowlist_and_matches_prefixes() {
+        use std::ffi::OsStr;
+
+        let only = parse_wave_wide_only(Some(" 6871D6E4 , deadbeef , "));
+        assert_eq!(only, vec!["6871d6e4".to_owned(), "deadbeef".to_owned()]);
+        assert!(matches_wave_wide_only("6871d6e4b3ac9a10", &only));
+        assert!(matches_wave_wide_only("DEADBEEF00112233", &only));
+        assert!(!matches_wave_wide_only("926c46bab3b86bd6", &only));
+        assert!(!matches_wave_wide_only("", &only));
+
+        // When VICTORY_WAVE_WIDE_ONLY is set (non-empty), ONLY matching hashes (or WIDE_HERE /
+        // explicit VICTORY_WAVE_WIDE=1) enable wide lowering; other default hashes stay off.
+        assert!(wide_lowering_enabled("6871d6e4b3ac9a10", None, &only, false, 2));
+        assert!(wide_lowering_enabled("deadbeef12345678", None, &only, false, 2));
+        assert!(!wide_lowering_enabled("926c46bab3b86bd6", None, &only, false, 2));
+        assert!(!wide_lowering_enabled("369cbe906ea72764", None, &only, false, 2));
+        assert!(!wide_lowering_enabled("2cc4c197ee29e291", None, &only, false, 2));
+        assert!(wide_lowering_enabled("", None, &only, true, 2));
+        assert!(!wide_lowering_enabled("", None, &only, false, 2));
+        assert!(wide_lowering_enabled("926c46bab3b86bd6", Some(OsStr::new("1")), &only, false, 2));
+        assert!(!wide_lowering_enabled("6871d6e4b3ac9a10", Some(OsStr::new("0")), &only, true, 2));
+
+        // Thread-local `with_wave_wide` scopes and restores its previous state.
+        assert!(!WIDE_HERE.get());
+        with_wave_wide(true, || {
+            assert!(WIDE_HERE.get());
+            assert!(wide_lowering_enabled("0123456789abcdef", None, &[], WIDE_HERE.get(), 2));
+            with_wave_wide(false, || {
+                assert!(!WIDE_HERE.get());
+            });
+            assert!(WIDE_HERE.get());
+        });
+        assert!(!WIDE_HERE.get());
     }
 }

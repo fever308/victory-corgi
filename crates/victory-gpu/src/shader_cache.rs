@@ -86,19 +86,27 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        let hash = blake3::hash(c).to_hex();
-        victory_shader::emit::translate_for_hash(c, &hash[..16]).map_err(|e| e.to_string())
+        translate_one(c)
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+}
+
+/// One container translated; `VICTORY_WAVE_WIDE_ONLY` turns the wave-wide
+/// form on for the containers it names, by the hash the log names them by.
+fn translate_one(c: &[u8]) -> Result<HostShader, String> {
+    let hash = blake3::hash(c).to_hex();
+    let hash = &hash[..16];
+    let wide = victory_shader::emit::wave_wide_only(hash);
+    victory_shader::emit::with_wave_wide(wide, || {
+        victory_shader::emit::translate_for_hash(c, hash)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| {
-        let hash = blake3::hash(c).to_hex();
-        victory_shader::emit::translate_for_hash(c, &hash[..16]).map_err(|e| e.to_string())
-    };
+    let translate = translate_one;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
