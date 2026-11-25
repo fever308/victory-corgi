@@ -166,11 +166,13 @@ struct StagingCache {
 }
 
 impl StagingCache {
-    fn insert(&mut self, key: usize, staging: Arc<Staging>) {
+    fn insert(&mut self, key: usize, staging: Arc<Staging>) -> Option<Arc<Staging>> {
         self.total_bytes = self.total_bytes.saturating_add(staging.bytes);
-        if let Some(previous) = self.entries.insert(key, staging) {
-            self.total_bytes = self.total_bytes.saturating_sub(previous.bytes);
+        let previous = self.entries.insert(key, staging);
+        if let Some(prev) = &previous {
+            self.total_bytes = self.total_bytes.saturating_sub(prev.bytes);
         }
+        previous
     }
 
     fn remove(&mut self, key: usize) -> Option<Arc<Staging>> {
@@ -1813,7 +1815,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
     let key = resource as usize;
-    let (s, evicted) = {
+    let (s, replaced, evicted) = {
         let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         let cache = cache.get_or_insert_with(StagingCache::default);
         if let Some(s) = cache.entries.get(&key) {
@@ -1821,13 +1823,13 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             return Some(s.clone());
         }
         let s = create_staging(resource, texture, on_demand)?;
-        cache.insert(key, s.clone());
+        let replaced = cache.insert(key, s.clone());
         let evicted = cache.evict_to_budget(staging_budget(), key);
-        (s, evicted)
+        (s, replaced, evicted)
     };
-    // Drop evicted staging buffers after releasing `STAGING` so freeing D3D12
-    // upload resources does not stall concurrent cache lookups.
-    drop(evicted);
+    // Drop replaced/evicted staging buffers after releasing `STAGING` so freeing
+    // D3D12 upload resources does not stall concurrent cache lookups.
+    drop((replaced, evicted));
     Some(s)
 }
 
@@ -2116,9 +2118,14 @@ mod tests {
             let row_bytes = fp.Footprint.Width as usize * 4;
             let rows = s.rows[0] as usize;
             let mut out = Vec::with_capacity(row_bytes * rows);
-            // SAFETY: `s.data` is a mapped upload buffer covering footprint 0.
+            if rows == 0 {
+                return out;
+            }
+            let span = (rows - 1) * pitch + row_bytes;
+            assert!(fp.Offset as usize + span <= s.bytes as usize);
+            // SAFETY: `s.data` is a mapped upload buffer covering `fp.Offset..fp.Offset + span`.
             let mapped =
-                unsafe { std::slice::from_raw_parts(s.data.add(fp.Offset as usize), pitch * rows) };
+                unsafe { std::slice::from_raw_parts(s.data.add(fp.Offset as usize), span) };
             for row in 0..rows {
                 out.extend_from_slice(&mapped[row * pitch..row * pitch + row_bytes]);
             }
@@ -2137,9 +2144,14 @@ mod tests {
         assert_eq!(s3.bytes, entry_bytes);
 
         let mut cache = StagingCache::default();
-        cache.insert(t1 as usize, s1.clone());
-        cache.insert(t2 as usize, s2.clone());
-        cache.insert(t3 as usize, s3.clone());
+        assert!(cache.insert(t1 as usize, s1.clone()).is_none());
+        // Re-inserting the same key returns the replaced entry to the caller so it
+        // can be dropped after releasing the `STAGING` lock.
+        let s1_dup = s1.clone();
+        assert!(cache.insert(t1 as usize, s1_dup).is_some());
+        assert_eq!(cache.total_bytes, entry_bytes);
+        assert!(cache.insert(t2 as usize, s2.clone()).is_none());
+        assert!(cache.insert(t3 as usize, s3.clone()).is_none());
         assert_eq!(cache.total_bytes, 3 * entry_bytes);
 
         // Touch `t1` so LRU order is `t2` (oldest) < `t3` < `t1` (newest).
@@ -2162,7 +2174,7 @@ mod tests {
         // Insert `t4`, pushing `total_bytes` to 4 * `entry_bytes`.
         let s4 = create_staging(t4, h4, false).expect("staging 4");
         assert_eq!(s4.bytes, entry_bytes);
-        cache.insert(t4 as usize, s4);
+        assert!(cache.insert(t4 as usize, s4).is_none());
         assert_eq!(cache.total_bytes, 4 * entry_bytes);
 
         // Budget of 3 entries must skip in-use `t2` and evict oldest idle `t3`,

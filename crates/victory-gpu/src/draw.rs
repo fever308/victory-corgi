@@ -1547,6 +1547,17 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         list.mark_work();
+        // Refresh `list.work_seq` when `bind` returns (including early `false`
+        // exits) so resources created lazily during descriptor binding (`tables` ->
+        // `host.make_at`, `memory_ready`, `heap_buffers`, root views) cannot
+        // get `born_seq > list.work_seq`.
+        struct MarkWorkGuard<'a>(&'a HostList);
+        impl Drop for MarkWorkGuard<'_> {
+            fn drop(&mut self) {
+                self.0.mark_work();
+            }
+        }
+        let _mark_after = MarkWorkGuard(list);
         // Depth planes compute wrote in this list through their twins: given to the planes
         // first, so this draw or dispatch reads (or tests) what was written. The passes set
         // state of ours: the title's is set again, and what follows sets the pipeline, root

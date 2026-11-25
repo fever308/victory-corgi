@@ -2036,9 +2036,8 @@ impl HostHeap {
             }
         }
         if !retired.is_empty() {
-            let seq = crate::host::birth_seq();
             for old in retired {
-                crate::host::retire_born(old, seq);
+                crate::host::retire_executing(old);
             }
         }
     }
@@ -2109,7 +2108,7 @@ impl HostHeap {
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_born(old, crate::host::birth_seq());
+            crate::host::retire_executing(old);
         }
     }
 
@@ -2189,29 +2188,30 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
+        if let Some(host) = host() {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: 1,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    self.cpu(index),
+                )
+            };
+        }
         self.keep(index, Kept::Empty);
         self.set_mark(index, None);
-        let Some(host) = host() else { return };
-        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_UAV {
-                    NumElements: 1,
-                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                    ..Default::default()
-                },
-            },
-        };
-        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-        unsafe {
-            host.device.CreateUnorderedAccessView(
-                None::<&ID3D12Resource>,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.cpu(index),
-            )
-        };
     }
 
     /// The shader-visible handle of slot `index`.
@@ -2226,18 +2226,19 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        if let Some(host) = host() {
+            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: gpu,
+                SizeInBytes: constant_view_size(size),
+            };
+            // SAFETY: a slot of our heap; the memory is the caller's.
+            unsafe {
+                host.device
+                    .CreateConstantBufferView(Some(&desc), self.cpu(index))
+            };
+        }
         self.keep(index, Kept::Empty);
         self.set_mark(index, None);
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: constant_view_size(size),
-        };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {

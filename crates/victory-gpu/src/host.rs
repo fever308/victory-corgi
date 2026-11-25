@@ -189,7 +189,7 @@ static RESOURCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// resource. Active command lists whose last recorded command occurred before
 /// this sequence cannot reference the resource and do not block its release.
 pub(crate) fn birth_seq() -> u64 {
-    RESOURCE_SEQ.fetch_add(1, Ordering::AcqRel) + 1
+    RESOURCE_SEQ.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 /// Sentinel work sequence shared by active [`Host::execute`] submissions so
@@ -494,15 +494,15 @@ fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T, born_seq: u64) {
-    // Pair with `work_seq` updates in `HostList::mark_work` and `RESOURCE_SEQ`
-    // increments in `birth_seq`.
+    // Pair with `work_seq` `SeqCst` stores/RMWs in `HostList::mark_work` and
+    // `RESOURCE_SEQ` `SeqCst` increments in `birth_seq`.
     std::sync::atomic::fence(Ordering::SeqCst);
     let warn = {
         let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
         let slot = state.free_slots.pop().unwrap_or(state.retired.len());
         let mut blockers = 0usize;
         for entry in state.active_epochs.values_mut() {
-            if born_seq == 0 || entry.work_seq.load(Ordering::Acquire) >= born_seq {
+            if born_seq == 0 || entry.work_seq.load(Ordering::SeqCst) >= born_seq {
                 entry.waiting.push(slot);
                 blockers += 1;
             }
@@ -579,6 +579,14 @@ pub(crate) fn retire_born<T: 'static>(object: T, born_seq: u64) {
         return;
     }
     retire_in(&RETIRE_STATE, object, born_seq);
+}
+
+/// Drops `object` once every currently executing [`Host::execute`] submission
+/// (`work_seq == u64::MAX`) has finished: at once if none is executing.
+/// Avoids bumping global [`RESOURCE_SEQ`] when retiring overwritten or released
+/// descriptor-heap references that newly recorded lists cannot observe.
+pub(crate) fn retire_executing<T: 'static>(object: T) {
+    retire_born(object, u64::MAX);
 }
 
 /// Drops `object` once every epoch active now has finished: at once if none is.
@@ -6677,9 +6685,10 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let timed = false;
         let mut batched_lists: Vec<Option<ID3D12CommandList>> = Vec::new();
+        let mut pre_hash_ok = true;
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timed {
             if let Some(pre) = rebar_hash_plan.pre_list.take() {
-                let _ = self.submit_helper_list(&mut submitted, pre, "ReBAR pre-hash");
+                pre_hash_ok = self.submit_helper_list(&mut submitted, pre, "ReBAR pre-hash");
             }
             firsts
                 .iter()
@@ -6763,9 +6772,10 @@ impl Host {
             }
             let _ = (i, started);
         }
-        let mut post_compare_ok = true;
+        let mut post_compare_ok = pre_hash_ok;
         if timed && let Some(post) = rebar_hash_plan.post_list {
-            post_compare_ok = self.submit_helper_list(&mut submitted, post, "ReBAR post-compare");
+            post_compare_ok =
+                pre_hash_ok && self.submit_helper_list(&mut submitted, post, "ReBAR post-compare");
         }
         let mut marks_capture_ok = true;
         if timed && let Some(cl) = marks_list.take() {
@@ -7244,15 +7254,15 @@ impl HostList {
     /// advances `work_seq` lock-free when new resources have been created
     /// since the last command on this list.
     pub(crate) fn mark_work(&self) {
-        let seq = RESOURCE_SEQ.load(Ordering::Acquire);
+        let seq = RESOURCE_SEQ.load(Ordering::SeqCst);
         if self.epoch.load(Ordering::Acquire) != 0 {
-            if self.work_seq.load(Ordering::Relaxed) < seq {
-                self.work_seq.fetch_max(seq, Ordering::AcqRel);
+            if self.work_seq.load(Ordering::SeqCst) < seq {
+                self.work_seq.fetch_max(seq, Ordering::SeqCst);
             }
             return;
         }
         let guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.work_seq.fetch_max(seq, Ordering::AcqRel);
+        self.work_seq.fetch_max(seq, Ordering::SeqCst);
         self.ensure_epoch(&guard);
     }
 
@@ -7306,7 +7316,7 @@ impl HostList {
             let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
             if self.in_flight.load(Ordering::Acquire) == 0 {
                 if clear_work_seq {
-                    self.work_seq.store(0, Ordering::Relaxed);
+                    self.work_seq.store(0, Ordering::Release);
                 }
                 self.epoch.swap(0, Ordering::AcqRel)
             } else {
@@ -10158,7 +10168,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
+                    let read_range = D3D12_RANGE { Begin: 0, End: 0 };
+                    b.Map(0, Some(&read_range), Some(&mut data))
                 })
         };
         match made {
@@ -10806,6 +10817,9 @@ impl Host {
         });
         if !ok {
             for entry in &pending {
+                if !entry.spans.is_empty() {
+                    entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+                }
                 entry.shadow.clear_pending_rebar();
             }
         }
@@ -11007,7 +11021,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
+                    let read_range = D3D12_RANGE { Begin: 0, End: 0 };
+                    b.Map(0, Some(&read_range), Some(&mut data))
                 })
         };
         match made {
@@ -11053,8 +11068,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
-    #[cfg(feature = "diagnostics")]
-    copy_stats_frames: u64,
+    logged_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -11067,8 +11081,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
-            #[cfg(feature = "diagnostics")]
-            copy_stats_frames: 0,
+            logged_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -11084,10 +11097,7 @@ impl Meter {
         crate::frametime::tick();
         crate::cardmeter::collect();
         self.frames += 1;
-        #[cfg(feature = "diagnostics")]
-        {
-            self.copy_stats_frames += 1;
-        }
+        self.logged_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -11274,6 +11284,7 @@ impl Meter {
         });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let logged_frames = (std::mem::take(&mut self.logged_frames) as f64).max(1.0);
             tracing::info!(
                 "the title's barrier groups since the start: {} waited for every earlier shader write, {} left out (no shader that writes through unordered access since the last wait; left out only under VICTORY_BARRIER_GROUPS=skip)",
                 crate::list::GROUPS_WAITED.load(Ordering::Relaxed),
@@ -11408,7 +11419,7 @@ impl Meter {
                 rebar_loose_mb,
             );
             let [remap_n, remap_wait_us, remap_hold_us] =
-                [0, 1, 2].map(|i| crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                [0, 1, 2].map(|i| crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64 / logged_frames);
             if remap_n > 0.0 {
                 tracing::info!(
                     "changes of title memory's mapping per frame: {remap_n:.0}, {:.1} ms of them waiting for reads in place, \
@@ -11424,7 +11435,7 @@ impl Meter {
             }
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                crate::copystat::log(logged_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -12173,6 +12184,50 @@ mod retire_tests {
         let (counter, drops) = DropCounter::new();
         retire(counter);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retire_executing_pins_only_active_execute_epochs_without_bumping_resource_seq() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let open = host.new_list().expect("open list");
+        open.mark_work();
+
+        let seq_before = RESOURCE_SEQ.load(Ordering::SeqCst);
+        let (c_open, d_open) = DropCounter::new();
+        retire_executing(c_open);
+        assert_eq!(
+            RESOURCE_SEQ.load(Ordering::SeqCst),
+            seq_before,
+            "retire_executing must not bump global RESOURCE_SEQ"
+        );
+        assert_eq!(
+            d_open.load(Ordering::SeqCst),
+            1,
+            "newly opened list with finite work_seq must not pin retire_executing objects"
+        );
+
+        let scope = current_retire_scope();
+        let epoch = acquire_epoch_in(scope.as_deref().unwrap_or(&RETIRE_STATE), exec_work_seq());
+        let exec_guard = ExecEpochGuard { scope, epoch };
+        let (c_exec, d_exec) = DropCounter::new();
+        retire_executing(c_exec);
+        assert_eq!(RESOURCE_SEQ.load(Ordering::SeqCst), seq_before);
+        assert_eq!(
+            d_exec.load(Ordering::SeqCst),
+            0,
+            "active Host::execute epoch (work_seq == u64::MAX) must pin retire_executing objects"
+        );
+        drop(exec_guard);
+        assert_eq!(
+            d_exec.load(Ordering::SeqCst),
+            1,
+            "finishing Host::execute epoch must drop pinned object"
+        );
+
+        drop(open);
     }
 
     #[test]

@@ -2688,11 +2688,38 @@ mod tests {
     /// `GetWriteWatch` and its writes are reported.
     #[test]
     fn ask_once_skips_known_guarded_views_and_watches_private_memory() {
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             UnmapViewOfFile,
         };
+        static JOURNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct AskOnceGuard;
+        impl Drop for AskOnceGuard {
+            fn drop(&mut self) {
+                ask_once_end();
+            }
+        }
+        struct CleanupGuard {
+            priv_p: usize,
+            section: HANDLE,
+            view_p: usize,
+        }
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                title_memory_remapped(self.view_p, PAGE);
+                // SAFETY: clean up view, section, and private allocation owned by this test.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: self.view_p as *mut _,
+                    });
+                    CloseHandle(self.section);
+                    VirtualFree(self.priv_p as *mut _, 0, MEM_RELEASE);
+                }
+            }
+        }
+
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: fresh write-watched private allocation and pagefile view.
         let (priv_p, section, view_p) = unsafe {
             let priv_p = VirtualAlloc(
@@ -2715,6 +2742,11 @@ mod tests {
             assert_ne!(view_p, 0);
             (priv_p, section, view_p)
         };
+        let _cleanup = CleanupGuard {
+            priv_p,
+            section,
+            view_p,
+        };
         // Baseline: clear private watch bit and guard the view so `known_view` is true.
         assert!(writes(priv_p, priv_p + PAGE, false).is_some());
         assert!(guard(view_p, view_p + PAGE).is_some());
@@ -2724,6 +2756,7 @@ mod tests {
         // Write a byte to private memory, then call `ask_once` with both ranges.
         // SAFETY: committed private write-watched page.
         unsafe { ((priv_p + 16) as *mut u8).write_volatile(0x7a) };
+        let ask_guard = AskOnceGuard;
         ask_once(&[(priv_p, priv_p + PAGE), (view_p, view_p + PAGE)]);
         let (now, priv_written) = asked(priv_p, priv_p + PAGE).expect("private range asked ahead");
         assert!(
@@ -2734,19 +2767,11 @@ mod tests {
             asked(view_p, view_p + PAGE).is_none(),
             "known guarded view must be skipped by ask_once"
         );
-        ask_once_end();
+        drop(ask_guard);
 
         // `wrote_own` records both the page and its aliases in the journal.
         let (before, own_now) = wrote_own(view_p / PAGE, &[view_p / PAGE + 1]);
         assert!(own_now > before);
-
-        title_memory_remapped(view_p, PAGE);
-        // SAFETY: clean up view, section, and private allocation.
-        unsafe {
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view_p as *mut _ });
-            CloseHandle(section);
-            VirtualFree(priv_p as *mut _, 0, MEM_RELEASE);
-        }
     }
 }
 
