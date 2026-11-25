@@ -29,6 +29,7 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+pub mod frametime;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

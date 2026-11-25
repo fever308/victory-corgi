@@ -373,6 +373,7 @@ fn async_poke() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let spawned = std::thread::Builder::new().name("victory-lines".into()).spawn(|| {
+            crate::host::keep_on_fast_cores("victory-lines");
             ASYNC_WORKER.with(|w| w.set(true));
             loop {
                 {
@@ -864,6 +865,12 @@ fn system_timestamp() -> u64 {
 
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Frames presented so far (also in release builds).
+#[cfg(windows)]
+pub(crate) fn frame_count() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {

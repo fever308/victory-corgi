@@ -368,7 +368,8 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
-/// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
+/// (on by default, `VICTORY_CARD_ROOM_FOR_BUFFERS=0` turns it off; see
+/// below).
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
 /// its 95 within two seconds, right before the first world frame), and
@@ -3218,6 +3219,7 @@ impl Shadow {
                 if crate::host::read_into((start + sub_at) as *const u8, title) {
                     let as_read = merge_race_on().then(|| title.clone());
                     if merge_piece(gpu, old, title) {
+                        crate::host::shaders_write(start + sub_at, &title[..]);
                         crate::watch::writing(start + sub_at, sub_n);
                         merge_race(
                             as_read.as_deref(),
@@ -3405,6 +3407,7 @@ impl Shadow {
                                 *o = *t;
                             }
                             if changed {
+                                crate::host::shaders_write(start + at, title_buf);
                                 crate::watch::writing(start + at, n);
                                 crate::host::write_mapped(
                                     (start + at) as *mut u8,
@@ -3526,6 +3529,7 @@ impl Shadow {
                     continue;
                 };
                 let at = at + first;
+                crate::host::shaders_write(start + at, &title[..n.min(title.len())]);
                 crate::watch::writing(start + at, n);
                 #[cfg(feature = "diagnostics")]
                 back_note(start + at, &title[..n], self.start, self.len);
@@ -3624,6 +3628,7 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
+        crate::host::shaders_write(start + at, &title[..]);
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
         #[cfg(feature = "diagnostics")]
@@ -4435,6 +4440,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
+                crate::host::shaders_write(start + at, &title[..]);
                 crate::watch::writing(start + at, n);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
                 #[cfg(feature = "diagnostics")]
@@ -4518,6 +4524,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
+        crate::host::shaders_write(start + at, &title[..]);
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         #[cfg(feature = "diagnostics")]
