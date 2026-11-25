@@ -1389,9 +1389,10 @@ fn uncommitted_end(block: usize) -> usize {
 /// notes them written; true if any was guarded. The same physical pages at
 /// every other view of them are opened too: the write that faulted (or is
 /// ours, `crate::host::copy_mapped`) goes through one view, and every
-/// guard over the pages must copy them again.
-fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    let any = open_here(g, start, end);
+/// guard over the pages must copy them again. Reports blocks whose cached
+/// contents became dirty, including other views of the same pages.
+fn open(g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)) -> bool {
+    let any = open_here(g, start, end, &mut dirtied);
     if start >= end || g.aliased.is_empty() {
         return any;
     }
@@ -1399,7 +1400,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for block in aliased {
         g.aliased.remove(&block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
-            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
+            if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK), &mut dirtied) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -1410,7 +1411,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// [`open`] for one range, without the other views of its pages.
-fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
+fn open_here(g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
@@ -1422,7 +1423,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     }
     for &block in &blocks {
         g.protected.remove(&block);
-        g.clean.remove(&block);
+        if g.clean.remove(&block) {
+            dirtied(block * BLOCK);
+        }
         clean_bit(block, false);
     }
     // Runs of blocks next to each other in one call (fewer kernel
@@ -1482,7 +1485,7 @@ pub(crate) fn writing(at: usize, len: usize) {
     };
     if needs_open {
         let mut g = guards();
-        open(&mut g, at, end);
+        open(&mut g, at, end, |_| {});
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
@@ -1504,7 +1507,7 @@ pub fn kernel_writing(at: usize, len: usize) {
         g.prune_pins();
         let until = std::time::Instant::now() + PIN;
         g.pin(first, last, until);
-        open(&mut g, at, end);
+        open(&mut g, at, end, |_| {});
         if view_guard() {
             // The same pages at their other views: the write lands in them too,
             // so their copies must take them again, now and when it has landed.
@@ -1516,7 +1519,7 @@ pub fn kernel_writing(at: usize, len: usize) {
                         let alias_block = alias / BLOCK;
                         if alias_block != block {
                             g.pin(alias_block, alias_block + 1, until);
-                            open_here(&mut g, alias, alias.saturating_add(BLOCK));
+                            open_here(&mut g, alias, alias.saturating_add(BLOCK), |_| {});
                         }
                     }
                 },
@@ -1596,7 +1599,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
         if mode & 1 != 0 && guarded != 0 {
-            open(&mut g, at, end);
+            open(&mut g, at, end, |_| {});
         }
     }
     // A placed texture there changed with no descriptor written.
@@ -1618,7 +1621,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     }
     let mut g = guards();
     for &(at, n) in &ranges {
-        if open_here(&mut g, at, at.saturating_add(n)) {
+        if open_here(&mut g, at, at.saturating_add(n), |_| {}) {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1942,17 +1945,38 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
-        if open(&mut g, at, at + 1) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
-            return EXCEPTION_CONTINUE_EXECUTION;
+        // Held across both checks when `open` returns false: another thread may
+        // have opened the block since this one faulted, and a copy may have
+        // guarded it again since (then it is ours again, not read-only for
+        // some other reason). Collect dirtied blocks and drop `GUARDS` before
+        // calling `descriptor::host::remapped` so VEH faults cannot deadlock
+        // with `REMAPPED`.
+        let mut dirty_blocks = Vec::new();
+        let handled = {
+            let mut g = guards();
+            if open(&mut g, at, at + 1, |block| dirty_blocks.push(block)) {
+                Some(true)
+            } else if writable(at) {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        match handled {
+            Some(true) => {
+                for block in dirty_blocks {
+                    // Indexed textures aren't checked each time a shader samples them.
+                    if crate::descriptor::host::remapped(block, BLOCK) {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::GuardTextureDirty, 1);
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            Some(false) => return EXCEPTION_CONTINUE_EXECUTION,
+            None => {}
         }
         // Read-only, in a view we were told of, and not noted guarded: only we
         // make title views read-only, so it is ours to give back.
@@ -2554,6 +2578,56 @@ mod tests {
         unsafe { ((b + 12) as *mut u8).write_volatile(0x99) };
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
 
+        drop_views(section, &[a, b], BLOCK);
+    }
+
+    /// A VEH write fault on a guarded alias view opens the clean view of the
+    /// same physical page and calls `descriptor::host::remapped` after dropping
+    /// `GUARDS`, refreshing indexed textures without risking lock inversion.
+    #[test]
+    fn alias_write_fault_triggers_remapped_without_deadlock() {
+        let (section, a, b) = two_views(BLOCK);
+        // Guard `a`: `a` is protected+clean, `b` is protected as an alias.
+        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
+        assert_eq!(guard(a, a + BLOCK), Some(Vec::new()));
+
+        // Direct `open` check: opening alias `b` reports clean view `a`.
+        let mut dirty = Vec::new();
+        assert!(open(&mut guards(), b + 8, b + 9, |block| dirty.push(block)));
+        assert_eq!(dirty, [a]);
+
+        // Re-guard `a` so a real CPU write through `b` enters the VEH handler.
+        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
+        assert_eq!(guard(a, a + BLOCK), Some(Vec::new()));
+
+        if let Some(heap) = crate::descriptor::host::HostHeap::new(false, 8) {
+            let mut desc = [0u32; 16];
+            (desc[10], desc[11]) = (a as u32, (a >> 32) as u32);
+            let view = crate::descriptor::View::Placed(
+                false,
+                [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0],
+                desc,
+            );
+            assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+            let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+            assert_eq!(queued, 1);
+            heap.texture_slot_done(1, write, None);
+            assert!(heap.texture_slots_due(u64::MAX, 8).0.is_empty());
+
+            // SAFETY: writing to guarded alias `b` faults into `on_write`,
+            // drops `GUARDS`, and calls `descriptor::host::remapped(a, BLOCK)`.
+            unsafe { ((b + 16) as *mut u8).write_volatile(0x7c) };
+            assert!(
+                heap.texture_slots_remapped(50) >= 1,
+                "alias write fault must queue texture slot refresh for `a`"
+            );
+            let due: Vec<u32> = heap.texture_slots_due(51, 8).0.into_iter().map(|d| d.0).collect();
+            assert_eq!(due, [1]);
+        } else {
+            // SAFETY: even without a host GPU, VEH fault through `b` opens `a`.
+            unsafe { ((b + 16) as *mut u8).write_volatile(0x7c) };
+        }
+        assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
         drop_views(section, &[a, b], BLOCK);
     }
 

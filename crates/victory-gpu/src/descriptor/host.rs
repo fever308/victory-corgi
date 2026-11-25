@@ -545,12 +545,13 @@ fn stale_rule() -> Rule {
 /// textures there may have arrived, gone, or changed with no descriptor
 /// written. The range is kept for the next texture pass
 /// ([`HostHeap::texture_slots_remapped`]). Called with the runtime's own
-/// locks held: this locks one mutex of its own and calls nothing.
-pub(crate) fn remapped(at: usize, len: usize) {
+/// locks held: this locks one mutex of its own and calls nothing. Returns
+/// whether the range was queued.
+pub(crate) fn remapped(at: usize, len: usize) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
-        return;
+        return false;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
@@ -558,6 +559,7 @@ pub(crate) fn remapped(at: usize, len: usize) {
     if gaps != 0 {
         STALE[2].fetch_add(gaps as u64, Relaxed);
     }
+    true
 }
 
 /// Joins `ranges` until at most `most` are left: first the ones that
@@ -1824,7 +1826,7 @@ impl HostHeap {
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
-    fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+    pub(crate) fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
