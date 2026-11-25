@@ -973,6 +973,33 @@ pub(crate) fn keep_on_fast_cores(what: &str) {
     }
 }
 
+/// Asks the system to run the calling thread on the slow cores only, where
+/// the processor has two kinds and at least eight slow logical processors
+/// (a helper that must not take a fast core from the title's threads).
+/// True if it was asked.
+pub fn keep_on_slow_cores(what: &str) -> bool {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    let sets = cpu_sets();
+    let best = sets.iter().map(|c| c.2).max().unwrap_or(0);
+    let slow: Vec<u32> = sets.iter().filter(|c| c.2 < best).map(|c| c.0).collect();
+    if slow.len() < 8 {
+        return false;
+    }
+    // SAFETY: our own thread and a list of the system's own set ids.
+    let ok = unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), slow.as_ptr(), slow.len() as u32) } != 0;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            what,
+            slow = slow.len(),
+            of = sets.len(),
+            ok,
+            "helper threads are kept on the slow cores: the first one"
+        );
+    });
+    ok
+}
+
 /// The process's private bytes (diagnostics: around the making of lists).
 #[cfg(feature = "diagnostics")]
 fn private_bytes() -> u64 {
@@ -1041,6 +1068,7 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    crate::drvwatch::start();
     // PIX's capturer, before any device (`VICTORY_PIX=1`).
     crate::pix::load();
     // SAFETY: plain D3D12 object creation with valid descriptions.
@@ -1362,6 +1390,12 @@ pub(crate) struct HostList {
     clamp_chunks: Mutex<ClampChunks>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// The pair of timestamps its run is timed with since its last reset
+    /// (`crate::cardmeter`), or none.
+    meter: std::sync::atomic::AtomicU32,
+    /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
+    /// last, open until the next one is bound or the list closes.
+    pipeline_meter: std::sync::atomic::AtomicU32,
     /// Active retirement epoch pinned while this list has recorded work or is
     /// queued/executing (0 when idle).
     epoch: std::sync::atomic::AtomicU64,
@@ -4693,6 +4727,17 @@ impl Host {
         }
     }
 
+    /// The host device (`crate::cardmeter`).
+    pub(crate) fn device(&self) -> &ID3D12Device {
+        &self.device
+    }
+
+    /// Ticks per second of the direct queue's timestamp clock (`crate::cardmeter`).
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query on our live command queue.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0)
+    }
+
     fn make_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
@@ -4723,6 +4768,8 @@ impl Host {
                 writes: std::sync::atomic::AtomicU64::new(0),
                 clamp_chunks: Mutex::default(),
                 _alive: Counted::new(),
+                meter: std::sync::atomic::AtomicU32::new(u32::MAX),
+                pipeline_meter: std::sync::atomic::AtomicU32::new(u32::MAX),
                 epoch: std::sync::atomic::AtomicU64::new(0),
                 work_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 in_flight: std::sync::atomic::AtomicUsize::new(0),
@@ -5013,6 +5060,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -5066,6 +5114,7 @@ impl Host {
                             );
                         }
                     }
+                    crate::cardmeter::end(list, timed);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -5142,6 +5191,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Check);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -5211,6 +5261,7 @@ impl Host {
                         plan.inflight = every;
                         plan.inflight_landed = inflight.landed;
                     }
+                    crate::cardmeter::end(list, timed);
                     list.Close()?;
                     list.cast()
                 })()
@@ -7007,6 +7058,15 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.twins_to_depth();
         self.textures_back();
+        crate::cardmeter::end(
+            &self.list,
+            crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)),
+        );
+        crate::cardmeter::end_named(
+            &self.list,
+            crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)),
+            &self.pipelines.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -7293,6 +7353,11 @@ impl HostList {
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
         }
+        self.pipeline_meter.store(u32::MAX, Ordering::Relaxed);
+        self.meter.store(
+            crate::cardmeter::begin(&self.list, crate::cardmeter::Kind::Lists).raw(),
+            Ordering::Relaxed,
+        );
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
         self.release_epoch_inner(true);
@@ -7892,11 +7957,24 @@ impl HostList {
         }
     }
 
-    /// Notes a pipeline the list binds.
+    /// Notes a pipeline the list binds; called where it is bound.
     pub(crate) fn used_pipeline(&self, name: &str) {
-        let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+        {
+            let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            if !pipelines.contains(name) {
+                pipelines.insert(name.to_owned());
+            }
+        }
+        if crate::cardmeter::pipelines() {
+            // The pipeline before it ends here on the card's clock.
+            crate::cardmeter::end(
+                &self.list,
+                crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)),
+            );
+            self.pipeline_meter.store(
+                crate::cardmeter::begin_named(&self.list, name).raw(),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -10585,6 +10663,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         crate::frametime::tick();
+        crate::cardmeter::collect();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -10787,6 +10866,12 @@ impl Meter {
                 crate::descriptor::host::EMPTY_AT_WRITE.load(Ordering::Relaxed)
             );
             crate::tiles::status();
+            if crate::drvwatch::errors() > 0 {
+                tracing::warn!(
+                    "errors the graphics driver reported to the system since the start: {} (the paths under suspicion are off)",
+                    crate::drvwatch::errors()
+                );
+            }
             {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));

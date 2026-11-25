@@ -1060,6 +1060,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::fence::pace::signal_called(fence as usize, value);
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -1268,6 +1270,8 @@ extern "system" fn present(
             }
         }
         async_poke();
+        #[cfg(feature = "diagnostics")]
+        crate::fence::pace::frame();
         return S_OK;
     }
     #[cfg(windows)]
@@ -1344,6 +1348,8 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::fence::pace::frame();
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

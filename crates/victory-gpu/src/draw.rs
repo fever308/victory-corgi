@@ -188,9 +188,14 @@ const WINDOW_MOST: u64 = 64;
 /// On by default (run 20261124-1457: clamps a frame 5,700-6,000 down to
 /// about 2,550, 3.6 to 4.3 fps in the prison cell); `VICTORY_INDIRECT_WINDOW=0`
 /// clamps every record on its own again.
+///
+/// Off for the rest of the run from the first error the card's driver
+/// reports to the system (`crate::drvwatch`): every loss of the card in a
+/// run with windows was announced that way seconds ahead.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
+        && !crate::drvwatch::tripped()
 }
 
 /// Constant buffer views in descriptor tables are views of the buffer's
