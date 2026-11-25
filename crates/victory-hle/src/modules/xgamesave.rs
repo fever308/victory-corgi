@@ -191,24 +191,45 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         }
     }
     committed.sort_unstable();
-    let Some(&number) = committed.last() else {
-        return Ok(None);
-    };
-    for old in &committed[..committed.len() - 1] {
+    // The newest version with a readable manifest is the current one. A newer
+    // one without (a manifest lost outside a commit) is moved aside as
+    // `v<n>.broken`: left in place it would shadow every later commit, and
+    // the older versions it made look stale would be removed.
+    let mut found = None;
+    while let Some(number) = committed.pop() {
+        let version = dir.join(format!("v{number}"));
+        match read_version(&version, number) {
+            Ok(v) => {
+                found = Some(v);
+                break;
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData) => {
+                let aside = dir.join(format!("v{number}.broken"));
+                let _ = std::fs::remove_dir_all(&aside);
+                std::fs::rename(&version, &aside)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    for old in &committed {
         std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
     }
-    let version = dir.join(format!("v{number}"));
+    Ok(found)
+}
+
+/// Version `number` from its folder's manifest.
+fn read_version(version: &Path, number: u64) -> std::io::Result<Version> {
     let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad save manifest");
     let mut names = parse_manifest(&std::fs::read(version.join(MANIFEST))?).ok_or_else(bad)?;
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).map_err(|_| bad())?;
-    Ok(Some(Version {
-        dir: version,
+    Ok(Version {
+        dir: version.to_path_buf(),
         number,
         name,
         display,
         blobs,
-    }))
+    })
 }
 
 /// The version of container `name` in `dir`; none for a missing container
@@ -1067,6 +1088,32 @@ mod tests {
             }
             assert!(seen.0 > 0 && seen.1 > 1, "{op}: {seen:?}");
         }
+    }
+
+    /// A newest version that lost its manifest neither hides the container
+    /// nor takes the saves made after it with it.
+    #[test]
+    fn a_version_without_its_manifest_does_not_shadow_later_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        // v1 committed; lose its manifest and put a stray v4 beside it.
+        let slot = container_dir(root, "Slot");
+        std::fs::rename(slot.join("v1"), slot.join("v4")).unwrap();
+        std::fs::remove_file(slot.join("v4").join(MANIFEST)).unwrap();
+        assert_eq!(state(root), None);
+        // The title saves afresh; the save must stay readable.
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+        let new = Some(("two".into(), vec![("a".into(), "new a".into())]));
+        assert_eq!(state(root), new);
+        assert_eq!(state(root), new, "the second read keeps it too");
+        assert!(
+            slot.join("v4.broken").join("0").exists(),
+            "the broken version's data is kept aside"
+        );
     }
 
     #[test]
