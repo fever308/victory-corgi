@@ -3872,6 +3872,42 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
     }
 }
 
+/// [`late_met`] without its settle: whether a bottom-of-pipe write of a
+/// flight in the air, or of one being landed, is known to meet `wait`
+/// without any conflicting shader, timestamp, or partial write. False says
+/// nothing about what else the flights may write there.
+pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
+    let (address, bytes) = wait.place();
+    let line = line();
+    if line.line.is_empty() && line.in_hand.is_empty() && !line.settling {
+        return false;
+    }
+    let writes = line.in_hand.iter().copied().chain(line.line.iter().filter_map(|item| match item {
+        Late::Write(at, what, n) => Some((*at, *what, *n)),
+        _ => None,
+    }));
+    if eval_late_met(&line.written, writes, address, bytes, |v| wait.holds_for(v)) == Some(true) {
+        LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Effect of a single host list's deferred writes on a memory-value wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteMatch {
+    /// The list does not touch `[address, address + bytes)`.
+    None,
+    /// The list's final write to `[address, address + bytes)` is an exact
+    /// constant value (with no overlapping shader, timestamp, or partial
+    /// write); `true` means it satisfies the wait, `false` means it overwrites
+    /// it with a non-matching value.
+    Exact(bool),
+    /// An overlapping shader, timestamp, or partial write makes the outcome
+    /// unknown until the list has run.
+    Unsure,
+}
+
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {
@@ -8003,6 +8039,42 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// How this list's deferred shader/bottom-of-pipe writes affect a wait on
+    /// `[address, address + bytes)` (`crate::queue::Joined::meets`).
+    pub(crate) fn will_write_state(
+        &self,
+        address: usize,
+        bytes: usize,
+        holds: impl Fn(u64) -> bool,
+    ) -> WriteMatch {
+        let end = address.saturating_add(bytes);
+        let deferred = self.deferred();
+        let shader_touches = deferred.copies.iter().any(|step| match step {
+            Step::GpuWrite(_, at, len, _) => *at < end && address < at.saturating_add(*len),
+            _ => false,
+        });
+        if shader_touches {
+            return WriteMatch::Unsure;
+        }
+        let mut last_exact: Option<bool> = None;
+        for &(at, what, n) in &deferred.writes {
+            let write_end = at.saturating_add(n);
+            if at >= end || address >= write_end {
+                continue;
+            }
+            match what {
+                crate::queue::Written::Value(v) if at == address && n >= bytes => {
+                    last_exact = Some(holds(v));
+                }
+                _ => return WriteMatch::Unsure,
+            }
+        }
+        match last_exact {
+            Some(met) => WriteMatch::Exact(met),
+            None => WriteMatch::None,
+        }
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
