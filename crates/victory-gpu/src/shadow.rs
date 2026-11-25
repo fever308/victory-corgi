@@ -1798,12 +1798,19 @@ fn lock_and_read<G>(acquire: impl Fn() -> G, addr: usize, buf: &mut [u8]) -> Opt
 }
 
 #[inline]
-fn execute_copy_seg(seg: CopySeg) {
+fn execute_copy_seg_checked(seg: CopySeg) -> bool {
     if seg.len == 0 {
-        return;
+        return true;
     }
     if seg.mirror != 0 {
-        crate::host::copy_mapped_raw(seg.mirror as *mut u8, seg.src as *const u8, seg.len, false);
+        if !crate::host::copy_mapped_raw_checked(
+            seg.mirror as *mut u8,
+            seg.src as *const u8,
+            seg.len,
+            false,
+        ) {
+            return false;
+        }
         // SAFETY: `seg` lies inside the shadow's mirror and WC VRAM mapping
         // (`off + len <= self.len`), and chunks are strictly disjoint.
         unsafe {
@@ -1813,8 +1820,9 @@ fn execute_copy_seg(seg: CopySeg) {
                 seg.len,
             );
         }
+        true
     } else {
-        crate::host::copy_mapped_raw(seg.dst as *mut u8, seg.src as *const u8, seg.len, false);
+        crate::host::copy_mapped_raw_checked(seg.dst as *mut u8, seg.src as *const u8, seg.len, false)
     }
 }
 
@@ -1851,36 +1859,47 @@ fn run_copy_jobs(jobs: Vec<Job>) {
     });
 }
 
-fn run_copy_segs(segs: &[CopySeg]) {
+fn run_copy_segs_checked(segs: &[CopySeg]) -> bool {
     let total: usize = segs.iter().map(|s| s.len).sum();
     if total == 0 {
-        return;
+        return true;
     }
     if !wide_copy() || total < WIDE_COPY_MIN {
+        let mut ok = true;
         for &seg in segs {
-            execute_copy_seg(seg);
+            if !execute_copy_seg_checked(seg) {
+                ok = false;
+            }
         }
-        return;
+        return ok;
     }
     let chunk_bytes = (total / 4).clamp(256 << 10, WIDE_COPY_CHUNK);
     let buckets = chunk_copy_segs(segs, chunk_bytes);
     if buckets.len() < 2 {
+        let mut ok = true;
         for &seg in segs {
-            execute_copy_seg(seg);
+            if !execute_copy_seg_checked(seg) {
+                ok = false;
+            }
         }
-        return;
+        return ok;
     }
+    let all_ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let jobs: Vec<Job> = buckets
         .into_iter()
         .map(|bucket| {
+            let all_ok = all_ok.clone();
             Box::new(move || {
                 for seg in bucket {
-                    execute_copy_seg(seg);
+                    if !execute_copy_seg_checked(seg) {
+                        all_ok.store(false, Ordering::Release);
+                    }
                 }
             }) as Job
         })
         .collect();
     run_copy_jobs(jobs);
+    all_ok.load(Ordering::Acquire)
 }
 
 /// Copies `len` bytes from title memory `src` into writable host memory `dst`,
@@ -1896,12 +1915,16 @@ pub(crate) fn copy_mapped_wide(dst: *mut u8, src: *const u8, len: usize) {
     if crate::lazy_back::active() {
         crate::lazy_back::materialize_range(src as usize, len);
     }
-    run_copy_segs(&[CopySeg {
+    let seg = [CopySeg {
         src: src as usize,
         dst: dst as usize,
         mirror: 0,
         len,
-    }]);
+    }];
+    if !run_copy_segs_checked(&seg) {
+        crate::lazy_back::materialize_range(src as usize, len);
+        let _ = run_copy_segs_checked(&seg);
+    }
 }
 
 /// Dirty byte ranges discovered by [`Shadow::plan_update`] before copying.
@@ -2004,7 +2027,17 @@ pub(crate) fn refresh_batch(
     }
 
     if !all_segs.is_empty() {
-        run_copy_segs(&all_segs);
+        if crate::lazy_back::active() {
+            for seg in &all_segs {
+                crate::lazy_back::materialize_range(seg.src, seg.len);
+            }
+        }
+        if !run_copy_segs_checked(&all_segs) {
+            for seg in &all_segs {
+                crate::lazy_back::materialize_range(seg.src, seg.len);
+            }
+            let _ = run_copy_segs_checked(&all_segs);
+        }
         for &(idx, seg_lo, seg_hi) in &non_mirrored {
             let shadow = &planned[idx].0;
             shadow.finish_copy_segs(shadow.start as usize, &all_segs[seg_lo..seg_hi]);
@@ -3413,6 +3446,21 @@ impl Shadow {
             .clear();
     }
 
+    /// Pre-lock materialization of deferred lazy_back blocks overlapping ReBAR
+    /// GPU readback `spans` before taking `rebar.mirror.lock()`.
+    fn materialize_rebar_spans(&self, spans: &[(usize, usize)], gpu_slices: &[&[u8]]) {
+        if !crate::lazy_back::active() {
+            return;
+        }
+        let start = self.start as usize;
+        let limit = self.len as usize;
+        for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
+            if from < to && to <= limit && gpu_span.len() == to - from {
+                crate::lazy_back::materialize_range(start + from, to - from);
+            }
+        }
+    }
+
     /// [`relay`] counterpart to [`Shadow::copy_back_rebar`]: merges GPU bytes
     /// DMAed by the relay thread (`gpu_slices`, for sorted disjoint buffer-offset
     /// `spans`) into title memory and the cached RAM mirror under `rebar.mirror`'s
@@ -3427,14 +3475,7 @@ impl Shadow {
             return 0;
         };
         let start = self.start as usize;
-        if crate::lazy_back::active() {
-            let limit = self.len as usize;
-            for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
-                if from < to && to <= limit && gpu_span.len() == to - from {
-                    crate::lazy_back::materialize_range(start + from, to - from);
-                }
-            }
-        }
+        self.materialize_rebar_spans(spans, gpu_slices);
         let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mirror) = mirror_guard.as_mut() else {
             return 0;
@@ -3620,14 +3661,7 @@ impl Shadow {
             return 0;
         };
         let start = self.start as usize;
-        if crate::lazy_back::active() {
-            let limit = self.len as usize;
-            for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
-                if from < to && to <= limit && gpu_span.len() == to - from {
-                    crate::lazy_back::materialize_range(start + from, to - from);
-                }
-            }
-        }
+        self.materialize_rebar_spans(spans, gpu_slices);
         let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let mut vram_dirty: Vec<(usize, usize)> = Vec::new();
@@ -4867,14 +4901,35 @@ impl Shadow {
                     for s in &mut segs {
                         s.mirror = m_ptr + (s.src - start);
                     }
-                    run_copy_segs(&segs);
+                    let ok = run_copy_segs_checked(&segs);
                     drop(mirror);
+                    if !ok {
+                        for s in &segs {
+                            crate::lazy_back::materialize_range(s.src, s.len);
+                        }
+                        let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(m) = mirror.as_mut() {
+                            let m_ptr = m.as_mut_ptr() as usize;
+                            let m_len = m.len();
+                            if segs.iter().all(|s| (s.src - start) + s.len <= m_len) {
+                                for s in &mut segs {
+                                    s.mirror = m_ptr + (s.src - start);
+                                }
+                                let _ = run_copy_segs_checked(&segs);
+                            }
+                        }
+                    }
                     rebar.mark_dirty_segs(start, &segs);
                     return total;
                 }
             }
         }
-        run_copy_segs(&segs);
+        if !run_copy_segs_checked(&segs) {
+            for s in &segs {
+                crate::lazy_back::materialize_range(s.src, s.len);
+            }
+            let _ = run_copy_segs_checked(&segs);
+        }
         self.finish_copy_segs(start, &segs);
         total
     }
@@ -8342,6 +8397,107 @@ mod tests {
         assert!(unmerged.is_empty());
         assert_eq!(&side[16..80], &[0x5Au8; 64]);
 
+        // SAFETY: free test allocation.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn refresh_batch_materializes_deferred_lazy_block_instead_of_zeroing() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let Some(h) = host() else {
+            return;
+        };
+        let pages = 2usize;
+        let len = pages * PAGE;
+        // SAFETY: isolated write-watched allocation freed at the end of the test.
+        // Use `MEM_TOP_DOWN` so bottom-up `watch` tests do not reuse this VA.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>()
+        };
+        assert!(!title.is_null());
+        // SAFETY: committed above.
+        unsafe { std::ptr::write_bytes(title, 0xA5, len) };
+        let va0 = title as usize;
+
+        let mut side_a = vec![0xA5u8; len];
+        let mut side_b = vec![0x00u8; len];
+        let mut side_c = vec![0x00u8; len];
+        let Some(shadow_a) = Shadow::new_card_sized_for_test(side_a.as_mut_ptr(), va0 as u64, len as u64) else {
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        let Some(shadow_b) = Shadow::new_card_sized_for_test(side_b.as_mut_ptr(), va0 as u64, len as u64) else {
+            drop(shadow_a);
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        let Some(shadow_c) = Shadow::new_card_sized_for_test(side_c.as_mut_ptr(), va0 as u64, len as u64) else {
+            drop(shadow_b);
+            drop(shadow_a);
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+
+        // Seed shadow_a's GPU card buffer with `0xA5` across `len` and `0x5C` in the
+        // first 64 bytes so materialization merges `0x5C` into title RAM when `VICTORY_LAZY_BACK=1`.
+        let (up, up_ptr) = h.upload_buffer(len as u64).expect("upload");
+        // SAFETY: mapped `len`-byte upload buffer.
+        unsafe {
+            std::ptr::write_bytes(up_ptr, 0xA5, len);
+            std::ptr::write_bytes(up_ptr, 0x5C, 64);
+        }
+        let list = h.new_list().expect("seed list");
+        // SAFETY: live buffers on open command list.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&shadow_a.buffer, 0, &up, 0, len as u64);
+        }
+        list.close();
+        h.execute(&[&list]);
+        list.reset();
+        shadow_a.writing(va0, PAGE, |_, _| None);
+
+        let deferred = crate::lazy_back::try_defer_page(&shadow_a, 0, PAGE, 0);
+        if deferred {
+            assert!(crate::lazy_back::has_block(va0 / PAGE));
+        }
+
+        // `refresh_batch` with >= 2 items exercises the flat `all_segs` +
+        // `run_copy_segs_checked` path across page 0 (`shadow_b`) and page 1 (`shadow_c`).
+        let copied = refresh_batch(
+            vec![
+                (shadow_b.clone(), va0, va0 + PAGE),
+                (shadow_c.clone(), va0 + PAGE, va0 + 2 * PAGE),
+            ],
+            false,
+        );
+        assert!(copied >= 2 * PAGE);
+        assert!(!crate::lazy_back::has_block(va0 / PAGE));
+        if deferred {
+            assert_eq!(&side_b[..64], &[0x5Cu8; 64]);
+        } else {
+            assert_eq!(&side_b[..64], &[0xA5u8; 64]);
+        }
+        assert_eq!(&side_c[PAGE..PAGE + 64], &[0xA5u8; 64]);
+
+        shadow_a.copy_back_done(&[(va0, va0 + PAGE)]);
+        drop(shadow_c);
+        drop(shadow_b);
+        drop(shadow_a);
         // SAFETY: free test allocation.
         unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
     }
