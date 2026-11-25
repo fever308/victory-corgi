@@ -1944,23 +1944,10 @@ pub(crate) fn ensure_handler() {
     install();
 }
 
-pub(crate) fn is_pinned_block(block: usize) -> bool {
-    let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
-    if g.pins.is_empty() {
-        return false;
-    }
-    let now = std::time::Instant::now();
-    g.pins
-        .range(..=block)
-        .next_back()
-        .is_some_and(|(_, &(end, until))| block < end && until > now)
-}
-
 /// Atomically checks pin state, clears guard/cold metadata for `blocks`, and
 /// invokes `arm()` under `GUARDS` (`GUARDS -> LAZY_STATE` lock order) so no
 /// concurrent `guard()`, `promote_cold_pages()`, or `kernel_writing()` can
 /// re-arm or pin `blocks` between disarming and `LAZY_STATE` insertion.
-#[allow(dead_code)]
 pub(crate) fn try_arm_lazy_under_guards(blocks: &[usize], arm: impl FnOnce() -> bool) -> bool {
     if blocks.is_empty() {
         return false;
@@ -1981,33 +1968,6 @@ pub(crate) fn try_arm_lazy_under_guards(blocks: &[usize], arm: impl FnOnce() -> 
         DIR.set_bits_range(from, to, BitField::GuardAliased, false, Ordering::SeqCst);
     });
     arm()
-}
-
-pub(crate) fn disarm_for_lazy(block: usize) {
-    let mut g = guards();
-    let start = block * BLOCK;
-    let end = start.saturating_add(BLOCK);
-    open(&mut g, start, end, |_| {});
-    demote_cold_range(&mut g, block, block + 1);
-    DIR.set_bit(block, BitField::GuardClean, false, Ordering::SeqCst);
-    DIR.set_bit(block, BitField::GuardAbsent, false, Ordering::SeqCst);
-    if view_guard() {
-        let mut sorted: Vec<usize> = crate::inplace::pages_of(start)
-            .into_iter()
-            .map(|a| a / BLOCK)
-            .filter(|&b| b != block)
-            .collect();
-        if !sorted.is_empty() {
-            sorted.sort_unstable();
-            sorted.dedup();
-            for_each_contiguous_run(&sorted, |from, to| {
-                open_here(&mut g, from * BLOCK, to * BLOCK, |_| {});
-                demote_cold_range(&mut g, from, to);
-                DIR.set_bits_range(from, to, BitField::GuardClean, false, Ordering::SeqCst);
-                DIR.set_bits_range(from, to, BitField::GuardAbsent, false, Ordering::SeqCst);
-            });
-        }
-    }
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -2859,6 +2819,11 @@ fn install() {
         const READ: usize = 0;
         const WRITE: usize = 1;
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // SAFETY: `ContextRecord` is valid when Windows dispatches an exception.
+        let rip = unsafe { (*(*info).ContextRecord).Rip };
+        if crate::host::is_fast_copy_rip(rip) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let access = r.ExceptionInformation[0];

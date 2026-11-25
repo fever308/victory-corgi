@@ -3495,37 +3495,8 @@ impl Shadow {
 
         let apply_subrange =
             |sub_at: usize, gpu: &[u8], old: &mut [u8], title: &mut Vec<u8>| -> usize {
-                let sub_n = gpu.len();
-                title.clear();
-                title.resize(sub_n, 0);
-                if crate::host::read_into_raw((start + sub_at) as *const u8, title) {
-                    let as_read = merge_race_on().then(|| title.clone());
-                    if merge_piece(gpu, old, title) {
-                        crate::host::shaders_write(start + sub_at, &title[..]);
-                        #[cfg(feature = "diagnostics")]
-                        back_note(start + sub_at, &title[..sub_n], self.start, self.len);
-                        if self.put_back_own(start + sub_at, &title[..]) {
-                            return sub_n;
-                        }
-                        crate::watch::writing(start + sub_at, sub_n);
-                        merge_race(
-                            as_read.as_deref(),
-                            (self.start, self.len),
-                            start + sub_at,
-                            &title[..],
-                            "rebar relay",
-                        );
-                        crate::host::write_mapped_raw(
-                            (start + sub_at) as *mut u8,
-                            title.as_ptr(),
-                            sub_n,
-                        );
-                        return sub_n;
-                    }
-                } else {
-                    old.copy_from_slice(gpu);
-                }
-                0
+                self.apply_rebar_relay_subrange(start, sub_at, gpu, old, title, false)
+                    .unwrap_or(0)
             };
 
         let mut written = 0;
@@ -3650,6 +3621,100 @@ impl Shadow {
             written += apply_subrange(sub_at, gpu, old, &mut title);
         }
         written
+    }
+
+    fn apply_rebar_relay_subrange(
+        &self,
+        start: usize,
+        sub_at: usize,
+        gpu: &[u8],
+        old: &mut [u8],
+        title: &mut Vec<u8>,
+        via_own: bool,
+    ) -> Option<usize> {
+        let sub_n = gpu.len();
+        title.clear();
+        title.resize(sub_n, 0);
+        if via_own {
+            if !crate::inplace::read_own(start + sub_at, title) {
+                return None;
+            }
+            let old_backup = old.to_vec();
+            if merge_piece(gpu, old, title) {
+                crate::host::shaders_write(start + sub_at, &title[..]);
+                #[cfg(feature = "diagnostics")]
+                back_note(start + sub_at, &title[..sub_n], self.start, self.len);
+                let Some(shown) = crate::inplace::write_own(start + sub_at, &title[..]) else {
+                    old.copy_from_slice(&old_backup);
+                    return None;
+                };
+                let _ = self.record_own_write(start + sub_at, sub_n, &shown);
+                return Some(sub_n);
+            }
+            return Some(0);
+        }
+        if crate::host::read_into_raw((start + sub_at) as *const u8, title) {
+            let as_read = merge_race_on().then(|| title.clone());
+            if merge_piece(gpu, old, title) {
+                crate::host::shaders_write(start + sub_at, &title[..]);
+                #[cfg(feature = "diagnostics")]
+                back_note(start + sub_at, &title[..sub_n], self.start, self.len);
+                if self.put_back_own(start + sub_at, &title[..]) {
+                    return Some(sub_n);
+                }
+                crate::watch::writing(start + sub_at, sub_n);
+                merge_race(
+                    as_read.as_deref(),
+                    (self.start, self.len),
+                    start + sub_at,
+                    &title[..],
+                    "rebar relay",
+                );
+                crate::host::write_mapped_raw((start + sub_at) as *mut u8, title.as_ptr(), sub_n);
+                return Some(sub_n);
+            }
+        } else {
+            old.copy_from_slice(gpu);
+        }
+        Some(0)
+    }
+
+    /// Merges one 64 KiB lazy-materialized GPU page into a ReBAR mirror and
+    /// title physical memory through `inplace` own `PAGE_READWRITE` views while
+    /// title views remain `PAGE_NOACCESS`. Returns `None` if an own view is
+    /// unavailable (private memory or active remap), leaving `mirror` untouched.
+    pub(crate) fn relay_merge_rebar_via_own(&self, offset: usize, gpu: &[u8]) -> Option<usize> {
+        let rebar = self.rebar.as_ref()?;
+        let start = self.start as usize;
+        let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
+        let mirror = mirror_guard.as_mut()?;
+        let end = offset.checked_add(gpu.len())?;
+        if gpu.is_empty() || end > mirror.len() {
+            return Some(0);
+        }
+        let mut title = Vec::new();
+        let mut written = 0usize;
+        let mut at = offset;
+        while at < end {
+            let n = (PAGE - (start + at) % PAGE).min(end - at);
+            let gpu_page = &gpu[at - offset..at - offset + n];
+            let old = &mut mirror[at..at + n];
+            if gpu_page != old
+                && let Some(first) = first_difference(gpu_page, old)
+            {
+                let last = last_difference(gpu_page, old).unwrap_or(first);
+                written += self.apply_rebar_relay_subrange(
+                    start,
+                    at + first,
+                    &gpu_page[first..=last],
+                    &mut old[first..=last],
+                    &mut title,
+                    true,
+                )?;
+            }
+            at += n;
+        }
+        Some(written)
     }
 
     /// ReBAR counterpart to [`Shadow::copy_back`]: merges post-submission GPU
@@ -3946,6 +4011,27 @@ impl Shadow {
         n
     }
 
+    /// Notifies the watch journal, descriptor cache, and `self.copied` after an
+    /// own-view write at `[at, at + len)` with alias pages `shown`.
+    fn record_own_write(&self, at: usize, len: usize, shown: &[usize]) -> bool {
+        let page = at / PAGE;
+        let others: Vec<usize> = shown.iter().map(|&a| a / PAGE).filter(|&p| p != page).collect();
+        let (before, now) = crate::watch::wrote_own(page, &others);
+        // A placed texture there changed with no descriptor written (what
+        // `crate::watch::writing` tells the texture table on the old way).
+        crate::descriptor::host::remapped(at, len);
+        let base = self.start as usize / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+            && *taken != 0
+            && *taken >= before
+        {
+            *taken = (*taken).max(now);
+            return true;
+        }
+        false
+    }
+
     /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
     /// what a merge made of title memory `[at, at + bytes.len())` (inside
     /// one 64 KiB page, as every merged stretch is) through a view of our
@@ -3983,40 +4069,27 @@ impl Shadow {
             }
         }
         let page = at / PAGE;
-        let others: Vec<usize> = shown.iter().map(|&a| a / PAGE).filter(|&p| p != page).collect();
-        let (before, now) = crate::watch::wrote_own(page, &others);
-        // A placed texture there changed with no descriptor written (what
-        // `crate::watch::writing` tells the texture table on the old way).
-        crate::descriptor::host::remapped(at, bytes.len());
-        let base = self.start as usize / PAGE;
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
-                && *taken != 0
-                && *taken >= before
-            {
-                *taken = (*taken).max(now);
-                OWN_WRITES[2].fetch_add(1, Ordering::Relaxed);
-                // A copy in the card's memory only: its CPU side is never
-                // written by the card, so it must equal title memory now.
-                // (ReBAR shadows keep WC VRAM in `self.data`, never CPU-read.)
-                if check && self.card.is_some() {
-                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                    let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
-                    if lo < hi {
-                        let mut title = vec![0u8; hi - lo];
-                        // SAFETY: inside the copy's mapping; read only.
-                        let held = unsafe {
-                            std::slice::from_raw_parts(
-                                self.data.add(lo - start).cast_const(),
-                                hi - lo,
-                            )
-                        };
-                        if crate::host::read_into_raw(lo as *const u8, &mut title) && title != held {
-                            OWN_WRITES[5].fetch_add(1, Ordering::Relaxed);
-                            if crate::watch::clean(page) {
-                                OWN_WRITES[6].fetch_add(1, Ordering::Relaxed);
-                            }
+        if self.record_own_write(at, bytes.len(), &shown) {
+            OWN_WRITES[2].fetch_add(1, Ordering::Relaxed);
+            // A copy in the card's memory only: its CPU side is never
+            // written by the card, so it must equal title memory now.
+            // (ReBAR shadows keep WC VRAM in `self.data`, never CPU-read.)
+            if check && self.card.is_some() {
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+                if lo < hi {
+                    let mut title = vec![0u8; hi - lo];
+                    // SAFETY: inside the copy's mapping; read only.
+                    let held = unsafe {
+                        std::slice::from_raw_parts(
+                            self.data.add(lo - start).cast_const(),
+                            hi - lo,
+                        )
+                    };
+                    if crate::host::read_into_raw(lo as *const u8, &mut title) && title != held {
+                        OWN_WRITES[5].fetch_add(1, Ordering::Relaxed);
+                        if crate::watch::clean(page) {
+                            OWN_WRITES[6].fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -5156,14 +5229,40 @@ impl Shadow {
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
+        self.card_merge_relay_inner(at, gpu, fetched_after, title, false)
+            .unwrap_or(0)
+    }
+
+    /// Variant of [`Shadow::card_merge_relay`] that reads and writes title
+    /// physical memory via `inplace` own `PAGE_READWRITE` section views while
+    /// title views remain `PAGE_NOACCESS`. Returns `None` if an own view is
+    /// unavailable, leaving `self.data` untouched.
+    pub(crate) fn card_merge_relay_via_own(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        fetched_after: u64,
+        title: &mut Vec<u8>,
+    ) -> Option<usize> {
+        self.card_merge_relay_inner(at, gpu, fetched_after, title, true)
+    }
+
+    fn card_merge_relay_inner(
+        &self,
+        at: usize,
+        gpu: &[u8],
+        fetched_after: u64,
+        title: &mut Vec<u8>,
+        via_own: bool,
+    ) -> Option<usize> {
         let start = self.start as usize;
         let Some(card) = &self.card else {
-            return 0;
+            return Some(0);
         };
         if at + gpu.len() > self.len as usize {
-            return 0;
+            return Some(0);
         }
-        if crate::lazy_back::active() {
+        if !via_own && crate::lazy_back::active() {
             crate::lazy_back::materialize_range(start + at, gpu.len());
         }
         let _side = self.before.read().unwrap_or_else(|e| e.into_inner());
@@ -5175,7 +5274,7 @@ impl Shadow {
         // ranges.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
-            return 0;
+            return Some(0);
         };
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
@@ -5192,6 +5291,29 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
+        if via_own {
+            if !crate::inplace::read_own(start + at, title) {
+                return None;
+            }
+            let held_backup = held.to_vec();
+            let mut changed = false;
+            for (a, b) in outside(at, at + n, skip) {
+                let (a, b) = (a - at, b - at);
+                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            }
+            if !changed {
+                return Some(0);
+            }
+            crate::host::shaders_write(start + at, &title[..]);
+            #[cfg(feature = "diagnostics")]
+            back_note(start + at, &title[..n], self.start, self.len);
+            let Some(shown) = crate::inplace::write_own(start + at, &title[..]) else {
+                held.copy_from_slice(&held_backup);
+                return None;
+            };
+            let _ = self.record_own_write(start + at, n, &shown);
+            return Some(n);
+        }
         let mapped = crate::host::read_into_raw((start + at) as *const u8, title);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
@@ -5204,18 +5326,18 @@ impl Shadow {
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
         if !mapped || !changed {
-            return 0;
+            return Some(0);
         }
         crate::host::shaders_write(start + at, &title[..]);
         #[cfg(feature = "diagnostics")]
         back_note(start + at, &title[..n], self.start, self.len);
         if self.put_back_own(start + at, &title[..]) {
-            return n;
+            return Some(n);
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped_raw((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        Some(n)
     }
 
     #[cfg(test)]

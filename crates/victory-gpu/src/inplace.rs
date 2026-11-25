@@ -629,23 +629,20 @@ struct Own {
 static OWN: std::sync::Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> =
     std::sync::Mutex::new(None);
 
-/// Stores `bytes` at title address `at` through a view of our own
-/// ([`back_own`]), if `[at, at + bytes.len())` lies in one 64 KiB page of
-/// a title view of a section. Gives the addresses of that page in every
-/// title view that shows it (the page of `at` among them), or `None` with
-/// nothing written: not view memory, a page of very many views, the
-/// runtime changing mappings at this moment, or the host refusing.
-pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
+/// Resolves `[at, at + len)` to a committed `PAGE_READWRITE` address in our own
+/// section view, the title views showing its 64 KiB page, and a guard keeping
+/// title mappings stable for the duration of the access.
+fn own_view_ptr(at: usize, len: usize) -> Option<(usize, Vec<usize>, crate::watch::Reading)> {
+    if len == 0 || at / K64 != (at + len - 1) / K64 {
         return None;
     }
-    // No mapping changes until the bytes are in: the view found below
-    // shows these pages for as long as this is held.
-    let _still = crate::watch::title_memory_reading_now(at, bytes.len())?;
+    // No mapping changes until the caller finishes: the view found below
+    // shows these pages for as long as this guard is held.
+    let still = crate::watch::title_memory_reading_now(at, len)?;
     let (section, offset, shown, section_bytes) = {
         let v = views_read();
-        let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
-        if at + bytes.len() > base + len {
+        let (&base, &(view_len, section, offset)) = v.views.range(..=at).next_back()?;
+        if at + len > base + view_len {
             return None;
         }
         let offset = offset + (at - base) as u64;
@@ -656,10 +653,10 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
         (section, offset, shown, section_bytes)
     };
-    if offset + bytes.len() as u64 > section_bytes {
+    if offset + len as u64 > section_bytes {
         return None;
     }
-    let dst = {
+    let ptr = {
         let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
         let view = own
             .get_or_insert_with(Default::default)
@@ -690,7 +687,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
                 })
             })
             .as_mut()?;
-        if offset + bytes.len() as u64 > view.bytes {
+        if offset + len as u64 > view.bytes {
             return None;
         }
         let block = offset as usize / K64;
@@ -713,6 +710,35 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         }
         view.base + offset as usize
     };
+    Some((ptr, shown, still))
+}
+
+/// Reads title physical bytes at `[at, at + dst.len())` through our own
+/// `PAGE_READWRITE` section view (without touching title view protections),
+/// returning `false` if `[at, at + dst.len())` is not inside one 64 KiB page
+/// of a mapped section view or a mapping change is in progress.
+pub(crate) fn read_own(at: usize, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    let Some((src, _shown, _still)) = own_view_ptr(at, dst.len()) else {
+        return false;
+    };
+    // SAFETY: committed bytes inside our own `PAGE_READWRITE` section view
+    // (kept mapped even if the handle number is reused, and `_still` keeps the
+    // title view live); `dst` is a valid mutable slice of `dst.len()` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst.as_mut_ptr(), dst.len()) };
+    true
+}
+
+/// Stores `bytes` at title address `at` through a view of our own
+/// ([`back_own`]), if `[at, at + bytes.len())` lies in one 64 KiB page of
+/// a title view of a section. Gives the addresses of that page in every
+/// title view that shows it (the page of `at` among them), or `None` with
+/// nothing written: not view memory, a page of very many views, the
+/// runtime changing mappings at this moment, or the host refusing.
+pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+    let (dst, shown, _still) = own_view_ptr(at, bytes.len())?;
     // SAFETY: committed bytes inside our own view (kept mapped even if the
     // handle number is reused, and `_still` keeps the title view live); the
     // source is the caller's slice.
@@ -1747,13 +1773,16 @@ mod tests {
         assert!(crate::watch::clean(one / K64), "page must be guarded and clean");
 
         // Write through our own view: both title views show the bytes and the
-        // guard on `one` stays clean (unopened).
+        // guard on `one` stays clean (unopened), and `read_own` reads them back.
         let payload = [0xde, 0xad, 0xbe, 0xef];
         let shown = write_own(one + 32, &payload).expect("write_own should succeed");
         assert!(shown.contains(&one) && shown.contains(&two));
+        let mut readback = [0u8; 4];
+        assert!(read_own(two + 32, &mut readback));
+        assert_eq!(readback, payload);
         assert!(
             crate::watch::clean(one / K64),
-            "write_own must not open the title view's read-only guard"
+            "write_own/read_own must not open the title view's read-only guard"
         );
         // SAFETY: both views are mapped and readable.
         unsafe {
