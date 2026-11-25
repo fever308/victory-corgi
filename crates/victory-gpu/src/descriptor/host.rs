@@ -127,7 +127,16 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Per title slot, bitmask of auxiliary maps (`buffers`, `placed`,
+    /// `textures`, `kept`) that may hold `index`. Maintained under each map's
+    /// lock so removals on slots never inserted skip locking those maps.
+    noted: Vec<std::sync::atomic::AtomicU8>,
 }
+
+const NOTED_BUFFER: u8 = 1 << 0;
+const NOTED_PLACED: u8 = 1 << 1;
+const NOTED_TEXTURE: u8 = 1 << 2;
+const NOTED_KEPT: u8 = 1 << 3;
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
 /// texture code, which has no heap at hand ([`next_start`],
@@ -1072,6 +1081,9 @@ impl HostHeap {
                 }
                 spans
             },
+            noted: (0..count)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1249,7 +1261,14 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match again {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
-            None => textures.done(index, write),
+            None => {
+                textures.done(index, write);
+                if !textures.slots.contains_key(&index)
+                    && let Some(noted) = self.noted.get(index as usize)
+                {
+                    noted.fetch_and(!NOTED_TEXTURE, std::sync::atomic::Ordering::Release);
+                }
+            }
         }
     }
 
@@ -1331,6 +1350,9 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
+            if let Some(noted) = self.noted.get(slot as usize) {
+                noted.fetch_or(NOTED_TEXTURE, std::sync::atomic::Ordering::Release);
+            }
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
@@ -1380,6 +1402,9 @@ impl HostHeap {
         }
         for &slot in &slots {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+            if let Some(noted) = self.noted.get(slot as usize) {
+                noted.fetch_or(NOTED_TEXTURE, std::sync::atomic::Ordering::Release);
+            }
         }
         [held, slots.len(), slots.len()]
     }
@@ -1464,6 +1489,9 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
+            if let Some(noted) = self.noted.get(slot as usize) {
+                noted.fetch_or(NOTED_TEXTURE, std::sync::atomic::Ordering::Release);
+            }
         }
         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
         slots.len()
@@ -1567,6 +1595,9 @@ impl HostHeap {
             if tabled_out() {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
+                    if let Some(noted) = self.noted.get(index as usize) {
+                        noted.fetch_and(!NOTED_TEXTURE, std::sync::atomic::Ordering::Release);
+                    }
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
             }
@@ -1601,7 +1632,6 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1609,9 +1639,21 @@ impl HostHeap {
             } else {
                 0
             };
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             textures.written(index, frame, due, seen);
-        } else {
+            if let Some(noted) = self.noted.get(index as usize) {
+                noted.fetch_or(NOTED_TEXTURE, std::sync::atomic::Ordering::Release);
+            }
+        } else if self
+            .noted
+            .get(index as usize)
+            .is_none_or(|n| n.load(std::sync::atomic::Ordering::Acquire) & NOTED_TEXTURE != 0)
+        {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             textures.remove(index);
+            if let Some(noted) = self.noted.get(index as usize) {
+                noted.fetch_and(!NOTED_TEXTURE, std::sync::atomic::Ordering::Release);
+            }
         }
     }
 
@@ -1671,12 +1713,12 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
-            use std::sync::atomic::Ordering::Relaxed;
+        let stale = if let Some((resource, start, first)) = placed_view {
+            use std::sync::atomic::Ordering::{Relaxed, Release};
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let span = placed_view.and_then(|(resource, start, first)| {
-                Some((start, start.saturating_add(placed.bytes(resource)?), first))
-            });
+            let span = placed
+                .bytes(resource)
+                .map(|len| (start, start.saturating_add(len), first));
             match span {
                 Some((start, end, first)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
@@ -1684,41 +1726,89 @@ impl HostHeap {
                     placed.rule = stale_rule();
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first);
+                    if let Some(noted) = self.noted.get(index as usize) {
+                        noted.fetch_or(NOTED_PLACED, Release);
+                    }
+                    for &slot in &stale {
+                        if let Some(noted) = self.noted.get(slot as usize) {
+                            noted.fetch_and(!NOTED_PLACED, Release);
+                        }
+                    }
                     stale
                 }
                 None => {
                     placed.forget(index);
+                    if let Some(noted) = self.noted.get(index as usize) {
+                        noted.fetch_and(!NOTED_PLACED, Release);
+                    }
                     Vec::new()
                 }
             }
+        } else if self
+            .noted
+            .get(index as usize)
+            .is_none_or(|n| n.load(std::sync::atomic::Ordering::Acquire) & NOTED_PLACED != 0)
+        {
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            placed.forget(index);
+            if let Some(noted) = self.noted.get(index as usize) {
+                noted.fetch_and(!NOTED_PLACED, std::sync::atomic::Ordering::Release);
+            }
+            Vec::new()
+        } else {
+            Vec::new()
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &slot in &stale {
                 textures.remove(slot);
+                if let Some(noted) = self.noted.get(slot as usize) {
+                    noted.fetch_and(!NOTED_TEXTURE, std::sync::atomic::Ordering::Release);
+                }
             }
         }
         let stride = view.and_then(view_stride);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
-        }
-        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let was = if stride.is_some() {
+        if let Some(s) = stride {
+            if let Some((_, _, data)) = &self.strides
+                && index < victory_shader::emit::SLOT_STRIDES_COUNT
+            {
+                // SAFETY: inside the mapping; shaders read it while we write (a
+                // dword, either value is one the slot had).
+                unsafe { (*data as *mut u32).add(index as usize).write_volatile(s) };
+            }
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
             buffers.insert(index);
-            true
-        } else {
-            buffers.remove(&index)
-        };
-        if was {
+            if let Some(noted) = self.noted.get(index as usize) {
+                noted.fetch_or(NOTED_BUFFER, std::sync::atomic::Ordering::Release);
+            }
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(index);
+        } else if self
+            .noted
+            .get(index as usize)
+            .is_none_or(|n| n.load(std::sync::atomic::Ordering::Acquire) & NOTED_BUFFER != 0)
+        {
+            if let Some((_, _, data)) = &self.strides
+                && index < victory_shader::emit::SLOT_STRIDES_COUNT
+            {
+                // SAFETY: inside the mapping; shaders read it while we write (a
+                // dword, either value is one the slot had).
+                unsafe { (*data as *mut u32).add(index as usize).write_volatile(0) };
+            }
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            let was = buffers.remove(&index);
+            if let Some(noted) = self.noted.get(index as usize) {
+                noted.fetch_and(!NOTED_BUFFER, std::sync::atomic::Ordering::Release);
+            }
+            if was {
+                self.changed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(index);
+            }
         }
         stale
     }
@@ -1813,6 +1903,12 @@ impl HostHeap {
             Kept::Resource(resource) => Some(KeptObject::Resource(resource)),
             Kept::Shadow(shadow) => Some(KeptObject::Shadow(shadow)),
         };
+        if slot_entry.is_none()
+            && let Some(noted) = self.noted.get(index as usize)
+            && noted.load(std::sync::atomic::Ordering::Acquire) & NOTED_KEPT == 0
+        {
+            return;
+        }
         let old = {
             let mut shard = self.kept[index as usize % KEPT_SHARDS]
                 .lock()
@@ -1825,8 +1921,18 @@ impl HostHeap {
                 return;
             }
             match slot_entry {
-                Some(entry) => shard.insert(index, entry),
-                None => shard.remove(&index),
+                Some(entry) => {
+                    if let Some(noted) = self.noted.get(index as usize) {
+                        noted.fetch_or(NOTED_KEPT, std::sync::atomic::Ordering::Release);
+                    }
+                    shard.insert(index, entry)
+                }
+                None => {
+                    if let Some(noted) = self.noted.get(index as usize) {
+                        noted.fetch_and(!NOTED_KEPT, std::sync::atomic::Ordering::Release);
+                    }
+                    shard.remove(&index)
+                }
             }
         };
         // A running submission may still read the old resource through
@@ -1966,41 +2072,18 @@ impl HostHeap {
 
     /// For a slot on a page of the title's heap that changed with no call
     /// (`super::sync_heaps`: the title copies records into its heap as
-    /// bytes): [`HostHeap::mirror`], if the `bytes` bytes of the record at
-    /// `handle` are not the ones this last saw there. True if it did.
-    ///
-    /// The page says only that something on it was written, and `mirror`
-    /// by itself would take every buffer or placed-texture record on it for
-    /// newly written each time (it leaves such a slot unmade until a draw
-    /// or a pass uses it): the texture queue's entry for the slot would
-    /// start again, and the buffer pass would look at 2,048 slots for one
-    /// that changed.
-    /// `record`: the record's bytes as the caller read them (through the
-    /// kernel, which fails on a page the title unmapped meanwhile where a
-    /// read in place would fault: the title unmaps heap pages too).
+    /// bytes): [`HostHeap::mirror`], if the bytes of the record at `handle`
+    /// are not the ones this last saw there. True if it did.
+    #[cfg(test)]
     pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
         if index >= self.count {
             return false;
         }
-        // A slot draws read through a table lately is left to its draws,
-        // as the passes over slots picked by index leave it
-        // (`texture_slots_remapped`, `slots_written_under`): the title
-        // writes its per-draw tables into the same heap every frame, and
-        // each draw makes what its table shows in a slot of its own. Those
-        // were most of the 26,000 to 43,000 records a frame this pass
-        // mirrored in run 200 and in the play session after it, each then
-        // made and brought up to date once more by the pass over buffer
-        // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
-        // are mirrored too, as in run 200.
         if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
         let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
         let print = record_print(record) | 1;
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2010,14 +2093,271 @@ impl HostHeap {
             let Some(last) = copied.get_mut(index as usize) else {
                 return false;
             };
-            // A slot never looked at that holds nothing: as it was.
             if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
                 return false;
             }
             *last = print;
         }
-        self.mirror(index, handle, false);
+        self.mirror_words(index, handle, record_words(record), false, false);
         true
+    }
+
+    /// Batched [`HostHeap::mirror_copied`] over one already-read page buffer.
+    /// Returns `(looked, mirrored)`.
+    #[cfg(test)]
+    pub(crate) fn mirror_copied_page(
+        &self,
+        heap_start: u64,
+        step: u64,
+        mirrored_count: u32,
+        from: usize,
+        page_bytes: &[u8],
+    ) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let limit = mirrored_count.min(self.count);
+        let to = from.saturating_add(page_bytes.len());
+        let (first, end, offset) = page_slot_range(from, to, heap_start as usize, step, limit);
+        if first >= end {
+            return (0, 0);
+        }
+        let frame = crate::frame::current();
+        let check_tabled = !sync_tables() && tabled_out() && !self.tabled.is_empty();
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        let mut changed = Vec::new();
+        let (looked, tabled_skipped) = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            let copied_sub = &mut copied[first as usize..end as usize];
+            let tabled_sub = check_tabled.then(|| &self.tabled[first as usize..end as usize]);
+            scan_page_records(
+                page_bytes,
+                first,
+                end,
+                offset,
+                heap_start,
+                step as usize,
+                copied_sub,
+                tabled_sub,
+                now,
+                &mut changed,
+            )
+        };
+        if tabled_skipped != 0 {
+            COPIED_TABLED.fetch_add(tabled_skipped, Relaxed);
+        }
+        self.apply_changed_slots(&changed);
+        (looked, changed.len() as u64)
+    }
+
+    /// Batched [`super::sync_heaps`] over all changed `[from, to)` page ranges
+    /// of this heap. Reads pages with `crate::host::read_into_fast`, hoists
+    /// per-sync invariants (`frame`, `sync_tables`, `tabled_out`), locks
+    /// `self.copied` once across the scan (parallelizing reads and
+    /// fingerprinting across `crate::shadow::wide_run` for `>= 16` disjoint
+    /// pages), flushes `COPIED_TABLED` once, and mirrors only changed slots
+    /// using the already-copied record words.
+    ///
+    /// Returns `(pages_read, slots_looked, slots_mirrored)`.
+    pub(crate) fn mirror_copied_pages(
+        &self,
+        heap_start: u64,
+        step: u64,
+        mirrored_count: u32,
+        page_ranges: &[(usize, usize)],
+    ) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        const PARALLEL_PAGES: usize = 16;
+
+        let limit = mirrored_count.min(self.count);
+        let step_usize = step as usize;
+        let frame = crate::frame::current();
+        let check_tabled = !sync_tables() && tabled_out() && !self.tabled.is_empty();
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+
+        let mut plans: Vec<(usize, usize, u32, u32, usize)> = Vec::with_capacity(page_ranges.len());
+        let mut disjoint = true;
+        let mut prev_end = 0u32;
+        for &(from, to) in page_ranges {
+            let (first, end, offset) =
+                page_slot_range(from, to, heap_start as usize, step, limit);
+            if first < end {
+                if first < prev_end {
+                    disjoint = false;
+                }
+                prev_end = prev_end.max(end);
+            }
+            plans.push((from, to, first, end, offset));
+        }
+
+        let (pages, looked, tabled_skipped, changed_chunks): (u64, u64, u64, Vec<Vec<ChangedSlot>>) = {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+
+            if plans.len() >= PARALLEL_PAGES && disjoint {
+                let workers = (plans.len() / 8).clamp(2, 6);
+                let chunk_len = plans.len().div_ceil(workers);
+                let copied_ptr = copied.as_mut_ptr() as usize;
+                let tabled_ptr = self.tabled.as_ptr() as usize;
+                let results: Arc<Vec<Mutex<(u64, u64, u64, Vec<ChangedSlot>)>>> = Arc::new(
+                    (0..plans.len().div_ceil(chunk_len))
+                        .map(|_| Mutex::new((0, 0, 0, Vec::new())))
+                        .collect(),
+                );
+                let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(results.len());
+                for (chunk_idx, slice) in plans.chunks(chunk_len).enumerate() {
+                    let chunk_plans = slice.to_vec();
+                    let results = results.clone();
+                    jobs.push(Box::new(move || {
+                        let mut page_bytes = vec![0u8; crate::watch::PAGE];
+                        let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
+                        let mut changed = Vec::new();
+                        for (from, to, first, end, offset) in chunk_plans {
+                            let len = to.saturating_sub(from);
+                            if len > page_bytes.len() {
+                                page_bytes.resize(len, 0);
+                            }
+                            let buf = &mut page_bytes[..len];
+                            if crate::host::read_into_fast(from as *const u8, buf) {
+                                p += 1;
+                                if first < end {
+                                    let n = (end - first) as usize;
+                                    // SAFETY: `plans` verified strictly disjoint
+                                    // `[first, end)` ranges within `0..self.count`,
+                                    // `self.copied` is locked for the duration of
+                                    // `wide_run`, and `self.tabled` has `self.count`
+                                    // fixed-length atomics when `check_tabled`.
+                                    let copied_sub = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            (copied_ptr as *mut u64).add(first as usize),
+                                            n,
+                                        )
+                                    };
+                                    let tabled_sub = check_tabled.then(|| unsafe {
+                                        std::slice::from_raw_parts(
+                                            (tabled_ptr as *const std::sync::atomic::AtomicU32)
+                                                .add(first as usize),
+                                            n,
+                                        )
+                                    });
+                                    let (pl, pt) = scan_page_records(
+                                        buf,
+                                        first,
+                                        end,
+                                        offset,
+                                        heap_start,
+                                        step_usize,
+                                        copied_sub,
+                                        tabled_sub,
+                                        now,
+                                        &mut changed,
+                                    );
+                                    l += pl;
+                                    t += pt;
+                                }
+                            }
+                        }
+                        *results[chunk_idx].lock().unwrap_or_else(|e| e.into_inner()) =
+                            (p, l, t, changed);
+                    }));
+                }
+                crate::shadow::wide_run(jobs);
+                let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
+                let mut chunks = Vec::with_capacity(results.len());
+                for slot in results.iter() {
+                    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    p += guard.0;
+                    l += guard.1;
+                    t += guard.2;
+                    chunks.push(std::mem::take(&mut guard.3));
+                }
+                (p, l, t, chunks)
+            } else {
+                let mut page_bytes = vec![0u8; crate::watch::PAGE];
+                let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
+                let mut changed = Vec::new();
+                for (from, to, first, end, offset) in plans {
+                    let len = to.saturating_sub(from);
+                    if len > page_bytes.len() {
+                        page_bytes.resize(len, 0);
+                    }
+                    let buf = &mut page_bytes[..len];
+                    if crate::host::read_into_fast(from as *const u8, buf) {
+                        p += 1;
+                        if first < end {
+                            let copied_sub = &mut copied[first as usize..end as usize];
+                            let tabled_sub =
+                                check_tabled.then(|| &self.tabled[first as usize..end as usize]);
+                            let (pl, pt) = scan_page_records(
+                                buf,
+                                first,
+                                end,
+                                offset,
+                                heap_start,
+                                step_usize,
+                                copied_sub,
+                                tabled_sub,
+                                now,
+                                &mut changed,
+                            );
+                            l += pl;
+                            t += pt;
+                        }
+                    }
+                }
+                (p, l, t, vec![changed])
+            }
+        };
+
+        if tabled_skipped != 0 {
+            COPIED_TABLED.fetch_add(tabled_skipped, Relaxed);
+        }
+        let mut mirrored = 0u64;
+        for chunk in &changed_chunks {
+            mirrored += chunk.len() as u64;
+            self.apply_changed_slots(chunk);
+        }
+        (pages, looked, mirrored)
+    }
+
+    /// Mirrors a batch of changed slots in order: batches contiguous
+    /// non-`VIEW_TAG` slots under a single `self.made` lock (skipping never-made
+    /// slots with one load) and skips `fast`-hit `VIEW_TAG` slots without
+    /// looking up or cloning their `View`.
+    fn apply_changed_slots(&self, changed: &[ChangedSlot]) {
+        let fast_on = mirror_fast();
+        let mut i = 0;
+        while i < changed.len() {
+            let slot = changed[i];
+            if slot.words[0] != VIEW_TAG {
+                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                while i < changed.len() && changed[i].words[0] != VIEW_TAG {
+                    let index = changed[i].index;
+                    if made[index as usize] != 0 {
+                        made[index as usize] = 0;
+                        self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
+                        self.make_null(index);
+                        let _ = self.note_buffer(index, None, false);
+                    }
+                    i += 1;
+                }
+            } else {
+                let [_, idx_word, generation] = slot.words;
+                let key = u64::from(generation) << 32 | u64::from(idx_word);
+                if !(key != 0
+                    && fast_on
+                    && self.fast[slot.index as usize]
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == key)
+                {
+                    self.mirror_words(slot.index, slot.handle, slot.words, false, false);
+                }
+                i += 1;
+            }
+        }
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2040,17 +2380,37 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_words(index, handle, words, for_draw, true)
+    }
+
+    /// Core of [`HostHeap::mirror`], taking the record's `[tag, i, generation]`
+    /// words directly so callers with a copied page buffer avoid re-reading
+    /// title memory. When `return_view` is false, a `fast`-hit slot returns
+    /// without looking up and cloning its `View`.
+    fn mirror_words(
+        &self,
+        index: u32,
+        handle: u64,
+        words: [u32; 3],
+        for_draw: bool,
+        return_view: bool,
+    ) -> Option<View> {
+        let [tag, i, generation] = words;
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this very record already: nothing to do, and nothing
         // to wait for (`fast`; `VICTORY_MIRROR_FAST=0` takes the lock, as
         // before).
-        if tag == VIEW_TAG && key != 0 && mirror_fast() && self.fast[index as usize].load(std::sync::atomic::Ordering::Acquire) == key {
-            return view_at(i, generation);
+        if tag == VIEW_TAG
+            && key != 0
+            && mirror_fast()
+            && self.fast[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+        {
+            return return_view.then(|| view_at(i, generation)).flatten();
         }
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -2092,11 +2452,16 @@ impl HostHeap {
             // time it got sharper.
             if later
                 && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
+                && made[index as usize] != 0
+                && matches!(&view, View::Placed(false, r, _) if r[0] != 1)
+                && view_at(
+                    made[index as usize] as u32,
+                    (made[index as usize] >> 32) as u32,
+                )
+                .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                return return_view.then_some(view);
             }
             self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
             // A view the title writes of a texture it fills whose host copy
@@ -2115,7 +2480,7 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.keep(index, Kept::Empty);
                 EMPTY_AT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                return return_view.then_some(view);
             }
             made[index as usize] = if later { 0 } else { key };
             // The making itself without the heap's lock: it may make a host
@@ -2138,7 +2503,7 @@ impl HostHeap {
                 self.fast[index as usize].store(key, std::sync::atomic::Ordering::Release);
             }
         }
-        Some(view)
+        return_view.then_some(view)
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -2399,6 +2764,238 @@ fn record_print(record: &[u8]) -> u64 {
         h = (h ^ u64::from(b)).wrapping_mul(K);
     }
     h ^ (h >> 32)
+}
+
+/// Specialized [`record_print`] for 32-byte view descriptor records (bit-for-bit
+/// identical to `record_print` on 32 bytes).
+#[inline]
+fn record_print_4(w0: u64, w1: u64, w2: u64, w3: u64) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h = K ^ 32u64;
+    h = (h ^ w0).wrapping_mul(K);
+    h ^= h >> 29;
+    h = (h ^ w1).wrapping_mul(K);
+    h ^= h >> 29;
+    h = (h ^ w2).wrapping_mul(K);
+    h ^= h >> 29;
+    h = (h ^ w3).wrapping_mul(K);
+    h ^= h >> 29;
+    h ^ (h >> 32)
+}
+
+/// Specialized [`record_print`] for 16-byte sampler descriptor records
+/// (bit-for-bit identical to `record_print` on 16 bytes).
+#[inline]
+fn record_print_2(w0: u64, w1: u64) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h = K ^ 16u64;
+    h = (h ^ w0).wrapping_mul(K);
+    h ^= h >> 29;
+    h = (h ^ w1).wrapping_mul(K);
+    h ^= h >> 29;
+    h ^ (h >> 32)
+}
+
+/// Extracts `[tag, i, generation]` from a copied record slice without touching
+/// title memory.
+#[inline]
+fn record_words(record: &[u8]) -> [u32; 3] {
+    if record.len() < 12 {
+        return [0; 3];
+    }
+    [
+        u32::from_le_bytes(record[0..4].try_into().unwrap()),
+        u32::from_le_bytes(record[4..8].try_into().unwrap()),
+        u32::from_le_bytes(record[8..12].try_into().unwrap()),
+    ]
+}
+
+#[derive(Clone, Copy)]
+struct ChangedSlot {
+    index: u32,
+    handle: u64,
+    words: [u32; 3],
+}
+
+/// Complete title descriptor slots `(first, end, byte_offset)` lying wholly
+/// within `[from, to)` that have host counterparts (`< mirrored_count`).
+fn page_slot_range(
+    from: usize,
+    to: usize,
+    heap_start: usize,
+    step: u64,
+    mirrored_count: u32,
+) -> (u32, u32, usize) {
+    if to <= from || to <= heap_start || step == 0 || mirrored_count == 0 {
+        return (0, 0, 0);
+    }
+    let rel_from = from.saturating_sub(heap_start) as u64;
+    let rel_to = (to - heap_start) as u64;
+    let first = rel_from.div_ceil(step);
+    let end = (rel_to / step).min(u64::from(mirrored_count));
+    if first >= end {
+        return (0, 0, 0);
+    }
+    let first_addr = heap_start + (first * step) as usize;
+    (first as u32, end as u32, first_addr - from)
+}
+
+/// Scans one copied page's complete descriptor records, updating `copied_sub`
+/// fingerprints and collecting changed slots into `changed`.
+/// Returns `(looked, tabled_skipped)`.
+#[allow(clippy::too_many_arguments)]
+fn scan_page_records(
+    page_bytes: &[u8],
+    first: u32,
+    end: u32,
+    offset: usize,
+    heap_start: u64,
+    step: usize,
+    copied_sub: &mut [u64],
+    tabled_sub: Option<&[std::sync::atomic::AtomicU32]>,
+    now: u32,
+    changed: &mut Vec<ChangedSlot>,
+) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let count = (end - first) as usize;
+    if count == 0 {
+        return (0, 0);
+    }
+    let slice = &page_bytes[offset..offset + count * step];
+    let mut tabled_skipped = 0u64;
+    match step {
+        32 => {
+            let chunks = slice.chunks_exact(32);
+            if let Some(tabled) = tabled_sub {
+                for (k, (rec, (last, stamp_atom))) in chunks
+                    .zip(copied_sub.iter_mut().zip(tabled.iter()))
+                    .enumerate()
+                {
+                    let stamp = stamp_atom.load(Relaxed) & !TABLED_READ;
+                    if stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES {
+                        tabled_skipped += 1;
+                        continue;
+                    }
+                    let w0 = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+                    let w1 = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+                    let w2 = u64::from_le_bytes(rec[16..24].try_into().unwrap());
+                    let w3 = u64::from_le_bytes(rec[24..32].try_into().unwrap());
+                    if *last == 0 && (w0 | w1 | w2 | w3) == 0 {
+                        continue;
+                    }
+                    let print = record_print_4(w0, w1, w2, w3) | 1;
+                    if *last == print {
+                        continue;
+                    }
+                    *last = print;
+                    let index = first + k as u32;
+                    changed.push(ChangedSlot {
+                        index,
+                        handle: heap_start + u64::from(index) * 32,
+                        words: [w0 as u32, (w0 >> 32) as u32, w1 as u32],
+                    });
+                }
+            } else {
+                for (k, (rec, last)) in chunks.zip(copied_sub.iter_mut()).enumerate() {
+                    let w0 = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+                    let w1 = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+                    let w2 = u64::from_le_bytes(rec[16..24].try_into().unwrap());
+                    let w3 = u64::from_le_bytes(rec[24..32].try_into().unwrap());
+                    if *last == 0 && (w0 | w1 | w2 | w3) == 0 {
+                        continue;
+                    }
+                    let print = record_print_4(w0, w1, w2, w3) | 1;
+                    if *last == print {
+                        continue;
+                    }
+                    *last = print;
+                    let index = first + k as u32;
+                    changed.push(ChangedSlot {
+                        index,
+                        handle: heap_start + u64::from(index) * 32,
+                        words: [w0 as u32, (w0 >> 32) as u32, w1 as u32],
+                    });
+                }
+            }
+        }
+        16 => {
+            let chunks = slice.chunks_exact(16);
+            if let Some(tabled) = tabled_sub {
+                for (k, (rec, (last, stamp_atom))) in chunks
+                    .zip(copied_sub.iter_mut().zip(tabled.iter()))
+                    .enumerate()
+                {
+                    let stamp = stamp_atom.load(Relaxed) & !TABLED_READ;
+                    if stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES {
+                        tabled_skipped += 1;
+                        continue;
+                    }
+                    let w0 = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+                    let w1 = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+                    if *last == 0 && (w0 | w1) == 0 {
+                        continue;
+                    }
+                    let print = record_print_2(w0, w1) | 1;
+                    if *last == print {
+                        continue;
+                    }
+                    *last = print;
+                    let index = first + k as u32;
+                    changed.push(ChangedSlot {
+                        index,
+                        handle: heap_start + u64::from(index) * 16,
+                        words: [w0 as u32, (w0 >> 32) as u32, w1 as u32],
+                    });
+                }
+            } else {
+                for (k, (rec, last)) in chunks.zip(copied_sub.iter_mut()).enumerate() {
+                    let w0 = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+                    let w1 = u64::from_le_bytes(rec[8..16].try_into().unwrap());
+                    if *last == 0 && (w0 | w1) == 0 {
+                        continue;
+                    }
+                    let print = record_print_2(w0, w1) | 1;
+                    if *last == print {
+                        continue;
+                    }
+                    *last = print;
+                    let index = first + k as u32;
+                    changed.push(ChangedSlot {
+                        index,
+                        handle: heap_start + u64::from(index) * 16,
+                        words: [w0 as u32, (w0 >> 32) as u32, w1 as u32],
+                    });
+                }
+            }
+        }
+        _ => {
+            for (k, (rec, last)) in slice.chunks_exact(step).zip(copied_sub.iter_mut()).enumerate()
+            {
+                if let Some(tabled) = tabled_sub {
+                    let stamp = tabled[k].load(Relaxed) & !TABLED_READ;
+                    if stamp != 0 && u64::from(now.wrapping_sub(stamp)) <= TABLED_FRAMES {
+                        tabled_skipped += 1;
+                        continue;
+                    }
+                }
+                if *last == 0 && rec.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                let print = record_print(rec) | 1;
+                if *last == print {
+                    continue;
+                }
+                *last = print;
+                let index = first + k as u32;
+                changed.push(ChangedSlot {
+                    index,
+                    handle: heap_start + u64::from(index) * step as u64,
+                    words: record_words(rec),
+                });
+            }
+        }
+    }
+    (count as u64, tabled_skipped)
 }
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own
@@ -4128,6 +4725,229 @@ mod tests {
         drop(shadow);
         crate::shadow::unregister(base as usize, base);
     }
+
+    #[test]
+    fn page_slot_range_matches_whole_records_within_page() {
+        let start = 0x1000usize;
+        let step = 32u64;
+        // Aligned full range, capped at 5 slots.
+        assert_eq!(page_slot_range(start, start + 10 * 32, start, step, 5), (0, 5, 0));
+        // Straddling start and end: slot 3 starts before `from`, slot 4 extends past `to`.
+        assert_eq!(
+            page_slot_range(start + 3 * 32 + 4, start + 4 * 32 + 8, start, step, 5),
+            (0, 0, 0)
+        );
+        // Unaligned `from` skips straddling slot 0, includes complete slots 1 and 2, excludes straddling slot 3.
+        assert_eq!(
+            page_slot_range(start + 4, start + 3 * 32 + 4, start, step, 10),
+            (1, 3, 28)
+        );
+        // Past cap.
+        assert_eq!(
+            page_slot_range(start + 6 * 32, start + 9 * 32, start, step, 5),
+            (0, 0, 0)
+        );
+        // Empty range.
+        assert_eq!(page_slot_range(start, start, start, step, 10), (0, 0, 0));
+    }
+
+    #[test]
+    fn read_into_fast_handles_mapped_empty_and_unmapped_memory() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        let src: Vec<u8> = (0..4096usize).map(|i| (i.wrapping_mul(31) ^ 0xA5) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        assert!(crate::host::read_into_fast(src.as_ptr(), &mut dst));
+        assert_eq!(dst, src);
+
+        // Empty slice succeeds even with null pointer.
+        let mut empty = [];
+        assert!(crate::host::read_into_fast(std::ptr::null(), &mut empty));
+
+        // Reserved (uncommitted) page must return false without faulting.
+        // SAFETY: reserves an uncommitted page owned by this test.
+        let unmapped = unsafe { VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!unmapped.is_null());
+        let mut probe = vec![0xCCu8; 4096];
+        assert!(!crate::host::read_into_fast(unmapped.cast::<u8>(), &mut probe));
+        // SAFETY: releases the reservation above.
+        unsafe { VirtualFree(unmapped, 0, MEM_RELEASE) };
+    }
+
+    /// Batched `mirror_copied_page` matches per-slot `mirror_copied` across
+    /// zero slots, unchanged slots, tabled slots, `VIEW_TAG` vs raw bytes,
+    /// trailing-byte changes on a made slot, and clearing a made slot.
+    #[test]
+    fn mirror_copied_page_matches_per_slot_mirror_copied() {
+        let Some(batched) = HostHeap::new(false, 16) else {
+            return; // no host GPU
+        };
+        let Some(single) = HostHeap::new(false, 16) else {
+            return;
+        };
+        let step = 32usize;
+        let mut page = vec![0u8; 16 * step];
+        let heap_start = page.as_ptr() as u64;
+
+        // Create a valid `VIEW_TAG` record (a View::Shader(0, None) — non-buffer,
+        // non-waiting, so `mirror` marks `made[slot] = key` and `fast[slot] = key`).
+        let mut srv_slot = [0u8; 32];
+        super::super::create_srv(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            srv_slot.as_mut_ptr() as u64,
+        );
+        // Create a constant buffer view (`later == true`, so `made` stays 0).
+        let mut cbv_slot = [0u8; 32];
+        super::super::create_cbv(
+            std::ptr::null(),
+            &[0x1000, 0, 256, 0],
+            cbv_slot.as_mut_ptr() as u64,
+        );
+
+        // Slot 0: zero-initialized (untouched).
+        // Slot 1: valid SRV (`VIEW_TAG`).
+        page[step..2 * step].copy_from_slice(&srv_slot);
+        // Slot 2: non-`VIEW_TAG` raw title bytes.
+        page[2 * step..3 * step].fill(0xAB);
+        // Slot 3: valid SRV, but marked tabled in the current frame -> skipped!
+        page[3 * step..4 * step].copy_from_slice(&srv_slot);
+        let frame = crate::frame::current();
+        batched.tabled_in(3, true, frame);
+        single.tabled_in(3, true, frame);
+        // Slot 4: valid CBV (`VIEW_TAG`, `later = true`).
+        page[4 * step..5 * step].copy_from_slice(&cbv_slot);
+
+        let before_tabled = COPIED_TABLED.load(std::sync::atomic::Ordering::Relaxed);
+        let (looked, mirrored) = batched.mirror_copied_page(heap_start, step as u64, 16, heap_start as usize, &page);
+        let tabled_batched = COPIED_TABLED.load(std::sync::atomic::Ordering::Relaxed) - before_tabled;
+
+        let before_tabled_single = COPIED_TABLED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut single_mirrored = 0u64;
+        for idx in 0..16u32 {
+            let rec = &page[idx as usize * step..(idx as usize + 1) * step];
+            if single.mirror_copied(idx, heap_start + u64::from(idx) * step as u64, rec) {
+                single_mirrored += 1;
+            }
+        }
+        let tabled_single = COPIED_TABLED.load(std::sync::atomic::Ordering::Relaxed) - before_tabled_single;
+
+        assert_eq!(looked, 16);
+        assert_eq!(mirrored, 3, "slots 1, 2, 4 changed; slot 0 zero, slot 3 tabled");
+        assert_eq!(mirrored, single_mirrored);
+        assert_eq!(tabled_batched, 1);
+        assert_eq!(tabled_batched, tabled_single);
+        for idx in 0..16u32 {
+            assert_eq!(batched.made(idx), single.made(idx), "pass 1 slot {idx}");
+        }
+        assert!(batched.made(1));
+        assert!(!batched.made(0));
+        assert!(!batched.made(2));
+        assert!(!batched.made(3));
+        assert!(!batched.made(4));
+
+        // Second pass with identical page: 0 slots mirrored.
+        let (looked2, mirrored2) =
+            batched.mirror_copied_page(heap_start, step as u64, 16, heap_start as usize, &page);
+        assert_eq!(looked2, 16);
+        assert_eq!(mirrored2, 0);
+
+        // Mutate trailing bytes (12..32) of made slot 1 while keeping [tag, i, gen]:
+        // fingerprint changes -> mirrored == 1, fast path keeps `made(1) == true`.
+        page[step + 16] ^= 0xFF;
+        let (_, mirrored3) =
+            batched.mirror_copied_page(heap_start, step as u64, 16, heap_start as usize, &page);
+        assert_eq!(mirrored3, 1);
+        assert!(batched.made(1));
+
+        // Overwrite made slot 1 with all zeros -> must mirror and clear `made(1)` to false!
+        page[step..2 * step].fill(0);
+        let (_, mirrored4) =
+            batched.mirror_copied_page(heap_start, step as u64, 16, heap_start as usize, &page);
+        assert_eq!(mirrored4, 1);
+        assert!(!batched.made(1), "zeroing a previously made slot clears made");
+
+        // Re-populate slot 1 and then overwrite with non-VIEW_TAG raw bytes -> clears `made(1)`.
+        page[step..2 * step].copy_from_slice(&srv_slot);
+        let (_, mirrored5) =
+            batched.mirror_copied_page(heap_start, step as u64, 16, heap_start as usize, &page);
+        assert_eq!(mirrored5, 1);
+        assert!(batched.made(1));
+        page[step..2 * step].fill(0x55);
+        let (_, mirrored6) =
+            batched.mirror_copied_page(heap_start, step as u64, 16, heap_start as usize, &page);
+        assert_eq!(mirrored6, 1);
+        assert!(!batched.made(1), "overwriting a made slot with raw bytes clears made");
+    }
+
+    /// `mirror_copied_pages` handles unmapped pages safely and runs the
+    /// parallel scan path (`>= 16` pages) identically to sequential scanning.
+    #[test]
+    fn mirror_copied_pages_parallel_and_unmapped_fallback() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        const PAGES: usize = 20;
+        const PAGE_BYTES: usize = crate::watch::PAGE;
+        const SLOTS_PER_PAGE: usize = PAGE_BYTES / 32;
+        let total_slots = (PAGES * SLOTS_PER_PAGE) as u32;
+        let Some(heap) = HostHeap::new(false, total_slots) else {
+            return; // no host GPU
+        };
+        let mut backing = vec![0u8; PAGES * PAGE_BYTES];
+        let heap_start = backing.as_ptr() as u64;
+
+        let mut srv_slot = [0u8; 32];
+        super::super::create_srv(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            srv_slot.as_mut_ptr() as u64,
+        );
+        // Write one valid SRV and one raw non-view slot on every page.
+        for p in 0..PAGES {
+            let base = p * PAGE_BYTES;
+            backing[base + 32..base + 64].copy_from_slice(&srv_slot);
+            backing[base + 64..base + 96].fill(0x7E);
+        }
+
+        let ranges: Vec<(usize, usize)> = (0..PAGES)
+            .map(|p| {
+                let from = backing.as_ptr() as usize + p * PAGE_BYTES;
+                (from, from + PAGE_BYTES)
+            })
+            .collect();
+        let (pages, looked, mirrored) =
+            heap.mirror_copied_pages(heap_start, 32, total_slots, &ranges);
+        assert_eq!(pages, PAGES as u64);
+        assert_eq!(looked, u64::from(total_slots));
+        assert_eq!(mirrored, (PAGES * 2) as u64);
+        for p in 0..PAGES {
+            let slot = (p * SLOTS_PER_PAGE + 1) as u32;
+            assert!(heap.made(slot), "page {p} slot {slot} must be made");
+            assert!(!heap.made(slot + 1), "page {p} raw slot must stay unmade");
+        }
+
+        // Second parallel pass with no changes: 0 mirrored.
+        let (pages2, looked2, mirrored2) =
+            heap.mirror_copied_pages(heap_start, 32, total_slots, &ranges);
+        assert_eq!(pages2, PAGES as u64);
+        assert_eq!(looked2, u64::from(total_slots));
+        assert_eq!(mirrored2, 0);
+
+        // Unmapped page range is skipped cleanly without faulting.
+        // SAFETY: uncommitted reservation owned by this test.
+        let unmapped = unsafe { VirtualAlloc(std::ptr::null(), PAGE_BYTES, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!unmapped.is_null());
+        let unmapped_from = unmapped as usize;
+        let (p_unmapped, l_unmapped, m_unmapped) = heap.mirror_copied_pages(
+            unmapped_from as u64,
+            32,
+            SLOTS_PER_PAGE as u32,
+            &[(unmapped_from, unmapped_from + PAGE_BYTES)],
+        );
+        assert_eq!((p_unmapped, l_unmapped, m_unmapped), (0, 0, 0));
+        // SAFETY: releases the reservation above.
+        unsafe { VirtualFree(unmapped, 0, MEM_RELEASE) };
+    }
 }
 
 #[cfg(test)]
@@ -4152,6 +4972,12 @@ mod record_print_tests {
         assert_ne!(record_print(&[0u8; 32]), record_print(&[0u8; 16]));
         // A record of zeros is told from "never looked at" by the caller's `| 1`.
         assert_ne!(record_print(&[0u8; 32]) | 1, 0);
+        // Specialized 32-byte and 16-byte hashers are bit-for-bit identical to `record_print`.
+        let w = |off: usize| u64::from_le_bytes(record[off..off + 8].try_into().unwrap());
+        assert_eq!(super::record_print_4(w(0), w(8), w(16), w(24)), print);
+        assert_eq!(super::record_print_2(w(0), w(8)), record_print(&record[..16]));
+        assert_eq!(super::record_print_4(0, 0, 0, 0), record_print(&[0u8; 32]));
+        assert_eq!(super::record_print_2(0, 0), record_print(&[0u8; 16]));
     }
 }
 

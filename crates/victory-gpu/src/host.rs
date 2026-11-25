@@ -7911,6 +7911,25 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// Reads title memory at `src` into `dst`; false if a page of it is not
+/// readable. When `VICTORY_FAST_COPY=1`, copies in-process with
+/// [`victory_copy_try`] and falls back to the kernel read only on a fault,
+/// preserving unmapped-page safety without a syscall per mapped page.
+pub(crate) fn read_into_fast(src: *const u8, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    if fast_fill() {
+        // SAFETY: `dst` is mapped writable memory of `dst.len()` bytes; a
+        // fault on `src` is caught by `fast_fill`'s vectored handler and
+        // returns 0.
+        if unsafe { victory_copy_try(dst.as_mut_ptr(), src, dst.len()) } != 0 {
+            return true;
+        }
+    }
+    read(src, dst.as_mut_ptr(), dst.len())
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
