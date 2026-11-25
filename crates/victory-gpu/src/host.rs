@@ -7295,9 +7295,9 @@ fn rebar_policy(
     } else if budget <= 14 * GIB {
         (true, 512 * MIB)
     } else if budget < 20 * GIB {
-        (true, 2 * GIB)
+        (true, GIB)
     } else {
-        (true, (budget / 4).min(8 * GIB))
+        (true, (budget / 16).clamp(GIB, 2 * GIB))
     }
 }
 
@@ -9422,28 +9422,25 @@ mod rebar_tests {
             (true, 512 * MIB)
         );
 
-        // 16 GiB tier: 2 GiB shadow budget.
-        assert_eq!(
-            rebar_policy(true, false, Some(16 * GIB), true),
-            (true, 2 * GIB)
-        );
+        // 16 GiB tier: 1 GiB shadow budget.
+        assert_eq!(rebar_policy(true, false, Some(16 * GIB), true), (true, GIB));
 
-        // 20–32+ GiB tier: 25% of local VRAM budget capped at 8 GiB.
+        // 20–32+ GiB tier: 1/16 of local VRAM budget clamped to 1–2 GiB to bound WDDM commit.
         assert_eq!(
             rebar_policy(true, false, Some(20 * GIB), true),
-            (true, 5 * GIB)
+            (true, 1280 * MIB)
         );
         assert_eq!(
             rebar_policy(true, false, Some(24 * GIB), true),
-            (true, 6 * GIB)
+            (true, 1536 * MIB)
         );
         assert_eq!(
             rebar_policy(true, false, Some(32 * GIB), true),
-            (true, 8 * GIB)
+            (true, 2 * GIB)
         );
         assert_eq!(
             rebar_policy(true, false, Some(48 * GIB), true),
-            (true, 8 * GIB)
+            (true, 2 * GIB)
         );
     }
 

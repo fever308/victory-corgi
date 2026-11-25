@@ -4217,37 +4217,35 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    // Keep unbounded loose 4 MiB windows in system memory (unless `window_card_for`
+    // places them on the card) so they cannot starve registered title buffers out
+    // of the bounded ReBAR budget.
+    let (buffer, data) = host()?.shared_buffer(len)?;
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
-    // buffer there, and the CPU's staging side stays in system memory.
-    let (buffer, data, card, rebar_bytes) = match window_card_for(len) {
+    // buffer there, and the one just made is the CPU's side.
+    let (buffer, card) = match window_card_for(len) {
         Some(on_card) => {
-            let (staging, data) = host()?.shared_buffer(len)?;
-            crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging,
+                staging: buffer,
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
             };
-            (on_card, data, Some(card), None)
+            (on_card, Some(card))
         }
-        None => {
-            let (buffer, data, rebar_bytes) = alloc_shadow_buffer(len)?;
-            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-            (buffer, data, None, rebar_bytes)
-        }
+        None => (buffer, None),
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
-        rebar = rebar_bytes.is_some(),
         "loose memory copied to the host"
     );
-    let mut shadow = Shadow::new(buffer, data, gpu, start, len, rebar_bytes);
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len, None);
     shadow.window = true;
     shadow.card = card;
     let shadow = Arc::new(shadow);
