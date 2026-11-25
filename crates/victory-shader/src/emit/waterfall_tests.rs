@@ -91,6 +91,7 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
         group_split: 1,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

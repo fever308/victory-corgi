@@ -424,7 +424,13 @@ impl State {
     /// shortcut: a view whose record is the same but whose resource
     /// changed state on this list meanwhile by a path that does not call
     /// `seen_gone` is not brought back to a readable state.
-    fn tables_key(&self, used: &[UsedResource], indexed: &[RootIndexedView], compute: bool) -> Option<u64> {
+    fn tables_key(
+        &self,
+        used: &[UsedResource],
+        indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
+        compute: bool,
+    ) -> Option<u64> {
         const K: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut h: u64 = if compute { 0x51 } else { 0x7 };
         let mut mix = |v: u64| h = (h.rotate_left(27) ^ v).wrapping_mul(K);
@@ -468,6 +474,9 @@ impl State {
             mix(u64::from(k) << 8 | u64::from(index.table_slot) | 1 << 48);
             mix(x);
             mix(y);
+        }
+        for &(slot, at) in half {
+            mix(u64::from(at) << 8 | u64::from(slot) | 1 << 56);
         }
         Some(h)
     }
@@ -833,6 +842,17 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     Some(gpu)
 }
 
+/// The last byte of the root view at `address` four dwords can be read from:
+/// to the end of its host copy ([`root_view`]).
+fn root_limit(address: u64) -> u32 {
+    crate::shadow::find(address, 1).map_or(0, |s| {
+        s.left(address)
+            .saturating_sub(16)
+            .min(u64::from(u32::MAX) - 16) as u32
+            & !3
+    })
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1173,10 +1193,26 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_MESH_ROW, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_GROUP_BASE, USER_MEMORY_BASE, USER_MESH_ROW, USER_ROOT_LIMIT, USER_VIEW_ADDRESS,
+            USER_VIEW_BIAS,
+        };
         // Set per mesh dispatch (`dispatch_mesh`, the indirect signature): 0, one row.
         if kind == USER_MESH_ROW || kind == USER_MESH_ROW + 1 {
             return 0;
+        }
+        if kind == USER_GROUP_BASE {
+            // The first group of the dispatch being bound: 0 until a split
+            // dispatch sets it before each run but the first (`State::dispatch`),
+            // or the second execution of an indirect compute record split at
+            // 65,535 groups (`group_base_word`).
+            return 0;
+        }
+        if kind == USER_ROOT_LIMIT {
+            return match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => root_limit(address),
+                _ => 0,
+            };
         }
         // A traced shader's: which lane it records (`crate::debugger::trace`).
         if (victory_shader::emit::USER_TRACE..victory_shader::emit::USER_TRACE + 8).contains(&kind) {
@@ -1478,7 +1514,7 @@ impl State {
                     self.tables_memo_copies = copies;
                     self.tables_memo.clear();
                 }
-                self.tables_key(&t.used, &t.host.root_indexed_views, compute)
+                self.tables_key(&t.used, &t.host.root_indexed_views, &t.host.half_views, compute)
             } else {
                 None
             };
@@ -1486,8 +1522,13 @@ impl State {
             let made: &[(u8, u32)] = match key {
                 Some(k) => {
                     if !self.tables_memo.contains_key(&k) {
-                        let computed =
-                            self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+                        let computed = self.tables(
+                            list,
+                            &t.used,
+                            &t.host.root_indexed_views,
+                            &t.host.half_views,
+                            compute,
+                        );
                         if computed.iter().any(|m| m.1 == u32::MAX) {
                             owned_made = computed;
                             &owned_made
@@ -1500,7 +1541,13 @@ impl State {
                     }
                 }
                 None => {
-                    owned_made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+                    owned_made = self.tables(
+                        list,
+                        &t.used,
+                        &t.host.root_indexed_views,
+                        &t.host.half_views,
+                        compute,
+                    );
                     &owned_made
                 }
             };
@@ -2671,6 +2718,44 @@ impl State {
         });
     }
 
+    /// The most groups the host runs in one dimension of a dispatch. The
+    /// console's own limit is higher (a builder pass asks for 77,500 in
+    /// `x`): a dispatch beyond it is run as several ([`State::dispatch`]).
+    const MOST_GROUPS: u32 = 65_535;
+
+    /// Where a compute stage's group-ID base is bound, if the stage reads its
+    /// group id in x: its user-data root parameter and the dword in it
+    /// (`victory_shader::emit::USER_GROUP_BASE`).
+    fn group_base_slot(p: &HostPipeline) -> Option<(u32, u32)> {
+        for stage in &p.stages {
+            let Some((param, _)) = stage.user_data else {
+                continue;
+            };
+            let t = stage.translated();
+            if let Some(u) = t
+                .host
+                .user_data
+                .iter()
+                .find(|u| u.root == RootType::Other(victory_shader::emit::USER_GROUP_BASE))
+            {
+                return Some((param, u.index));
+            }
+        }
+        None
+    }
+
+    /// Sets the group-ID base of the next run of a split dispatch.
+    fn set_group_base(list: &HostList, compute: bool, (param, dword): (u32, u32), base: u32) {
+        // SAFETY: an open list whose root signature has that parameter.
+        unsafe {
+            if compute {
+                list.list.SetComputeRoot32BitConstant(param, base, dword);
+            } else {
+                list.list.SetGraphicsRoot32BitConstant(param, base, dword);
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         self.seen_gone();
@@ -2756,8 +2841,48 @@ impl State {
         } else {
             z
         };
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        // The host runs at most 65,535 groups in a dimension. A console
+        // dispatch over that runs as several, each with the group id where
+        // it starts (the translated program adds
+        // `victory_shader::emit::USER_GROUP_BASE` to its group id in x).
+        match Self::group_base_slot(p) {
+            Some(slot) if x > Self::MOST_GROUPS => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(
+                        x,
+                        runs = x.div_ceil(Self::MOST_GROUPS),
+                        "a dispatch asks for more groups in x than the host runs: it runs in pieces, each told where its \
+                         groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
+                    );
+                });
+                let mut at = 0;
+                while at < x {
+                    let n = (x - at).min(Self::MOST_GROUPS);
+                    if at != 0 {
+                        Self::set_group_base(list, true, slot, at);
+                    }
+                    // SAFETY: an open list with everything set.
+                    unsafe { list.list.Dispatch(n, y, z) };
+                    at += n;
+                }
+                Self::set_group_base(list, true, slot, 0);
+            }
+            _ => {
+                if x > Self::MOST_GROUPS {
+                    once!(
+                        x,
+                        "a dispatch asks for more groups in x than the host runs and its program reads no group id: the \
+                         groups after 65,535 do not run"
+                    );
+                }
+                // No group id to move: the groups after the host's limit
+                // cannot be run at all (a count over it the host does not
+                // give its driver either).
+                // SAFETY: an open list with everything set.
+                unsafe { list.list.Dispatch(x.min(Self::MOST_GROUPS), y, z) };
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::debugger::pixel::after(list, probe);
         list.count_write();
@@ -3197,11 +3322,18 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
@@ -3211,6 +3343,36 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and
+        // the title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -3274,10 +3436,13 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
+            // The descriptors the shader moves halves through count too: one
+            // past every entry was left out of the table.
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
+                .chain(half.iter().filter(|&&(s, _)| s == slot).map(|&(_, at)| at / 8))
                 .max()
                 .unwrap_or(0)
                 + 1;
@@ -3296,6 +3461,9 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    half.contains(&(slot, k * 8)).hash(&mut h);
                 }
                 (table, n, h.finish())
             };
@@ -3360,7 +3528,10 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -3832,6 +4003,13 @@ impl State {
             None
         };
         let inline = before.is_none();
+        // A program that reads its group id in x: where it takes the first
+        // group of the dispatch (root parameter, dword), and where the
+        // second records begin once they are made. (Dispatches are never
+        // hoisted or clamped in windows, so only the inline non-window path
+        // below sees one.)
+        let group_base = if kind == DISPATCH { group_base_word(p) } else { None };
+        let mut second: Option<((u32, u32), u64)> = None;
         let (bounded, at) = match before {
             Some(hoisted) => {
                 self.window = None;
@@ -3902,6 +4080,11 @@ impl State {
                         // whose unfilled slots must not spend the list's budget.
                         let bounded = if windowed && records > 1 {
                             crate::indirect::bound_ahead(list, (&args.buffer, offset), (clamp_kind, step, records))
+                        } else if let Some(base) = group_base {
+                            // The groups past 65,535 in x run as second records,
+                            // `records` records on in the scratch buffer.
+                            second = Some((base, u64::from(step) * u64::from(records)));
+                            crate::indirect::bound_split(list, (&args.buffer, offset), count_arg, (clamp_kind, step, records))
                         } else {
                             crate::indirect::bound(list, (&args.buffer, offset), count_arg, (clamp_kind, step, records))
                         };
@@ -3969,6 +4152,25 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        // The groups past 65,535 in x: the second records, with the first
+        // group in x at 65,535 (a dispatch runs at most 65,535 groups in
+        // each dimension). Records that asked for fewer run no groups here.
+        if let Some(((param, dword), offset)) = second {
+            // SAFETY: as above; the compute root signature bound has the
+            // user-data parameter `param` with dword `dword`.
+            unsafe {
+                list.list.SetComputeRoot32BitConstant(param, 65535, dword);
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &bounded,
+                    at + offset,
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+                list.list.SetComputeRoot32BitConstant(param, 0, dword);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::debugger::pixel::after(list, probe);
         if kind == MESH {
@@ -3985,6 +4187,18 @@ impl State {
         }
         true
     }
+}
+
+/// Where the compute program of `p` takes the first thread group of its
+/// dispatch in x (`victory_shader::emit::USER_GROUP_BASE`): its user-data
+/// root parameter and dword. `None` if it does not read the group id in x,
+/// or with `VICTORY_DISPATCH_SPLIT=0`.
+fn group_base_word(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DISPATCH_SPLIT").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    State::group_base_slot(p)
 }
 
 /// The host command signature of mesh records clamped as rows

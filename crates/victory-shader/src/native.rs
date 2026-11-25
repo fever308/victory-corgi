@@ -356,6 +356,11 @@ pub enum RootType {
 }
 
 impl RootType {
+    /// Not the title's: the last byte reads of a root view may start at, as
+    /// user data (root views have no bounds); matches
+    /// [`crate::emit::USER_ROOT_LIMIT`].
+    pub const LIMIT: RootType = RootType::Other(0x107);
+
     fn from_raw(raw: u32) -> Self {
         match raw {
             0 => RootType::Constants,

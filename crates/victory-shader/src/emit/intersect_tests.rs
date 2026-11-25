@@ -189,6 +189,7 @@ fn build(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         group_split: 1,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

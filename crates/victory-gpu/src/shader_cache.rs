@@ -247,6 +247,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
         }
     }
     word(&mut out, s.group_split);
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -316,6 +321,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         });
     }
     let group_split = r.word().filter(|&n| (1..=16).contains(&n))?;
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -327,6 +337,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         group_split,
+        half_views,
     })
 }
 
@@ -362,6 +373,7 @@ mod tests {
                 shift: 5,
             }],
             group_split: 1,
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

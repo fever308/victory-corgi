@@ -416,6 +416,7 @@ mod tests {
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
             group_split: 1,
+            half_views: Vec::new(),
         };
         (
             host(crate::native::HwStage::Vs, vs),

@@ -79,6 +79,20 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// the last row past the count run as the last group (the same meshlet drawn
 /// again: no new pixels).
 pub const USER_MESH_ROW: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the index
+/// of the first thread group a dispatch runs, in `x`. The console allows a
+/// dispatch of more groups in a dimension than the host does (65,535), so
+/// the host runs such a dispatch as several, one after another, and tells
+/// each where its groups start: a direct dispatch in pieces, or an indirect
+/// compute record past 65,535 as a second execution with this dword at
+/// 65,535. 0 for every dispatch that fits. Read only by a compute program
+/// that reads its group id in `x` (`Input::GroupId(0)`). (Placed at `0x106`,
+/// after `USER_MESH_ROW` which occupies `0x104..=0x105`.)
+pub const USER_GROUP_BASE: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes: the last
+/// byte reads of the root SRV of root parameter `slot` may start at (to the
+/// end of its backing host copy, matching [`crate::RootType::LIMIT`]).
+pub const USER_ROOT_LIMIT: u32 = 0x107;
 /// The root UAV a traced shader writes its trace to (`lower::with_trace`): word 0
 /// counts the records (a ring); records of [`TRACE_WORDS`] dwords follow from byte
 /// [`TRACE_FIRST`] on.
@@ -101,6 +115,8 @@ pub const TRACE_WORDS: u32 = 8;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
+    pub const EARLY_DEPTH: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
@@ -125,6 +141,9 @@ pub(crate) struct Types {
     pub cbuf_ret: Ty,
     pub res_ret: Ty,
 }
+
+/// Resource properties, word 0: a globally coherent UAV (bit 14).
+pub(crate) const COHERENT: u32 = 0x4000;
 
 /// What a mesh shader declares beyond its thread-group size.
 #[derive(Debug, Clone, Copy)]
@@ -181,11 +200,15 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Where reads through a handle (a root view's) may start at most.
+    pub limits: Vec<(V, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Every UAV globally coherent (see `lower::wants_coherent`).
+    pub coherent: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -239,9 +262,11 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            limits: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            coherent: false,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -265,6 +290,30 @@ impl Shader {
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
     pub fn op(
+        &mut self,
+        block: usize,
+        name: &str,
+        attr: Attr,
+        ret: Ty,
+        opcode: u32,
+        args: &[V],
+    ) -> V {
+        // A raw buffer load through a limited handle.
+        const RAW_LOAD: u32 = 139;
+        if opcode == RAW_LOAD
+            && let Some(&(_, limit)) = self.limits.iter().find(|l| l.0 == args[0])
+        {
+            let i32t = self.t.i32;
+            let at = self.op_as_is(block, "binary.i32", Attr::ReadNone, i32t, 40, &[args[1], limit]);
+            self.m.tag(at, super::bitcode::Tag::Clamp);
+            let mut args = args.to_vec();
+            args[1] = at;
+            return self.op_as_is(block, name, attr, ret, opcode, &args);
+        }
+        self.op_as_is(block, name, attr, ret, opcode, args)
+    }
+
+    fn op_as_is(
         &mut self,
         block: usize,
         name: &str,
@@ -375,7 +424,8 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        let props = 11 | 0x1000 | if self.coherent { COHERENT } else { 0 };
+        let h = self.annotate(block, h, props, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -460,6 +510,12 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        // Resource properties: bit 12 a UAV, bit 14 globally coherent.
+        let props = if self.coherent && props.0 & 0x1000 != 0 {
+            (props.0 | COHERENT, props.1)
+        } else {
+            props
+        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -599,6 +655,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let coherent = self.m.bool(self.coherent);
+                let coherent = self.m.md_value(coherent);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -612,7 +670,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,

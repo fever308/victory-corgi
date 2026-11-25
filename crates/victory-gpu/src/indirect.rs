@@ -36,12 +36,14 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing. Bits 8-15: dispatches, host
-    // thread groups per console thread group along z (a console group of
-    // several waves run as one host group per wave; 0 or 1: as asked).
-    // Bit 16: mesh records as rows (`USER_MESH_ROW`): each written as 20
-    // bytes, the row width and last group (the root constants the mesh
-    // shader reads), then the groups as rows of at most 65,535.
+    // run is left empty and costs nothing. Bit 2: dispatch records split at
+    // 65,535 groups in x (second records written `records` records on).
+    // Bits 8-15: dispatches, host thread groups per console thread group
+    // along z (a console group of several waves run as one host group per
+    // wave; 0 or 1: as asked). Bit 16: mesh records as rows (`USER_MESH_ROW`):
+    // each written as 20 bytes, the row width and last group (the root
+    // constants the mesh shader reads), then the groups as rows of at most
+    // 65,535.
     uint has_count;
     uint count_offset;
     // The first record this dispatch clamps: the caller dispatches one group
@@ -110,14 +112,22 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
+        // Split (bit 2): the groups past 65,535 in x, up to 65,535 more, run
+        // as a second record (below), charged with the first.
+        uint rest = ((has_count & 4u) != 0 && g.x == 65535u) ? min(asked.x - 65535u, 65535u) : 0u;
+        if (rest != 0 && g.y * g.z != 0 && g.x + rest > GROUPS / (g.y * g.z)) {
+            g = uint3(0, 0, 0);
+            rest = 0;
+        }
         // One host group per console wave of a group split by the
         // translation: z counts the waves too.
         uint split = max((has_count >> 8) & 0xffu, 1u);
         if (g.z * split > 65535u) {
             g = uint3(0, 0, 0);
+            rest = 0;
         }
         g.z *= split;
-        cost = g.x * g.y * g.z * 64u;
+        cost = (g.x + rest) * g.y * g.z * 64u;
         groups = g;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
@@ -190,6 +200,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             dst_args.Store2(dst_at, row_words);
             dst_args.Store3(dst_at + 8, groups);
         } else {
+            // Split: the second record, `records` records on, takes the groups
+            // past 65,535 in x (none where the first is not full).
+            if (kind == 2 && (has_count & 4u) != 0) {
+                uint rest = groups.x == 65535u ? min(src_args.Load(src_at) - 65535u, 65535u) : 0u;
+                dst_args.Store3(records * stride + dst_at, uint3(rest, groups.yz));
+            }
             dst_args.Store3(dst_at, groups);
             for (uint off = 12; off < stride; off += 4) {
                 dst_args.Store(dst_at + off, src_args.Load(src_at + off));
@@ -369,7 +385,26 @@ pub(crate) fn bound(
     let bytes = scratch_bytes(spec.0, spec.1, spec.2);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = list.take_buffer_writes() || every_wait();
-    record_clamp_with(c, &list.list, &dst, budget, src, count, spec, false, wait).then_some(dst)
+    record_clamp_with(c, &list.list, &dst, budget, src, count, spec, (false, false), wait).then_some(dst)
+}
+
+/// [`bound`] for dispatch records (`kind & 0xff == 2`) whose groups past
+/// 65,535 in x run as a second execution: the scratch buffer holds the
+/// clamped records at offset 0 and, `stride * records` bytes on, as many
+/// records again with the groups past 65,535 in x of each (up to 65,535
+/// more; 0 where it asked for fewer), y and z as the first. A dispatch runs
+/// at most 65,535 groups in each dimension; the console's go further in x.
+pub(crate) fn bound_split(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Option<ID3D12Resource> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let both = bytes.checked_mul(2).filter(|&b| b <= u64::from(u32::MAX))?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(both)?);
+    let wait = list.take_buffer_writes() || every_wait();
+    record_clamp_with(c, &list.list, &dst, budget, src, count, spec, (false, (spec.0 & 0xff) == 2), wait).then_some(dst)
 }
 
 /// Ensures earlier compute writes to indirect argument/count buffers are
@@ -399,7 +434,7 @@ pub(crate) fn bound_ahead(
     let bytes = scratch_bytes(spec.0, spec.1, spec.2);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = list.take_buffer_writes() || every_wait();
-    record_clamp_with(c, &list.list, &dst, budget, src, None, spec, true, wait).then_some(dst)
+    record_clamp_with(c, &list.list, &dst, budget, src, None, spec, (true, false), wait).then_some(dst)
 }
 
 /// `VICTORY_INDIRECT_WAITS=1`: every clamp waits for every earlier shader
@@ -441,11 +476,12 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_with(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), ahead, true)
+    record_clamp_with(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), (ahead, false), true)
 }
 
-/// [`record_clamp_as`]; `wait`: wait for every earlier shader write first
-/// (see [`every_wait`]).
+/// [`record_clamp_as`]; `x_split`: dispatch records' groups past 65,535 in x
+/// go to second records after the first ([`bound_split`]); `wait`: wait for
+/// every earlier shader write first (see [`every_wait`]).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_with(
     c: &Clamp,
@@ -455,7 +491,7 @@ fn record_clamp_with(
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-    ahead: bool,
+    (ahead, x_split): (bool, bool),
     wait: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
@@ -504,7 +540,7 @@ fn record_clamp_with(
     // `kind` bits 8-15: the dispatch's host groups per console group ([`with_split`]);
     // bit 16: mesh records as rows ([`ROWS`])
     let (kind, split, rows) = (kind & 0xff, (kind >> 8) & 0xff, (kind >> 16) & 1);
-    let flags = has_count | (u32::from(ahead) << 1) | (split << 8) | (rows << 16);
+    let flags = has_count | (u32::from(ahead) << 1) | (u32::from(x_split) << 2) | (split << 8) | (rows << 16);
     let constants = [kind, stride, records, args_offset, flags, count_offset, 0];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
@@ -1490,6 +1526,117 @@ void main() {
                 assert_eq!(largest, u32::MAX);
             }
         }
+    }
+
+    /// Counts each group it runs at `x + base + 131072 * (y + 16 * z)`.
+    const SPLIT_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0)"
+cbuffer First : register(b0) { uint base; };
+RWByteAddressBuffer hits : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    uint prev;
+    hits.InterlockedAdd(4 * (g.x + base + 131072u * (g.y + 16u * g.z)), 1, prev);
+}
+"#;
+
+    /// One dispatch record of `asked` groups through the clamp, split
+    /// (`bound_split`'s two parts, the second with its first group at
+    /// 65,535) or not: how many times each group ran, and the budget spent.
+    fn split_run(warp: &mut WarpHarness, worker: &Clamp, asked: [u32; 3], split: bool) -> (Vec<u32>, u32) {
+        const STRIDE: u32 = 12;
+        const CELLS: usize = 131_072 * 48;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer((CELLS * 4) as u64);
+        let dst_buf = warp.default_uav(u64::from(STRIDE) * 2);
+        let sig = warp.signature(2, STRIDE);
+        // SAFETY: buffers are mapped with the capacities above.
+        unsafe {
+            for (k, w) in asked.into_iter().enumerate() {
+                src_ptr.cast::<u32>().add(k).write_volatile(w);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(hits_ptr, 0, CELLS * 4);
+        }
+        assert!(record_clamp_with(
+            &warp.clamp,
+            &warp.list,
+            &dst_buf,
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (2, STRIDE, 1),
+            (false, split),
+            true,
+        ));
+        // SAFETY: an open list, the worker's root signature and pipeline,
+        // live buffers; the scratch buffer is in `INDIRECT_ARGUMENT`.
+        unsafe {
+            let l = &warp.list;
+            l.SetComputeRootSignature(&worker.root);
+            l.SetPipelineState(&worker.pso);
+            l.SetComputeRootUnorderedAccessView(1, hits_gpu);
+            l.SetComputeRoot32BitConstant(0, 0, 0);
+            l.ExecuteIndirect(&sig, 1, &dst_buf, 0, None, 0);
+            if split {
+                l.SetComputeRoot32BitConstant(0, 65535, 0);
+                l.ExecuteIndirect(&sig, 1, &dst_buf, u64::from(STRIDE), None, 0);
+            }
+        }
+        done_on(&warp.list, &dst_buf);
+        warp.submit_and_wait();
+        // SAFETY: the GPU is done; mapped host memory.
+        unsafe {
+            let hits = std::slice::from_raw_parts(hits_ptr.cast::<u32>().cast_const(), CELLS).to_vec();
+            (hits, budget_ptr.cast::<u32>().read_volatile())
+        }
+    }
+
+    /// A dispatch record of more than 65,535 groups in x, split in two
+    /// parts, runs each of its groups exactly once (up to 131,070 in x),
+    /// with y and z as asked, and the budget charges them all; unsplit,
+    /// the groups past 65,535 never run.
+    #[test]
+    fn warp_split_runs_every_group_of_a_wide_dispatch_once() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let worker = compile_cs(&warp.device, SPLIT_CS).expect("split worker must compile");
+        // The last: 65,535 x 16 groups fit the 2^20 a dispatch may run, the
+        // whole 70,000 x 16 does not, so neither part runs.
+        let cases: [[u32; 3]; 8] = [
+            [1, 1, 1],
+            [65_535, 1, 1],
+            [65_536, 1, 1],
+            [89_968, 1, 1],
+            [131_070, 1, 1],
+            [200_000, 1, 1],
+            [70_000, 2, 3],
+            [70_000, 16, 1],
+        ];
+        for asked in cases {
+            let (hits, spent) = split_run(&mut warp, &worker, asked, true);
+            let fits = asked[0].min(131_070) * asked[1] * asked[2] <= 1 << 20;
+            let runs = if fits { asked[0].min(131_070) } else { 0 };
+            for z in 0..3u32 {
+                for y in 0..16u32 {
+                    let row = 131_072 * (y + 16 * z) as usize;
+                    let inside = y < asked[1] && z < asked[2];
+                    for x in 0..131_072u32 {
+                        let want = u32::from(inside && x < runs);
+                        assert_eq!(hits[row + x as usize], want, "asked {asked:?}: group ({x}, {y}, {z})");
+                    }
+                }
+            }
+            assert_eq!(spent, runs * asked[1] * asked[2] * 64, "asked {asked:?}: budget");
+        }
+        // Unsplit, as before: cut at 65,535 in x.
+        let (hits, spent) = split_run(&mut warp, &worker, [89_968, 1, 1], false);
+        assert!(hits[..65_535].iter().all(|&h| h == 1));
+        assert!(hits[65_535..].iter().all(|&h| h == 0));
+        assert_eq!(spent, 65_535 * 64);
     }
 
     #[test]

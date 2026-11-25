@@ -133,6 +133,7 @@ fn lowered_on(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         group_split: 1,
+        half_views: lowered.half_views,
     })
 }
 
