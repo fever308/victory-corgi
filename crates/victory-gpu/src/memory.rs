@@ -298,18 +298,11 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
-    if first_read {
+    let refresh_from = if first_read { 0 } else { numbered };
+    if refresh_from < m.copies.len() {
         list.defer_refresh_batch(
-            m.copies.len(),
-            m.copies.iter().map(|shadow| {
-                let (start, len) = shadow.span();
-                (shadow, start, len)
-            }),
-        );
-    } else if numbered < m.copies.len() {
-        list.defer_refresh_batch(
-            m.copies.len() - numbered,
-            m.copies[numbered..].iter().map(|shadow| {
+            m.copies.len() - refresh_from,
+            m.copies[refresh_from..].iter().map(|shadow| {
                 let (start, len) = shadow.span();
                 (shadow, start, len)
             }),

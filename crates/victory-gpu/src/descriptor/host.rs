@@ -135,9 +135,13 @@ pub(crate) struct HostHeap {
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
     /// Per title slot, bitmask of auxiliary maps (`buffers`, `placed`,
-    /// `textures`, `kept`) that may hold `index`. Maintained under each map's
+    /// `textures`, `kept`, `marks`) that may hold `index`. Maintained under each map's
     /// lock so removals on slots never inserted skip locking those maps.
     noted: Vec<std::sync::atomic::AtomicU8>,
+    /// Sharded locks serializing slow-path `set_mark` updates on a slot so
+    /// concurrent `Some`/`None` writers cannot leave a live mark in `*data`
+    /// while `NOTED_MARK` is cleared.
+    mark_locks: Vec<Mutex<()>>,
 }
 
 const NOTED_BUFFER: u8 = 1 << 0;
@@ -145,6 +149,23 @@ const NOTED_PLACED: u8 = 1 << 1;
 const NOTED_TEXTURE: u8 = 1 << 2;
 const NOTED_KEPT: u8 = 1 << 3;
 const NOTED_MARK: u8 = 1 << 4;
+
+/// Mode flags for [`HostHeap::mirror_resolved_in`].
+#[derive(Clone, Copy)]
+struct MirrorOpts {
+    for_draw: bool,
+    return_view: bool,
+    want_copy_hint: bool,
+    fast_null_skip: bool,
+}
+
+/// Target title slot identity and record key for [`HostHeap::mirror_resolved_in`].
+#[derive(Clone, Copy)]
+struct SlotRecord {
+    index: u32,
+    handle: u64,
+    key: u64,
+}
 
 /// Fixed, parameterless null descriptor kind installed in an unmade host
 /// view slot (`made.keys[index] == 0`), allowing deferred rewrites of the
@@ -1201,6 +1222,7 @@ impl HostHeap {
             noted: (0..count)
                 .map(|_| std::sync::atomic::AtomicU8::new(0))
                 .collect(),
+            mark_locks: (0..KEPT_SHARDS).map(|_| Mutex::new(())).collect(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1406,10 +1428,21 @@ impl HostHeap {
         {
             return;
         }
-        if let Some(noted) = noted
-            && mark.is_some()
-        {
-            noted.fetch_or(NOTED_MARK, std::sync::atomic::Ordering::Release);
+        let _guard = noted.map(|_| {
+            self.mark_locks[index as usize % KEPT_SHARDS]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        });
+        if let Some(noted) = noted {
+            if mark.is_none()
+                && descriptor_fast()
+                && noted.load(std::sync::atomic::Ordering::Acquire) & NOTED_MARK == 0
+            {
+                return;
+            }
+            if mark.is_some() {
+                noted.fetch_or(NOTED_MARK, std::sync::atomic::Ordering::Release);
+            }
         }
         let (base, phase) = mark.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0));
         // SAFETY: two dwords of the mapped view-mark table (`SLOT_STRIDES_COUNT * 2` dwords).
@@ -2720,6 +2753,12 @@ impl HostHeap {
             return;
         }
         super::resolve_views(records, views);
+        const DEFERRED_OPTS: MirrorOpts = MirrorOpts {
+            for_draw: false,
+            return_view: false,
+            want_copy_hint: false,
+            fast_null_skip: true,
+        };
         let mut view_iter = views.drain(..);
         let mut made_guard = None;
         for &(slot, key, is_view) in todo.iter() {
@@ -2730,15 +2769,14 @@ impl HostHeap {
             };
             self.mirror_resolved_in(
                 &mut made_guard,
-                slot.index,
-                slot.handle,
-                key,
+                SlotRecord {
+                    index: slot.index,
+                    handle: slot.handle,
+                    key,
+                },
                 view,
-                false,
-                false,
-                false,
+                DEFERRED_OPTS,
                 Some(pending_changed),
-                true,
             );
         }
         drop(made_guard);
@@ -2853,18 +2891,23 @@ impl HostHeap {
                     on_slot(pos, index, view.map(|v| (v, None)));
                     continue;
                 }
+                const BUFFER_SLOT_OPTS: MirrorOpts = MirrorOpts {
+                    for_draw: true,
+                    return_view: true,
+                    want_copy_hint: true,
+                    fast_null_skip: true,
+                };
                 let key = u64::from(generation) << 32 | u64::from(idx_word);
                 let (view_out, copy_hint) = self.mirror_resolved_in(
                     &mut made_guard,
-                    index,
-                    handle,
-                    key,
+                    SlotRecord {
+                        index,
+                        handle,
+                        key,
+                    },
                     view,
-                    true,
-                    true,
-                    true,
+                    BUFFER_SLOT_OPTS,
                     None,
-                    true,
                 );
                 made_guard = None;
                 on_slot(pos, index, view_out.map(|v| (v, copy_hint)));
@@ -2925,37 +2968,34 @@ impl HostHeap {
         let mut made_guard = None;
         self.mirror_resolved_in(
             &mut made_guard,
-            index,
-            handle,
-            key,
+            SlotRecord { index, handle, key },
             view,
-            for_draw,
-            return_view,
-            false,
+            MirrorOpts {
+                for_draw,
+                return_view,
+                want_copy_hint: false,
+                fast_null_skip: descriptor_fast(),
+            },
             None,
-            descriptor_fast(),
         )
         .0
     }
 
-    /// Shared core for [`mirror_words`], [`apply_changed_slots`],
-    /// [`mirror_range`], and [`mirror_buffer_slots`]. Holds `made_guard` across
-    /// consecutive fast-skipped deferred slots and releases it before calling
-    /// `wait_for`, `null_for`, or `make_marked`.
-    #[allow(clippy::too_many_arguments)]
+    /// Shared core for [`mirror_words`], [`mirror_deferred_chunk`], and
+    /// [`mirror_buffer_slots`]. Holds `made_guard` across consecutive
+    /// fast-skipped deferred slots and across `later == true` null updates;
+    /// runs `make_marked` outside `self.made` for `later == false`, then
+    /// re-checks `made.keys[index] == key` under `self.made` before committing
+    /// `set_mark`, `keep`, and `self.fast`.
     fn mirror_resolved_in<'a>(
         &'a self,
         made_guard: &mut Option<std::sync::MutexGuard<'a, MadeState>>,
-        index: u32,
-        handle: u64,
-        key: u64,
+        slot: SlotRecord,
         view: Option<View>,
-        for_draw: bool,
-        return_view: bool,
-        want_copy_hint: bool,
+        opts: MirrorOpts,
         mut pending_changed: Option<&mut Vec<u32>>,
-        fast_null_skip: bool,
     ) -> (Option<View>, Option<(Arc<Shadow>, u64, u64)>) {
+        let SlotRecord { index, handle, key } = slot;
         let made = made_guard.get_or_insert_with(|| self.made.lock().unwrap_or_else(|e| e.into_inner()));
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -2968,7 +3008,7 @@ impl HostHeap {
                 }
                 self.make_null(index);
                 let _ = self.note_buffer_into(index, None, false, pending_changed);
-            } else if for_draw {
+            } else if opts.for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer_into(index, None, false, pending_changed);
             }
@@ -2979,7 +3019,7 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer_into(index, Some(&view), for_draw, pending_changed.as_deref_mut()) {
+            for stale in self.note_buffer_into(index, Some(&view), opts.for_draw, pending_changed.as_deref_mut()) {
                 if stale != index {
                     self.unmake(made, stale);
                 }
@@ -2990,7 +3030,7 @@ impl HostHeap {
             // Deferred writes (`mirror(..., for_draw = false)`) leave
             // `made[index] == 0`, so `replaced_made` is false and they do not
             // echo back into `changed`.
-            if for_draw && replaced_made && view_stride(&view).is_some() {
+            if opts.for_draw && replaced_made && view_stride(&view).is_some() {
                 if let Some(pending) = pending_changed {
                     pending.push(index);
                 } else {
@@ -3004,8 +3044,8 @@ impl HostHeap {
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
             // here when a draw reads the slot through a table.
-            let waiting = if for_draw { None } else { view.waiting_texture() };
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            let waiting = if opts.for_draw { None } else { view.waiting_texture() };
+            let later = !opts.for_draw && (view.is_buffer() || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -3023,11 +3063,12 @@ impl HostHeap {
                 )
                 .is_some_and(|old| same_placed_texture(&old, &view))
             {
+                *made_guard = None;
                 if let Some(texture) = waiting {
                     super::wait_for(texture, handle);
                 }
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return (return_view.then_some(view), None);
+                return (opts.return_view.then_some(view), None);
             }
             let target_null = if later && !self.sampler {
                 null_kind_of(&view)
@@ -3037,13 +3078,13 @@ impl HostHeap {
             if later
                 && !replaced_made
                 && waiting.is_none()
-                && fast_null_skip
+                && opts.fast_null_skip
                 && target_null != NullKind::None
                 && made.null_kind[index as usize] == target_null
             {
                 self.set_mark(index, None);
                 self.keep(index, Kept::Empty);
-                return (return_view.then_some(view), None);
+                return (opts.return_view.then_some(view), None);
             }
             if replaced_made {
                 self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
@@ -3056,7 +3097,7 @@ impl HostHeap {
             // until one of those makes it, as they make a slot left for
             // later.
             if !later
-                && !for_draw
+                && !opts.for_draw
                 && !self.sampler
                 && let Some(words) = empty_texture_view(&view)
                 && fallback_view(&words, self.cpu(index))
@@ -3066,39 +3107,55 @@ impl HostHeap {
                 self.set_mark(index, None);
                 self.keep(index, Kept::Empty);
                 EMPTY_AT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return (return_view.then_some(view), None);
+                return (opts.return_view.then_some(view), None);
             }
-            made.keys[index as usize] = if later { 0 } else { key };
-            made.null_kind[index as usize] = target_null;
+            if later {
+                // Hold `made_guard` through `set_mark`, `null_for`, and `keep`
+                // so a preempted deferred writer cannot overwrite a concurrent
+                // `for_draw = true` slot after dropping `self.made`.
+                made.keys[index as usize] = 0;
+                made.null_kind[index as usize] = target_null;
+                self.set_mark(index, None);
+                if !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, Kept::Empty);
+                *made_guard = None;
+                if let Some(texture) = waiting {
+                    super::wait_for(texture, handle);
+                }
+                return (opts.return_view.then_some(view), None);
+            }
+            made.keys[index as usize] = key;
+            made.null_kind[index as usize] = NullKind::None;
             // The making itself without the heap's lock: it may make a host
             // copy of what the view shows, milliseconds of the host's own
             // waiting, with every other recording thread in line behind it.
-            // shortcut: two threads making one slot at once (the title
-            // writing a slot two of its lists read) is not kept apart.
             *made_guard = None;
-            if let Some(texture) = waiting {
-                super::wait_for(texture, handle);
-            }
-            let (kept, mark, copy_hint) = if later {
-                (None, None, None)
-            } else if want_copy_hint {
+            let (kept, mark, copy_hint) = if opts.want_copy_hint {
                 make_marked_with_copy(&view, self.cpu(index))
             } else {
                 let (k, m) = make_marked(&view, self.cpu(index));
                 (k, m, None)
             };
-            self.set_mark(index, mark);
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
-            }
-            self.keep(index, kept.unwrap_or(Kept::Empty));
-            // Made: from here on without the lock.
-            if !later {
+            let made = made_guard.get_or_insert_with(|| self.made.lock().unwrap_or_else(|e| e.into_inner()));
+            if made.keys[index as usize] == key {
+                self.set_mark(index, mark);
+                if kept.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, kept.unwrap_or(Kept::Empty));
+                // Made: from here on without the lock.
                 self.fast[index as usize].store(key, std::sync::atomic::Ordering::Release);
+                return (opts.return_view.then_some(view), copy_hint);
             }
-            return (return_view.then_some(view), copy_hint);
+            *made_guard = None;
+            if let Some(kept) = kept {
+                crate::host::retire_executing(kept);
+            }
+            return (opts.return_view.then_some(view), None);
         }
-        (return_view.then_some(view), None)
+        (opts.return_view.then_some(view), None)
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -4022,17 +4079,31 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     if want_hint {
-        if let Some((start, bytes)) = own_range {
-            BUFFER_COPY_HINT.with(|h| h.set(Some((shadow.clone(), start, bytes))));
-        } else if view_len > 0
-            && view_extent()
-            && view_address >= address
-            && view_address - address < len.max(1)
-        {
-            BUFFER_COPY_HINT.with(|h| h.set(Some((shadow.clone(), view_address, view_len))));
-        }
+        record_buffer_copy_hint(&shadow, address, len, view_address, view_len, own_range);
     }
     Some(Kept::Shadow(shadow))
+}
+
+/// Records the resolved `(Shadow, start, bytes)` range into `BUFFER_COPY_HINT`
+/// when `WANT_COPY_HINT` is active, letting `mirror_buffer_slots` reuse the
+/// lookup without a second `shadow::find`.
+fn record_buffer_copy_hint(
+    shadow: &Arc<Shadow>,
+    address: u64,
+    len: u64,
+    view_start: u64,
+    view_len: u64,
+    own_range: Option<(u64, u64)>,
+) {
+    if let Some((start, bytes)) = own_range {
+        BUFFER_COPY_HINT.with(|h| h.set(Some((shadow.clone(), start, bytes))));
+    } else if view_len > 0
+        && view_extent()
+        && view_start >= address
+        && view_start - address < len.max(1)
+    {
+        BUFFER_COPY_HINT.with(|h| h.set(Some((shadow.clone(), view_start, view_len))));
+    }
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -4128,15 +4199,7 @@ fn buffer_uav(
     };
     MARK.with(|m| m.set(shadow.mark_entry(view_start)));
     if want_hint {
-        if let Some((start, bytes)) = own_range {
-            BUFFER_COPY_HINT.with(|h| h.set(Some((shadow.clone(), start, bytes))));
-        } else if view_len > 0
-            && view_extent()
-            && view_start >= address
-            && view_start - address < len.max(1)
-        {
-            BUFFER_COPY_HINT.with(|h| h.set(Some((shadow.clone(), view_start, view_len))));
-        }
+        record_buffer_copy_hint(&shadow, address, len, view_start, view_len, own_range);
     }
     Some(Kept::Shadow(shadow))
 }
@@ -6622,15 +6685,19 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             let view = (tag == VIEW_TAG).then(|| super::super::view_at(i, generation)).flatten();
             reference.mirror_resolved_in(
                 &mut None,
-                slot.index,
-                slot.handle,
-                key,
+                SlotRecord {
+                    index: slot.index,
+                    handle: slot.handle,
+                    key,
+                },
                 view,
-                false,
-                false,
-                false,
+                MirrorOpts {
+                    for_draw: false,
+                    return_view: false,
+                    want_copy_hint: false,
+                    fast_null_skip: false,
+                },
                 None,
-                false,
             );
         }
 
@@ -6643,6 +6710,191 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         r_changes.sort_unstable();
         assert_eq!(b_changes, r_changes);
         assert_eq!(batched.buffer_slots(), reference.buffer_slots());
+
+        crate::shadow::unregister(base as usize, base);
+    }
+
+    /// Concurrent `set_mark` `Some`/`None` writers on the same slot never leave
+    /// a live mark in `*data` with `NOTED_MARK == 0`, and a final `set_mark(..., None)`
+    /// always restores `VIEW_MARK_NONE` cleanly.
+    #[test]
+    fn concurrent_set_mark_some_and_none_keeps_noted_mark_consistent() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(mut heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        // Ensure a mapped marks buffer exists even if `VICTORY_VIEW_MARKS` is off.
+        if heap.marks.is_none() {
+            let bytes = 64u64;
+            let Some((buffer, data)) = host.upload_buffer(bytes) else {
+                return;
+            };
+            // SAFETY: mapped upload buffer of `bytes` bytes.
+            let gpu = unsafe {
+                std::ptr::write_bytes(data, 0xFF, bytes as usize);
+                buffer.GetGPUVirtualAddress()
+            };
+            heap.marks = Some((buffer, gpu, data as usize));
+        }
+
+        let heap_ref = &heap;
+        std::thread::scope(|s| {
+            let setter = s.spawn(|| {
+                for step in 1..=2000u32 {
+                    heap_ref.set_mark(2, Some((step, step ^ 0x55)));
+                }
+            });
+            let clearer = s.spawn(|| {
+                let data_ptr = heap_ref.marks.as_ref().unwrap().2;
+                for _ in 0..2000 {
+                    heap_ref.set_mark(2, None);
+                    // Serializing behind `mark_locks`: if `NOTED_MARK == 0`, `*data`
+                    // must hold `VIEW_MARK_NONE` (never a stale live mark).
+                    let _g = heap_ref.mark_locks[2].lock().unwrap();
+                    if heap_ref.noted[2].load(std::sync::atomic::Ordering::Acquire) & NOTED_MARK == 0 {
+                        // SAFETY: slot 2 lies inside the mapped marks buffer.
+                        let base_bit = unsafe { (data_ptr as *const u32).add(4).read_volatile() };
+                        assert_eq!(
+                            base_bit,
+                            victory_shader::emit::VIEW_MARK_NONE,
+                            "live mark left in slot with NOTED_MARK == 0"
+                        );
+                    }
+                }
+            });
+            setter.join().unwrap();
+            clearer.join().unwrap();
+        });
+
+        heap.set_mark(2, None);
+        let data_ptr = heap.marks.as_ref().unwrap().2;
+        // SAFETY: slot 2 lies inside the mapped marks buffer.
+        let (base_bit, phase) = unsafe {
+            let p = (data_ptr as *const u32).add(4);
+            (p.read_volatile(), p.add(1).read_volatile())
+        };
+        assert_eq!(base_bit, victory_shader::emit::VIEW_MARK_NONE);
+        assert_eq!(phase, 0);
+        assert_eq!(
+            heap.noted[2].load(std::sync::atomic::Ordering::Acquire) & NOTED_MARK,
+            0
+        );
+    }
+
+    /// Concurrent deferred (`later=true`) and draw (`for_draw=true`) updates on the
+    /// same buffer slot keep `self.fast`, `made.keys`, `made.null_kind`, and `kept`
+    /// consistent without clobbering or leaking.
+    #[test]
+    fn concurrent_later_and_for_draw_updates_stay_consistent() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let backing = vec![0u8; 8192];
+        let base = backing.as_ptr() as u64;
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+
+        let mut page = vec![0u8; 8 * 32];
+        let slot_addr = page.as_mut_ptr() as u64 + 32;
+        let view_a = placed_buffer_view(false, base, 8192, 0, 16, 16, false);
+        let view_b = placed_buffer_view(false, base, 8192, 4, 16, 16, false);
+        let [i_a, g_a] = super::super::words_for(view_a.clone());
+        let [i_b, g_b] = super::super::words_for(view_b.clone());
+        let key_a = u64::from(g_a) << 32 | u64::from(i_a);
+        let key_b = u64::from(g_b) << 32 | u64::from(i_b);
+
+        let write_slot = |view: &View| {
+            let [i, generation] = super::super::words_for(view.clone());
+            // SAFETY: `slot_addr` points to 32 bytes inside `page`.
+            unsafe {
+                (slot_addr as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]);
+            }
+        };
+        write_slot(&view_a);
+
+        // Concurrent threads racing `for_draw=false` (later) vs `for_draw=true`
+        // (draw) on the same slot 1, alternating view A and view B.
+        let heap_ref = &heap;
+        std::thread::scope(|s| {
+            let deferred = s.spawn(|| {
+                for n in 0..400u32 {
+                    let (key, v) = if n % 2 == 0 {
+                        (key_a, view_a.clone())
+                    } else {
+                        (key_b, view_b.clone())
+                    };
+                    heap_ref.mirror_resolved_in(
+                        &mut None,
+                        SlotRecord {
+                            index: 1,
+                            handle: slot_addr,
+                            key,
+                        },
+                        Some(v),
+                        MirrorOpts {
+                            for_draw: false,
+                            return_view: false,
+                            want_copy_hint: false,
+                            fast_null_skip: true,
+                        },
+                        None,
+                    );
+                }
+            });
+            let draw = s.spawn(|| {
+                for n in 0..400u32 {
+                    let (key, v) = if n % 2 == 0 {
+                        (key_a, view_a.clone())
+                    } else {
+                        (key_b, view_b.clone())
+                    };
+                    heap_ref.mirror_resolved_in(
+                        &mut None,
+                        SlotRecord {
+                            index: 1,
+                            handle: slot_addr,
+                            key,
+                        },
+                        Some(v),
+                        MirrorOpts {
+                            for_draw: true,
+                            return_view: true,
+                            want_copy_hint: false,
+                            fast_null_skip: true,
+                        },
+                        None,
+                    );
+                }
+            });
+            deferred.join().unwrap();
+            draw.join().unwrap();
+        });
+
+        // Invariant: `self.fast[1]` must never disagree with `made.keys[1]`, and if
+        // `made.keys[1] == 0`, `kept` must be empty.
+        let made = heap.made.lock().unwrap();
+        let key_now = made.keys[1];
+        let fast_now = heap.fast[1].load(std::sync::atomic::Ordering::Acquire);
+        assert!(
+            fast_now == 0 || fast_now == key_now,
+            "fast={fast_now:#x} diverged from made.keys[1]={key_now:#x}"
+        );
+        if key_now == 0 {
+            assert!(!heap.kept[1].lock().unwrap().contains_key(&1));
+            assert_eq!(made.null_kind[1], NullKind::BufferSrv);
+        }
+        drop(made);
+
+        // Final `for_draw=true` with `view_b` cleanly leaves slot 1 made and `fast == key_b`.
+        write_slot(&view_b);
+        assert_eq!(heap.mirror(1, slot_addr, true), Some(view_b));
+        assert!(heap.made(1));
+        assert_eq!(
+            heap.fast[1].load(std::sync::atomic::Ordering::Acquire),
+            key_b
+        );
 
         crate::shadow::unregister(base as usize, base);
     }
