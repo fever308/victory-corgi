@@ -66,6 +66,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked (`State::tables`): whether that
+    /// stage's shader marks written 64 KiB pages (`HostShader::has_view_marks`).
+    static MARKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -266,7 +269,7 @@ pub(crate) struct State {
     /// `VICTORY_TABLES_MEMO=1` (experiment): the views already made
     /// readable for this list since the last thing that can change what
     /// "readable" asks for ([`State::seen_gone`]).
-    seen: std::cell::RefCell<std::collections::BTreeSet<(u8, View)>>,
+    seen: std::cell::RefCell<std::collections::BTreeSet<(u8, bool, View)>>,
     /// `VICTORY_TABLES_MEMO=2` (experiment): what [`State::tables`] gave
     /// for a stage whose tables, and the records in them, were these
     /// ([`State::tables_key`]), since the last [`State::seen_gone`].
@@ -432,7 +435,7 @@ impl State {
         compute: bool,
     ) -> Option<u64> {
         const K: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut h: u64 = if compute { 0x51 } else { 0x7 };
+        let mut h: u64 = if compute { 0x51 } else { 0x7 } ^ (u64::from(MARKED.get()) << 16);
         let mut mix = |v: u64| h = (h.rotate_left(27) ^ v).wrapping_mul(K);
         for &heap in &self.heaps {
             mix(heap as u64);
@@ -499,6 +502,7 @@ impl State {
                 ResourceType::Cbv => 2,
                 _ => 3,
             },
+            MARKED.get(),
             view.clone(),
         );
         if self.seen.borrow().contains(&key) {
@@ -1489,6 +1493,7 @@ impl State {
                 crate::debugger::trace::stage(&stage.shader, compute, target);
             }
             STORES.set(t.stores);
+            MARKED.set(t.host.has_view_marks());
             // What it stores may be an indirect call's arguments: the next
             // clamp waits for it (`crate::indirect`).
             if t.stores {
@@ -1554,6 +1559,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             drop(part);
             STORES.set(true);
+            MARKED.set(false);
             #[cfg(feature = "diagnostics")]
             let _stage = crate::copystat::sect(4);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -1646,6 +1652,30 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_MARKS {
+                        // Ours: per-slot view-mark table for `VICTORY_VIEW_MARKS=1`.
+                        let host = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host());
+                        let Some((gpu, buffer)) = host.and_then(|h| Some((h.marks_gpu()?, h.marks_buffer()?))) else {
+                            once!("a shader marking its writes without a view-marks table: the draw is dropped");
+                            return false;
+                        };
+                        list.keep(buffer);
+                        // SAFETY: an open list; the table lives while the list holds it.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
@@ -1713,6 +1743,22 @@ impl State {
                             } else {
                                 l.SetGraphicsRootUnorderedAccessView(param, ring);
                             }
+                        }
+                    }
+                    continue;
+                }
+                if slot == victory_shader::emit::SLOT_VIEW_WRITES {
+                    // Ours: 64 KiB page bitmap for `VICTORY_VIEW_MARKS=1`.
+                    let Some(bitmap) = crate::shadow::view_writes() else {
+                        once!("a shader marking its writes without a view-writes bitmap: the draw is dropped");
+                        return false;
+                    };
+                    // SAFETY: an open list; the bitmap lives for the process lifetime.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, bitmap);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, bitmap);
                         }
                     }
                     continue;
@@ -4348,7 +4394,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
+                shadow.gpu_writes_marked(list, address, len, MARKED.get());
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

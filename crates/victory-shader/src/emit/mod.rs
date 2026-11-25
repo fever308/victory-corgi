@@ -114,10 +114,11 @@ pub use sampler::StaticSampler;
 pub use lower::{set_host_max_wave, with_trace};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TRACE, TRACE_FIRST, TRACE_PIXEL, TRACE_THREAD, TRACE_WORDS,
-    USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_MESH_ROW, USER_ROOT_LIMIT,
-    USER_TRACE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_TRACE, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, TRACE_FIRST,
+    TRACE_PIXEL, TRACE_THREAD, TRACE_WORDS, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE,
+    USER_MESH_ROW, USER_ROOT_LIMIT, USER_TRACE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE,
+    VIEW_WRITE_BITS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -201,6 +202,17 @@ pub(crate) fn mesh_payload() -> u32 {
     *BYTES.get_or_init(|| if std::env::var_os("VICTORY_INDIRECT_AMPLIFY").is_some_and(|v| v == "1") { 4 } else { 0 })
 }
 
+/// Whether translated shaders emit 64 KiB page write marks into the host's
+/// view-write bitmap (`SLOT_VIEW_MARKS` / `SLOT_VIEW_WRITES`).
+/// `VICTORY_VIEW_MARKS=1` enables it; unset or `0` leaves translated shaders
+/// and copy-back behavior completely unchanged.
+///
+/// Part of the translation: the shader cache keys on it (`translation_fingerprint`).
+pub fn view_marks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_some_and(|v| v == "1"))
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
@@ -225,6 +237,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(u8::from(view_marks_enabled()));
     out
 }
 
@@ -312,6 +325,20 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// Whether this shader marks the 64 KiB pages it writes through unordered
+    /// buffer views (`SLOT_VIEW_MARKS` / `SLOT_VIEW_WRITES`).
+    pub fn has_view_marks(&self) -> bool {
+        self.root_uavs.contains(&SLOT_VIEW_WRITES)
+    }
+}
+
+/// How a translation is made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Writes through unordered buffer views mark their 64 KiB pages in
+    /// `u<SLOT_VIEW_WRITES>` using `t<SLOT_VIEW_MARKS>`.
+    pub view_marks: bool,
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -337,15 +364,25 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_plain(container) {
+    translate_with(
+        container,
+        Options {
+            view_marks: view_marks_enabled(),
+        },
+    )
+}
+
+/// [`translate`] made as `options` say.
+pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    match translate_plain(container, options) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
-            lower::with_first_half_pairs(|| translate_plain(container))
+            lower::with_first_half_pairs(|| translate_plain(container, options))
         }
         other => other,
     }
 }
 
-fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+fn translate_plain(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -369,7 +406,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -381,9 +418,32 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_with(
+        c,
+        native,
+        p,
+        st,
+        io,
+        res,
+        Options {
+            view_marks: view_marks_enabled(),
+        },
+    )
+}
+
+/// [`emit`] made as `options` say.
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
-    let original = emit_program(c, native, p, st, io, res);
+    let original = emit_program(c, native, p, st, io, res, options);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -442,7 +502,7 @@ pub fn emit(
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
+                let again = emit_program(c, native, p, st, io, res, options);
                 report(name, &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
@@ -467,7 +527,7 @@ pub fn emit(
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
-                    let again = emit_program(c, native, p, st, io, res);
+                    let again = emit_program(c, native, p, st, io, res, options);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
@@ -484,7 +544,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, options);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -502,7 +562,7 @@ pub fn emit(
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
                 {
-                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res, options));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
                         return local.map(|(shader, _)| shader);
@@ -510,7 +570,7 @@ pub fn emit(
                 }
             }
             if idiom(p, st) == exact {
-                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res, options));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
@@ -522,14 +582,14 @@ pub fn emit(
             if !strict {
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
-                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
                             return local.map(|(shader, _)| shader);
                         }
                     }
                 }
-                let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
@@ -543,14 +603,14 @@ pub fn emit(
         // then with each host wave on its own. (Run 20261124-174052 drew streaks across
         // the screen with it on, run -174823 none with it off.)
         if !strict && std::env::var_os("VICTORY_WAVE_LOOSE_LDS").is_some_and(|v| v == "1") {
-            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res, options));
             report("LDS without barriers in lane branches (APPROXIMATE)", &again);
             if done(&again) {
                 return again.map(|(shader, _)| shader);
             }
             for (name, f) in &forms {
                 if let Some((p, st, io, res)) = f {
-                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res, options));
                     report(&format!("LDS without barriers in lane branches (APPROXIMATE), {name}"), &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
@@ -559,7 +619,7 @@ pub fn emit(
             }
             if local_on && !exact_only {
                 let local = lower::with_loose_lds(|| {
-                    lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res))
+                    lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options))
                 });
                 report("LDS without barriers in lane branches, local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
@@ -577,7 +637,7 @@ pub fn emit(
         // two host waves to exchange there; 8 branches taken wave-wide.)
         let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
         if wide_last {
-            let again = widen(c, native, p, why);
+            let again = widen(c, native, p, why, options);
             report("wave-wide branches, last resort", &again);
             if done(&again) {
                 return again.map(|(shader, _)| shader);
@@ -586,7 +646,7 @@ pub fn emit(
             // program's own do not with its branches taken wave-wide
             for (name, f) in &forms {
                 if let Some((p, ..)) = f {
-                    let again = widen(c, native, p, why);
+                    let again = widen(c, native, p, why, options);
                     report(&format!("wave-wide branches, last resort, {name}"), &again);
                     if done(&again) {
                         return again.map(|(shader, _)| shader);
@@ -604,10 +664,10 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), options);
             match again {
                 Ok(_) => again,
-                Err(_) => emit_program(c, native, p, st, io, res),
+                Err(_) => emit_program(c, native, p, st, io, res, options),
             }
         }
         other => other,
@@ -626,7 +686,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res, options).map(|(shader, _)| shader)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -641,6 +701,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    options: Options,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -683,9 +744,9 @@ fn widen(
         _ => return Err(NOT),
     }
     if split {
-        return lower::with_group_split(|| widen_loop(c, native, p, why));
+        return lower::with_group_split(|| widen_loop(c, native, p, why, options));
     }
-    widen_loop(c, native, p, why)
+    widen_loop(c, native, p, why, options)
 }
 
 /// `VICTORY_GROUP_SPLIT=0`: thread groups of several console waves are not split for
@@ -700,6 +761,7 @@ fn widen_loop(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    options: Options,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let mut wide = std::collections::HashSet::new();
     // The lanes' own paths, as the console takes them: what descriptors the lanes reaching an
@@ -718,7 +780,7 @@ fn widen_loop(
             },
         };
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = emit_program(c, native, p, &st, &io, &res, options);
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
@@ -754,6 +816,7 @@ fn emit_program(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+    options: Options,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -822,6 +885,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        view_marks: options.view_marks,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -1506,6 +1570,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1729,6 +1794,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap();
         let base = l
@@ -2207,6 +2273,7 @@ mod barycentric_tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap()
     }
@@ -2294,6 +2361,7 @@ mod barycentric_tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap();
         assert!(
@@ -2319,5 +2387,193 @@ mod barycentric_tests {
         let lowered = lower_ps(&words);
         assert!(lowered.funcs.iter().any(|n| n == "dx.op.quadReadLaneAt.i32"));
         assert!(!lowered.funcs.iter().any(|n| n == "dx.op.waveReadLaneAt.i32"));
+    }
+
+    /// Writes through unordered buffer views mark their 64 KiB pages when
+    /// `view_marks` is enabled: a dword store and a 16-byte store through
+    /// view 0 (base bit 100, phase 0xFFF0 so the 16-byte store at offset 12
+    /// crosses into page 101), a store through view 1 (VIEW_MARK_NONE), and
+    /// an atomic add through view 2 (base bit 200). With `view_marks: false`,
+    /// no view-mark root bindings are emitted.
+    #[test]
+    fn writes_through_views_mark_their_pages() {
+        use crate::native::{ComputeIo, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+
+        const fn s_mov_b32(dst: u8, src: u8) -> u32 {
+            0xBE80_0300 | (dst as u32) << 16 | src as u32
+        }
+        const fn s_load_dwordx4(sbase: u8, sdata: u8, offset: u32) -> [u32; 2] {
+            [
+                0x3D << 26 | 2 << 18 | (sdata as u32) << 6 | (sbase as u32 >> 1),
+                (0x7D << 25) | offset,
+            ]
+        }
+        const fn v_mov_b32(vdst: u8, src: u8) -> u32 {
+            0x7E00_0200 | (vdst as u32) << 17 | src as u32
+        }
+        const fn mubuf(op: u32, vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+            [
+                0x38 << 26 | op << 18 | (byte_off as u32 & 0xFFF),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+            ]
+        }
+        const BUFFER_STORE_DWORD: u32 = 0x1C;
+        const BUFFER_STORE_DWORDX4: u32 = 0x1E;
+        const BUFFER_ATOMIC_ADD: u32 = 0x32;
+        const S_WAITCNT_ALL: u32 = 0xBF8C_0000;
+        const ZERO: u8 = 0x80;
+
+        let mut w = vec![s_mov_b32(5, ZERO)];
+        for (k, sdata) in [8u8, 12, 16].into_iter().enumerate() {
+            w.extend(s_load_dwordx4(4, sdata, 32 * k as u32));
+        }
+        w.push(S_WAITCNT_ALL);
+        w.extend((0..4).map(|v| v_mov_b32(v, 0)));
+        w.extend(mubuf(BUFFER_STORE_DWORD, 0, 8, 0));
+        w.extend(mubuf(BUFFER_STORE_DWORDX4, 0, 8, 12));
+        w.extend(mubuf(BUFFER_STORE_DWORD, 0, 12, 4));
+        w.extend(mubuf(BUFFER_ATOMIC_ADD, 0, 16, 8));
+        w.push(S_ENDPGM);
+
+        let param = |root, user_data, sgprs, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let uav = |k: u32| UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 8 * k,
+            lower_bound: k,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = NativeProgram {
+            stage: crate::HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                param(RootType::Constants, 0, 4, 0),
+                param(RootType::Table, 4, 1, 1),
+            ],
+            used: (0..3).map(uav).collect(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = crate::structure::structure(&p).expect("structure");
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = crate::io::raise(&p, &native).expect("io::raise");
+
+        // Disabled: zero view-mark bindings.
+        let off = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+        })
+        .expect("lower off");
+        assert!(!off.root_srvs.contains(&super::SLOT_VIEW_MARKS));
+        assert!(!off.root_uavs.contains(&super::SLOT_VIEW_WRITES));
+
+        // Enabled: emits both bindings, validates, and sets exact bits on GPU.
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: true,
+        })
+        .expect("lower on");
+        assert!(l.root_srvs.contains(&super::SLOT_VIEW_MARKS));
+        assert!(l.root_uavs.contains(&super::SLOT_VIEW_WRITES));
+        let shader = super::HostShader {
+            stage: crate::HwStage::Cs,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            samplers: l.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: res.root_indexed_views,
+            half_views: l.half_views,
+            group_split: 1,
+        };
+        assert!(shader.has_view_marks());
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        #[cfg(windows)]
+        {
+            use super::host::{Dispatch, Host, Root, View};
+            let _one = super::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let value = 0x1234_5678u32;
+            let marks = vec![100, 0xFFF0, super::VIEW_MARK_NONE, 0, 200, 0];
+            let mut ran = 0;
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+                let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = if u.root == RootType::Constants { value } else { 0 };
+                }
+                // `root_signature_for` sorts root views by slot:
+                // param 0 = user data, param 1 = SLOT_VIEW_WRITES (250), param 2 = SLOT_VIEW_MARKS (251).
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud)),
+                                (1, Root::Uav(8)),
+                                (2, Root::View { srv: true, data: marks.clone() }),
+                            ],
+                            views: &[View::RawUav(8), View::RawUav(8), View::RawUav(8)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+                assert_eq!(out[0], [value, 0, 0, value, value, value, value, 0], "{label}: view 0");
+                assert_eq!(out[1][1], value, "{label}: view 1");
+                assert_eq!(out[2][2], value, "{label}: atomic");
+                let marked: Vec<usize> = (0..out[3].len() * 32)
+                    .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
+                    .collect();
+                assert_eq!(marked, [100, 101, 200], "{label}: marked pages");
+                ran += 1;
+            }
+            assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+        }
     }
 }

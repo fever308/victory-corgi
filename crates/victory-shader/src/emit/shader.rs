@@ -97,6 +97,19 @@ pub const USER_ROOT_LIMIT: u32 = 0x107;
 /// counts the records (a ring); records of [`TRACE_WORDS`] dwords follow from byte
 /// [`TRACE_FIRST`] on.
 pub const SLOT_TRACE: u8 = 252;
+/// The root SRV `t<SLOT_VIEW_MARKS>` in [`ROOT_CBV_SPACE`] for shader write marks
+/// (`Options::view_marks`, `VICTORY_VIEW_MARKS=1`): a raw buffer of
+/// [`SLOT_STRIDES_COUNT`] pairs of dwords `(base_bit, phase)` indexed by view-heap
+/// slot. `base_bit == VIEW_MARK_NONE` means writes through that slot are not marked.
+pub const SLOT_VIEW_MARKS: u8 = 251;
+/// The root UAV `u<SLOT_VIEW_WRITES>` in [`ROOT_CBV_SPACE`] for shader write marks:
+/// a raw bitmap of [`VIEW_WRITE_BITS`] bits (1 bit per 64 KiB page).
+pub const SLOT_VIEW_WRITES: u8 = 250;
+/// A view-mark table entry's `base_bit` for a slot whose writes are not marked.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits in the [`SLOT_VIEW_WRITES`] bitmap (512 KiB); marks past it clamp to the
+/// last bit.
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// `RootType::Other` codes of the user-data dwords a traced shader reads: what it
 /// traces ([`TRACE_PIXEL`] or [`TRACE_THREAD`], 0 nothing), then x, y and z of the
 /// pixel or the thread, the stamp each record carries (the frame), the tag (the draw),
@@ -204,6 +217,9 @@ pub(crate) struct Shader {
     pub limits: Vec<(V, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The heap index of each handle of an unordered buffer view (writes
+    /// through it are marked via [`SLOT_VIEW_MARKS`] / [`SLOT_VIEW_WRITES`]).
+    pub view_index: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -264,6 +280,7 @@ impl Shader {
             root_srvs: Vec::new(),
             limits: Vec::new(),
             root_uavs: Vec::new(),
+            view_index: std::collections::HashMap::new(),
             flags: 0,
             nonuniform_handles: 0,
             coherent: false,
@@ -525,7 +542,12 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // Unordered typed, raw and structured buffers (kinds 10-12).
+        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.

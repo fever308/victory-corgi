@@ -516,10 +516,13 @@ impl HostPipeline {
                     // table of strides, the directory of title memory by
                     // address and its fault notes.
                     let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS || slot == victory_shader::emit::SLOT_TRACE
+                        slot == victory_shader::emit::SLOT_FAULTS
+                            || slot == victory_shader::emit::SLOT_TRACE
+                            || slot == victory_shader::emit::SLOT_VIEW_WRITES
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
+                            || slot == victory_shader::emit::SLOT_VIEW_MARKS
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the

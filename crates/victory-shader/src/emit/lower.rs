@@ -90,6 +90,9 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Writes through unordered buffer views mark their 64 KiB pages
+    /// (`SLOT_VIEW_MARKS` / `SLOT_VIEW_WRITES`).
+    pub view_marks: bool,
 }
 
 enum Stop {
@@ -3227,6 +3230,8 @@ impl<'a> Lower<'a> {
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        // Raw title-memory accesses go through the directory, not view-marks.
+        self.s.view_index.remove(&h);
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -7263,6 +7268,130 @@ impl<'a> Lower<'a> {
         Ok(Some(v))
     }
 
+    /// Reads the byte stride of the buffer view at heap slot `index` from the
+    /// host's view-stride table (`t<SLOT_STRIDES>`), clamping `index` inside
+    /// `SLOT_STRIDES_COUNT`.
+    fn stride_at(&mut self, index: V) -> V {
+        let c = self.cur;
+        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
+        let i32t = self.s.t.i32;
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let two = self.s.m.i32(2);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, two);
+        let table = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
+        let iu = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, byte, iu, mask, align],
+        );
+        let f = self.s.m.extract(c, r, 0);
+        self.as_int(f)
+    }
+
+    /// Marks the 64 KiB pages a write of `bytes` bytes at byte `x` of the
+    /// unordered buffer view `h` touches, in the lanes `guard` lets through:
+    /// sets the bits of its first and last byte in `u<SLOT_VIEW_WRITES>`,
+    /// emitting an atomic OR only where the bit is still clear. Does nothing
+    /// for non-heap handles (e.g. root UAVs) or when `Parts::view_marks` is
+    /// false.
+    fn mark_view_write(&mut self, h: V, x: V, bytes: u32, guard: Option<V>) {
+        if !self.x.view_marks {
+            return;
+        }
+        let Some(&index) = self.s.view_index.get(&h) else {
+            return;
+        };
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let last_slot = k(self, super::shader::SLOT_STRIDES_COUNT - 1);
+        let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last_slot]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let (k3, k4) = (k(self, 3), k(self, 4));
+        let at = self.s.m.bin(c, Bin::Shl, slot, k3);
+        let table = self.s.root_srv_handle(super::shader::SLOT_VIEW_MARKS);
+        let iu = self.s.m.undef(i32t);
+        let both = self.s.m.i8(3);
+        let entry = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, at, iu, both, k4],
+        );
+        let (base_f, phase_f) = (
+            self.s.m.extract(c, entry, 0),
+            self.s.m.extract(c, entry, 1),
+        );
+        let (base, phase) = (self.as_int(base_f), self.as_int(phase_f));
+        let none = k(self, super::shader::VIEW_MARK_NONE);
+        let valid = self.s.m.cmp(c, pred::NE, base, none);
+        let active = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, valid),
+            None => valid,
+        };
+        let first = self.s.m.bin(c, Bin::Add, phase, x);
+        let span = k(self, bytes.max(1) - 1);
+        let last = self.s.m.bin(c, Bin::Add, first, span);
+        let (k16, cap) = (k(self, 16), k(self, super::shader::VIEW_WRITE_BITS - 1));
+        let mut bits = Vec::with_capacity(2);
+        for byte in [first, last] {
+            let page = self.s.m.bin(c, Bin::LShr, byte, k16);
+            let n = self.s.m.bin(c, Bin::Add, base, page);
+            let over = self.s.m.cmp(c, pred::IUGT, n, cap);
+            bits.push(self.s.m.select(c, over, cap, n));
+        }
+        let bitmap = self.s.root_uav_handle(super::shader::SLOT_VIEW_WRITES);
+        let outer = self.begin_guarded(Some(active));
+        for (i, &n) in bits.iter().enumerate() {
+            let c = self.cur;
+            let (k5, k2, k31, one, zero) =
+                (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+            let word = self.s.m.bin(c, Bin::LShr, n, k5);
+            let word = self.s.m.bin(c, Bin::Shl, word, k2);
+            let bit = self.s.m.bin(c, Bin::And, n, k31);
+            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            // Most writes find their page already marked: a load, not an atomic.
+            let mask = self.s.m.i8(1);
+            let loaded = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[bitmap, word, iu, mask, k4],
+            );
+            let old_f = self.s.m.extract(c, loaded, 0);
+            let old = self.as_int(old_f);
+            let set = self.s.m.bin(c, Bin::And, old, bit);
+            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
+            if i == 1 {
+                let other = self.s.m.cmp(c, pred::NE, n, bits[0]);
+                clear = self.s.m.bin(c, Bin::And, clear, other);
+            }
+            let inner = self.begin_guarded(Some(clear));
+            // Operation 2 is OR.
+            self.s.op(
+                self.cur,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                78,
+                &[bitmap, k2, word, iu, iu, bit],
+            );
+            self.end_guarded(inner, &[]);
+        }
+        self.end_guarded(outer, &[]);
+    }
+
     /// The heap index of a descriptor that may differ between lanes,
     /// computed in the current block (or, chosen by control flow, at the
     /// join).
@@ -11254,17 +11383,18 @@ impl<'a> Lower<'a> {
                 }
                 self.end_guarded(second, &[]);
             }
+            self.mark_view_write(h, byte, bits / 8, None);
             self.end_guarded(at, &[]);
             return Ok(());
         }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+            let (h, coords, byte) = match index {
                 // A raw buffer (stride 1) read by index: the index is the byte.
                 Some(index) if used.is_some_and(|u| u.stride == 1) => {
                     let byte = self.s.m.bin(c, Bin::Add, index, off);
-                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu], byte)
                 }
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
@@ -11272,9 +11402,12 @@ impl<'a> Lower<'a> {
                         return Err("a structured buffer of unknown stride");
                     }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let s = self.s.m.i32(stride);
+                    let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                    let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
+                    (h, [index, off, iu], byte)
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu], off),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -11306,6 +11439,7 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
+            self.mark_view_write(h, byte, 4, None);
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
@@ -11342,6 +11476,7 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
+            let (byte, bytes);
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
@@ -11350,11 +11485,21 @@ impl<'a> Lower<'a> {
                 }
                 // Four unsigned integers for halves, four floats otherwise.
                 let component = if halves { 0x405 } else { 0x409 };
-                args.push(self.handle(site, src, false, (10 | u, component))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let h = self.handle(site, src, false, (10 | u, component))?;
+                let element = index.unwrap_or(self.s.m.i32(0));
+                args.push(h);
+                args.extend([element, iu]);
                 for x in vals {
                     args.push(if halves { x } else { self.as_float(x) });
                 }
+                // Element byte size comes from the view-stride table (16 bytes max).
+                (byte, bytes) = match self.s.view_index.get(&h).copied() {
+                    Some(at) if self.x.view_marks => {
+                        let stride = self.stride_at(at);
+                        (self.s.m.bin(self.cur, Bin::Mul, element, stride), 16)
+                    }
+                    _ => (element, 16),
+                };
                 (
                     69,
                     if halves {
@@ -11367,9 +11512,10 @@ impl<'a> Lower<'a> {
                 match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
                     Some(index) if used.is_some_and(|u| u.stride == 1) => {
-                        let byte = self.s.m.bin(c, Bin::Add, index, off);
+                        let b = self.s.m.bin(c, Bin::Add, index, off);
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([byte, iu]);
+                        args.extend([b, iu]);
+                        (byte, bytes) = (b, 4 * count);
                     }
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
@@ -11378,10 +11524,14 @@ impl<'a> Lower<'a> {
                         }
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
+                        let s = self.s.m.i32(stride);
+                        let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([off, iu]);
+                        (byte, bytes) = (off, 4 * count);
                     }
                 }
                 args.extend(&vals);
@@ -11395,6 +11545,7 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            self.mark_view_write(args[0], byte, bytes, None);
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -12378,6 +12529,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         })
     }
 
@@ -12427,6 +12579,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         })
     }
 
@@ -12538,6 +12691,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         }).unwrap();
 
         let container =
@@ -12951,6 +13105,7 @@ mod tests {
             outputs: vec![target.clone()],
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap();
         TEST_ROOT_LIMITS.set(Some(false));
@@ -12964,6 +13119,7 @@ mod tests {
             outputs: vec![target],
             prims: vec![],
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap();
         TEST_ROOT_LIMITS.set(None);

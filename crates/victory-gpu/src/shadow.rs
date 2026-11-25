@@ -278,6 +278,10 @@ pub(crate) struct Shadow {
     rebar: Option<RebarShadow>,
     /// Monotonic tick of the last loose-cache access (0 for registered buffers).
     last_used: AtomicU64,
+    /// First bit in the shader view-writes bitmap (`VICTORY_VIEW_MARKS=1`), one
+    /// bit per 64 KiB title page this copy touches; `None` when view marks are
+    /// off, for in-place buffers, or if the bitmap is full.
+    marks: Option<u32>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2494,6 +2498,9 @@ impl Drop for Shadow {
         if let Some(rebar) = &self.rebar {
             REBAR_SHADOW_BYTES.fetch_sub(rebar.bytes, Ordering::Relaxed);
         }
+        if let Some(base) = self.marks {
+            marks().give_back(base, mark_pages(self.start, self.len));
+        }
     }
 }
 
@@ -2817,7 +2824,7 @@ impl Shadow {
     /// copies does nothing ([`Shadow::update`], [`Shadow::gpu_writes`]).
     fn placed(placed: crate::inplace::Placed, start: u64, len: u64, window: bool) -> Shadow {
         crate::host::name(&placed.buffer, || format!("title memory {start:#x}+{len:#x} in place"));
-        let mut shadow = Shadow::new(placed.buffer, start as *mut u8, placed.gpu, start, len, None);
+        let mut shadow = Shadow::new_inner(placed.buffer, start as *mut u8, placed.gpu, start, len, None, false);
         // Not a copy: not counted with them, and nothing asks what the
         // title wrote there.
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -2849,9 +2856,24 @@ impl Shadow {
         len: u64,
         rebar_bytes: Option<u64>,
     ) -> Shadow {
+        Self::new_inner(buffer, data, gpu, start, len, rebar_bytes, view_marks_on())
+    }
+
+    fn new_inner(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        rebar_bytes: Option<u64>,
+        allocate_marks: bool,
+    ) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        let mark_base = allocate_marks
+            .then(|| marks().take(mark_pages(start, len)))
+            .flatten();
         Shadow {
             buffer,
             data,
@@ -2881,7 +2903,46 @@ impl Shadow {
                 hashes: Mutex::new(None),
             }),
             last_used: AtomicU64::new(0),
+            marks: mark_base,
         }
+    }
+
+    /// First bit in the shader view-writes bitmap for this copy, if allocated.
+    pub(crate) fn mark_base(&self) -> Option<u32> {
+        self.marks
+    }
+
+    /// The view-mark table entry `(base_bit, phase)` for an unordered buffer
+    /// view of this copy starting at title address `start`.
+    pub(crate) fn mark_entry(&self, start: u64) -> Option<(u32, u32)> {
+        let base = self.marks?;
+        let page = (start >> 16).checked_sub(self.start >> 16)?;
+        Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32))
+    }
+
+    /// Whether writes through unordered buffer views of this copy are marked
+    /// in the shader view-writes bitmap.
+    pub(crate) fn marked(&self) -> bool {
+        self.marks.is_some()
+    }
+
+    /// Filters `declared_title_ranges` down to only the 64 KiB title pages
+    /// marked in any of `bitmaps` (union with `unmarked_title_ranges`),
+    /// returning `(filtered_title_ranges, declared_pages, marked_pages)`.
+    pub(crate) fn filter_marked_spans(
+        &self,
+        declared_title_ranges: &[(usize, usize)],
+        unmarked_title_ranges: &[(usize, usize)],
+        bitmaps: &[&[u32]],
+    ) -> (Vec<(usize, usize)>, u64, u64) {
+        filter_title_ranges_by_marks(
+            self.start,
+            self.len,
+            self.marks,
+            declared_title_ranges,
+            unmarked_title_ranges,
+            bitmaps,
+        )
     }
 
     fn touch(&self) {
@@ -3020,6 +3081,20 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     #[track_caller]
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.gpu_writes_marked(list, address, len, false);
+    }
+
+    /// [`Shadow::gpu_writes`], with `marked` indicating that the shader marks
+    /// the 64 KiB pages it writes through unordered buffer views in the
+    /// view-writes bitmap (`VICTORY_VIEW_MARKS=1`).
+    #[track_caller]
+    pub(crate) fn gpu_writes_marked(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        marked: bool,
+    ) {
         if crate::host::bare() & 8 != 0 {
             return;
         }
@@ -3045,7 +3120,7 @@ impl Shadow {
                 );
             }
         }
-        list.defer_gpu_write(self, address as usize, len as usize);
+        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -5275,6 +5350,272 @@ pub(crate) fn exact_line(frames: f64) {
     );
 }
 
+/// Whether shader view-marks 64 KiB page filtering is enabled (`VICTORY_VIEW_MARKS=1`).
+pub(crate) fn view_marks_on() -> bool {
+    victory_shader::emit::view_marks_enabled()
+}
+
+/// Number of 64 KiB title pages touched by `[start, start + len)`.
+fn mark_pages(start: u64, len: u64) -> u32 {
+    ((start + len.max(1) - 1) >> 16).saturating_sub(start >> 16) as u32 + 1
+}
+
+/// Free-list allocator for runs of bits in the shader view-writes bitmap
+/// (`victory_shader::emit::VIEW_WRITE_BITS`), one bit per 64 KiB title page.
+#[derive(Default)]
+struct Marks {
+    /// Free bit runs below `end`, keyed by first bit -> run length.
+    free: BTreeMap<u32, u32>,
+    /// High-water mark of bits handed out; bits at or past `end` are unused.
+    end: u32,
+}
+
+static MARKS: Mutex<Marks> = Mutex::new(Marks {
+    free: BTreeMap::new(),
+    end: 0,
+});
+
+fn marks() -> std::sync::MutexGuard<'static, Marks> {
+    MARKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Marks {
+    /// Allocates a contiguous run of `n` bits (the last bit of `VIEW_WRITE_BITS`
+    /// is reserved as an overflow sink and never handed out).
+    fn take(&mut self, n: u32) -> Option<u32> {
+        if let Some((&at, &len)) = self.free.iter().find(|&(_, &len)| len >= n) {
+            self.free.remove(&at);
+            if len > n {
+                self.free.insert(at + n, len - n);
+            }
+            return Some(at);
+        }
+        if self.end.checked_add(n).is_some_and(|e| e < victory_shader::emit::VIEW_WRITE_BITS) {
+            let at = self.end;
+            self.end += n;
+            return Some(at);
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                "no bits left in the view-writes bitmap (VICTORY_VIEW_MARKS=1): new copies fall back to full declared-range compare"
+            )
+        });
+        None
+    }
+
+    /// Returns a run of `n` bits at `at`, coalescing with adjacent free runs.
+    fn give_back(&mut self, mut at: u32, mut n: u32) {
+        if let Some((&before, &len)) = self.free.range(..at).next_back()
+            && before + len == at
+        {
+            self.free.remove(&before);
+            (at, n) = (before, n + len);
+        }
+        if let Some(len) = self.free.remove(&(at + n)) {
+            n += len;
+        }
+        self.free.insert(at, n);
+    }
+}
+
+/// High-water mark of allocated bits in the view-writes bitmap.
+pub(crate) fn marks_end() -> u32 {
+    marks().end
+}
+
+/// GPU-side 64 KiB page bitmap (`SLOT_VIEW_WRITES`, `DEFAULT` heap in
+/// `UNORDERED_ACCESS` state) plus a matching zero-filled `UPLOAD` buffer for
+/// fast GPU-timeline clears after each submission's snapshot copy.
+struct ViewWritesBitmap {
+    uav: ID3D12Resource,
+    gpu: u64,
+    zero: ID3D12Resource,
+}
+
+// SAFETY: D3D12 resources are free-threaded; GPU accesses are strictly
+// ordered on the direct command queue.
+unsafe impl Send for ViewWritesBitmap {}
+// SAFETY: as above.
+unsafe impl Sync for ViewWritesBitmap {}
+
+fn view_writes_bitmap() -> Option<&'static ViewWritesBitmap> {
+    static BITMAP: OnceLock<Option<ViewWritesBitmap>> = OnceLock::new();
+    BITMAP
+        .get_or_init(|| {
+            let h = host()?;
+            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
+            let uav = h.default_buffer_in_state(
+                bytes,
+                windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )?;
+            crate::host::name(&uav, || "shader view-writes bitmap".into());
+            // SAFETY: live D3D12 buffer.
+            let gpu = unsafe { uav.GetGPUVirtualAddress() };
+            let (zero, data) = h.upload_buffer(bytes)?;
+            crate::host::name(&zero, || "shader view-writes clear source".into());
+            // SAFETY: mapped upload buffer of `bytes` bytes.
+            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            Some(ViewWritesBitmap { uav, gpu, zero })
+        })
+        .as_ref()
+}
+
+/// GPU virtual address of the shader view-writes bitmap (`SLOT_VIEW_WRITES`),
+/// allocated lazily when `VICTORY_VIEW_MARKS=1`.
+pub(crate) fn view_writes() -> Option<u64> {
+    view_writes_bitmap().map(|b| b.gpu)
+}
+
+/// `(uav_buffer, gpu_va, zero_upload_buffer)` for capturing and clearing the
+/// shader view-writes bitmap on the GPU timeline.
+pub(crate) fn view_writes_resources()
+-> Option<(&'static ID3D12Resource, u64, &'static ID3D12Resource)> {
+    view_writes_bitmap().map(|b| (&b.uav, b.gpu, &b.zero))
+}
+
+/// Pure helper: intersects `declared_title_ranges` (title addresses `[from, to)`)
+/// with the 64 KiB title pages whose bit is set in any of `bitmaps`, unioned with
+/// `unmarked_title_ranges` (which are always kept unfiltered).
+///
+/// Returns `(filtered_title_ranges, declared_pages, marked_pages)`.
+pub(crate) fn filter_title_ranges_by_marks(
+    start: u64,
+    len: u64,
+    mark_base: Option<u32>,
+    declared_title_ranges: &[(usize, usize)],
+    unmarked_title_ranges: &[(usize, usize)],
+    bitmaps: &[&[u32]],
+) -> (Vec<(usize, usize)>, u64, u64) {
+    let (s_start, s_end) = (start as usize, start.saturating_add(len) as usize);
+    let clamp_merge = |ranges: &[(usize, usize)]| -> Vec<(usize, usize)> {
+        let clamped: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter_map(|&(a, b)| {
+                let lo = a.clamp(s_start, s_end);
+                let hi = b.clamp(lo, s_end);
+                (lo < hi).then_some((lo, hi))
+            })
+            .collect();
+        if clamped.is_empty() {
+            Vec::new()
+        } else {
+            joined(clamped)
+        }
+    };
+    let declared = clamp_merge(declared_title_ranges);
+    if declared.is_empty() {
+        return (Vec::new(), 0, 0);
+    }
+    let mut declared_pages = 0u64;
+    let mut last_counted_page = usize::MAX;
+    for &(from, to) in &declared {
+        let p0 = from / PAGE;
+        let p1 = to.div_ceil(PAGE);
+        for p in p0..p1 {
+            if p != last_counted_page {
+                declared_pages += 1;
+                last_counted_page = p;
+            }
+        }
+    }
+    let Some(base) = mark_base else {
+        return (declared, declared_pages, declared_pages);
+    };
+    if bitmaps.is_empty() {
+        return (declared, declared_pages, declared_pages);
+    }
+    let unmarked = clamp_merge(unmarked_title_ranges);
+    let base_title_page = (start >> 16) as usize;
+    let max_k = mark_pages(start, len);
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut push_range = |lo: usize, hi: usize| {
+        if lo >= hi {
+            return;
+        }
+        match out.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    };
+    let mut marked_pages = 0u64;
+    let mut last_marked_page = usize::MAX;
+    for &(from, to) in &declared {
+        let p0 = from / PAGE;
+        let p1 = to.div_ceil(PAGE);
+        for p in p0..p1 {
+            let page_lo = p * PAGE;
+            let page_hi = page_lo.saturating_add(PAGE);
+            let lo = from.max(page_lo);
+            let hi = to.min(page_hi);
+            let k = p.saturating_sub(base_title_page) as u32;
+            let bit = base.saturating_add(k);
+            let is_marked = k < max_k
+                && bitmaps.iter().any(|words| {
+                    let wi = (bit / 32) as usize;
+                    wi < words.len() && (words[wi] >> (bit & 31)) & 1 != 0
+                });
+            if is_marked {
+                if p != last_marked_page {
+                    marked_pages += 1;
+                    last_marked_page = p;
+                }
+                push_range(lo, hi);
+            } else if !unmarked.is_empty() {
+                for &(u0, u1) in &unmarked {
+                    if u1 <= lo {
+                        continue;
+                    }
+                    if u0 >= hi {
+                        break;
+                    }
+                    push_range(lo.max(u0), hi.min(u1));
+                }
+            }
+        }
+    }
+    (out, declared_pages, marked_pages)
+}
+
+/// View-marks telemetry since the last frame line:
+/// `[0]`: total declared 64 KiB pages evaluated,
+/// `[1]`: marked 64 KiB pages (bit set by shaders),
+/// `[2]`: GPU bitmap captures recorded.
+static VIEW_MARKS_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub(crate) fn record_view_marks_filter(declared_pages: u64, marked_pages: u64) {
+    VIEW_MARKS_STATS[0].fetch_add(declared_pages, Ordering::Relaxed);
+    VIEW_MARKS_STATS[1].fetch_add(marked_pages, Ordering::Relaxed);
+}
+
+pub(crate) fn record_view_marks_capture() {
+    VIEW_MARKS_STATS[2].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Logs shader view-marks filtering telemetry alongside the frame-rate line.
+pub(crate) fn view_marks_line(frames: f64) {
+    if !view_marks_on() || frames <= 0.0 {
+        return;
+    }
+    let [declared, marked, captures] =
+        [0, 1, 2].map(|i| VIEW_MARKS_STATS[i].swap(0, Ordering::Relaxed));
+    if declared == 0 && captures == 0 {
+        return;
+    }
+    let skipped = declared.saturating_sub(marked);
+    let pct = if declared > 0 {
+        skipped as f64 * 100.0 / declared as f64
+    } else {
+        0.0
+    };
+    tracing::info!(
+        "view marks per frame (VICTORY_VIEW_MARKS=1): {:.1} marked of {:.1} declared 64 KiB pages ({pct:.1}% filtered out), {:.1} bitmap captures",
+        marked as f64 / frames,
+        declared as f64 / frames,
+        captures as f64 / frames,
+    );
+}
+
 #[cfg(test)]
 mod window_tests {
     use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
@@ -6429,5 +6770,117 @@ mod tests {
             let got = unsafe { std::slice::from_raw_parts(shadow.data, src.len()) };
             assert_eq!(got, src.as_slice());
         }
+    }
+
+    #[test]
+    fn view_marks_runs_are_reused_and_joined() {
+        assert_eq!(mark_pages(0, 0), 1);
+        assert_eq!(mark_pages(0, 1), 1);
+        assert_eq!(mark_pages(0, PAGE as u64), 1);
+        assert_eq!(mark_pages(0, PAGE as u64 + 1), 2);
+        // Unaligned start crossing a 64 KiB boundary spans 2 pages.
+        assert_eq!(mark_pages((PAGE as u64) - 4, 8), 2);
+        assert_eq!(mark_pages((PAGE as u64) - 4, 4), 1);
+
+        let mut pool = Marks {
+            free: BTreeMap::new(),
+            end: 0,
+        };
+        let a = pool.take(4).expect("run a");
+        let b = pool.take(6).expect("run b");
+        let c = pool.take(2).expect("run c");
+        assert_eq!((a, b, c), (0, 4, 10));
+        assert_eq!(pool.end, 12);
+
+        // Give back outer runs, then middle: all three coalesce into 0..12.
+        pool.give_back(a, 4);
+        pool.give_back(c, 2);
+        assert_eq!(pool.free.len(), 2);
+        pool.give_back(b, 6);
+        assert_eq!(pool.free.len(), 1);
+        assert_eq!(pool.free.get(&0), Some(&12));
+
+        // Reusing a slice leaves the remainder in the free list.
+        assert_eq!(pool.take(5), Some(0));
+        assert_eq!(pool.free.get(&5), Some(&7));
+        assert_eq!(pool.take(7), Some(5));
+        assert!(pool.free.is_empty());
+
+        // The last bit (`VIEW_WRITE_BITS - 1`) is reserved as an overflow sink.
+        let mut full = Marks {
+            free: BTreeMap::new(),
+            end: victory_shader::emit::VIEW_WRITE_BITS - 2,
+        };
+        assert_eq!(full.take(2), None);
+        assert_eq!(full.take(1), Some(victory_shader::emit::VIEW_WRITE_BITS - 2));
+        assert_eq!(full.take(1), None);
+    }
+
+    #[test]
+    fn view_marks_filter_spans_respects_marked_unmarked_and_multi_flight() {
+        // Shadow starting unaligned inside title page 0x10 (+0x1234) covering 5 title pages (0x10..=0x14).
+        let base_page = 0x10usize;
+        let start = (base_page * PAGE + 0x1234) as u64;
+        let len = (4 * PAGE) as u64; // ends at 0x14 * PAGE + 0x1234
+        let mark_base = 30u32; // crosses a 32-bit word boundary (bits 30..=34)
+
+        let declared = [(start as usize, (start + len) as usize)];
+
+        // Flight 1 marks page +0 (bit 30) and page +3 (bit 33); flight 2 marks page +1 (bit 31).
+        let mut bm1 = [0u32; 2];
+        bm1[0] |= 1 << 30;
+        bm1[1] |= 1 << (33 - 32);
+        let mut bm2 = [0u32; 2];
+        bm2[0] |= 1 << 31;
+
+        // Multi-flight union: pages +0 and +1 merge into one span; page +3 is separate.
+        let (filtered, decl_pages, marked_pages) =
+            filter_title_ranges_by_marks(start, len, Some(mark_base), &declared, &[], &[&bm1, &bm2]);
+        assert_eq!(decl_pages, 5);
+        assert_eq!(marked_pages, 3);
+        assert_eq!(
+            filtered,
+            vec![
+                (start as usize, (base_page + 2) * PAGE),
+                ((base_page + 3) * PAGE, (base_page + 4) * PAGE),
+            ]
+        );
+
+        // Unmarked range inside page +2 (not set in bitmap) is preserved without inflating marked_pages.
+        let unmarked = [((base_page + 2) * PAGE + 0x400, (base_page + 2) * PAGE + 0x800)];
+        let (filtered_with_unmarked, decl2, marked2) = filter_title_ranges_by_marks(
+            start,
+            len,
+            Some(mark_base),
+            &declared,
+            &unmarked,
+            &[&bm1],
+        );
+        assert_eq!(decl2, 5);
+        assert_eq!(marked2, 2);
+        assert_eq!(
+            filtered_with_unmarked,
+            vec![
+                (start as usize, (base_page + 1) * PAGE),
+                ((base_page + 2) * PAGE + 0x400, (base_page + 2) * PAGE + 0x800),
+                ((base_page + 3) * PAGE, (base_page + 4) * PAGE),
+            ]
+        );
+
+        // Zero bits set -> empty filtered spans (0% readback!).
+        let zero = [0u32; 2];
+        let (none, decl3, marked3) =
+            filter_title_ranges_by_marks(start, len, Some(mark_base), &declared, &[], &[&zero]);
+        assert_eq!(decl3, 5);
+        assert_eq!(marked3, 0);
+        assert!(none.is_empty());
+
+        // Missing mark_base or empty bitmaps -> safe fallback to full declared ranges.
+        let (fb1, d1, m1) =
+            filter_title_ranges_by_marks(start, len, None, &declared, &[], &[&zero]);
+        assert_eq!((fb1, d1, m1), (declared.to_vec(), 5, 5));
+        let (fb2, d2, m2) =
+            filter_title_ranges_by_marks(start, len, Some(mark_base), &declared, &[], &[]);
+        assert_eq!((fb2, d2, m2), (declared.to_vec(), 5, 5));
     }
 }

@@ -1040,11 +1040,12 @@ void main() {
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                let constants = [0u32, 0, size as u32, PIECES, 0, mode, u32::MAX];
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, differs_gpu);
                 warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
@@ -1136,11 +1137,12 @@ void main() {
             unsafe {
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, SKEW, size as u32, pieces, 0, mode];
-                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                let constants = [0u32, SKEW, size as u32, pieces, 0, mode, u32::MAX];
+                warp.list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, differs_gpu);
                 // One group per piece (the 64-thread compare).
                 warp.list.Dispatch(pieces, 1, 1);
                 if mode == 2 {

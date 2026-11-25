@@ -2160,20 +2160,22 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// piece flagged for a byte just outside the range costs a fetch that finds
 /// nothing.
 pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2)"
 cbuffer Span : register(b0) {
-    uint first;    // the first piece
-    uint skew;     // where the copy starts in its piece 0
-    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
+    uint first;     // the first piece
+    uint skew;      // where the copy starts in its piece 0
+    uint size;      // the copy's buffer, in bytes (a multiple of 64 KiB)
     uint pieces;
-    uint out_at;   // the first piece's dword in `differs`, in bytes
-    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+    uint out_at;    // the first piece's dword in `differs`, in bytes
+    uint compare;   // 0: the hashes are stored; else compared with those stored (2: and then stored)
+    uint mark_base; // base bit in `marks` (0xFFFFFFFFu = no view-mark filter)
 };
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+RWByteAddressBuffer marks : register(u2);
 groupshared uint4 shared_h[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
@@ -2182,22 +2184,30 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     if (idx >= pieces) return;
     uint lane = gtid.x;
     uint piece = first + idx;
-    uint lo = piece * 65536u;
-    lo = lo > skew ? lo - skew : 0u;
-    uint hi = min((piece + 1u) * 65536u - skew, size);
-    lo = lo & ~15u;
-    hi = (hi + 15u) & ~15u;
+    bool active = true;
+    if (compare != 0u && mark_base != 0xFFFFFFFFu) {
+        uint bit = min(mark_base + piece, 4194303u);
+        uint word = marks.Load((bit >> 5u) << 2u);
+        active = ((word & (1u << (bit & 31u))) != 0u);
+    }
     uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ (lane * 0x9E3779B9u);
-    [loop]
-    for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    if (active) {
+        uint lo = piece * 65536u;
+        lo = lo > skew ? lo - skew : 0u;
+        uint hi = min((piece + 1u) * 65536u - skew, size);
+        lo = lo & ~15u;
+        hi = (hi + 15u) & ~15u;
+        [loop]
+        for (uint at = lo + lane * 16u; at < hi; at += 1024u) {
+            h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            h = h.yzwx ^ (h >> 15);
+        }
     }
     shared_h[lane] = h;
     GroupMemoryBarrierWithGroupSync();
     [unroll]
     for (uint stride = 32u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
+        if (active && lane < stride) {
             uint4 a = shared_h[lane];
             uint4 b = shared_h[lane + stride];
             a = (a ^ b) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
@@ -2206,14 +2216,18 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
         GroupMemoryBarrierWithGroupSync();
     }
     if (lane == 0u) {
-        uint4 final_h = shared_h[0];
-        if (compare != 0u) {
-            differs.Store(out_at + idx * 4u, any(final_h != hashes.Load4(piece * 16u)) ? 1u : 0u);
-            // With the copy-back on its own thread: the next compare of the
-            // piece finds what is written from here on.
-            if (compare == 2u) hashes.Store4(piece * 16u, final_h);
+        if (!active) {
+            differs.Store(out_at + idx * 4u, 0u);
         } else {
-            hashes.Store4(piece * 16u, final_h);
+            uint4 final_h = shared_h[0];
+            if (compare != 0u) {
+                differs.Store(out_at + idx * 4u, any(final_h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+                // With the copy-back on its own thread: the next compare of the
+                // piece finds what is written from here on.
+                if (compare == 2u) hashes.Store4(piece * 16u, final_h);
+            } else {
+                hashes.Store4(piece * 16u, final_h);
+            }
         }
     }
 }
@@ -2233,15 +2247,24 @@ unsafe fn dispatch_card_compare(
     pieces: u32,
     out_at_bytes: u32,
     compare: u32,
+    mark_base: u32,
 ) {
     const MAX_GROUPS: u32 = 65_535;
     let mut done = 0u32;
     while done < pieces {
         let chunk = (pieces - done).min(MAX_GROUPS);
-        let constants = [first + done, skew, size, chunk, out_at_bytes + done * 4, compare];
+        let constants = [
+            first + done,
+            skew,
+            size,
+            chunk,
+            out_at_bytes + done * 4,
+            compare,
+            mark_base,
+        ];
         // SAFETY: caller guarantees `list` is open with CARD_COMPARE bound.
         unsafe {
-            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
             list.Dispatch(chunk, 1, 1);
         }
         done += chunk;
@@ -2582,6 +2605,9 @@ struct CardRange {
     at: u32,
     /// Whether the card compares it; else every piece is fetched.
     compared: bool,
+    /// Base bit in `SLOT_VIEW_WRITES` when all writes overlapping this range
+    /// were marked by shaders (`VIEW_MARK_NONE` = no view-mark filter).
+    mark_base: u32,
 }
 
 /// What a submission does for copies in the card's memory.
@@ -2626,8 +2652,9 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// `bool`: whether the shader marks written 64 KiB pages in the view-writes bitmap.
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -3155,8 +3182,57 @@ fn late_writes() -> bool {
 }
 
 /// Per host copy, the ranges a submission's shaders may write, as declared
-/// (address, end).
-type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+/// `(address, end)`, and the subset declared without shader view-marks
+/// (always compared unfiltered).
+type Declared = (
+    std::sync::Arc<crate::shadow::Shadow>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize)>,
+);
+
+/// Reusable pool of direct helper command lists and 512 KiB `READBACK` buffers
+/// for capturing and clearing the GPU shader view-writes bitmap
+/// (`SLOT_VIEW_WRITES`) on the GPU timeline at the end of each submission.
+#[derive(Default)]
+struct ViewMarksPool {
+    lists: Vec<Prelude>,
+    slots: Vec<(ID3D12Resource, usize, u64)>,
+}
+
+// SAFETY: D3D12 resources are free-threaded; mapped `READBACK` pointers are
+// read only after their submission's GPU fence has completed.
+unsafe impl Send for ViewMarksPool {}
+
+static VIEW_MARKS_POOL: Mutex<ViewMarksPool> = Mutex::new(ViewMarksPool {
+    lists: Vec::new(),
+    slots: Vec::new(),
+});
+
+/// One submission's GPU-timeline snapshot of the shader view-writes bitmap.
+struct ViewMarksCapture {
+    list: Prelude,
+    slot: (ID3D12Resource, usize, u64),
+    words: usize,
+}
+
+// SAFETY: same as `ViewMarksPool`.
+unsafe impl Send for ViewMarksCapture {}
+
+impl ViewMarksCapture {
+    fn words(&self) -> &[u32] {
+        if self.words == 0 {
+            return &[];
+        }
+        // SAFETY: submission fence completed and `slot` covers `words * 4` bytes.
+        unsafe { std::slice::from_raw_parts(self.slot.1 as *const u32, self.words) }
+    }
+
+    fn recycle(self) {
+        let mut pool = VIEW_MARKS_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.lists.push(self.list);
+        pool.slots.push(self.slot);
+    }
+}
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -3165,6 +3241,7 @@ struct Sent {
     number: u64,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    marks: Option<ViewMarksCapture>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     exec_epoch: ExecEpochGuard,
@@ -3181,6 +3258,7 @@ struct Flight {
     order: Vec<usize>,
     card: Option<CardPlan>,
     back: Vec<Declared>,
+    marks: Option<ViewMarksCapture>,
     _exec_epoch: ExecEpochGuard,
 }
 
@@ -3324,7 +3402,7 @@ fn why_read_say(kind: &str, src: usize, len: usize, written: &[(usize, usize)]) 
     let flights = line.line.iter().filter(|l| matches!(l, Late::Run(_))).count();
     let mut first = None;
     for (i, item) in line.line.iter().filter_map(|l| if let Late::Run(f) = l { Some(f) } else { None }).enumerate() {
-        if item.back.iter().any(|(_, r)| r.iter().any(|&(a, b)| a < src + len && src < b)) {
+        if item.back.iter().any(|(_, r, _)| r.iter().any(|&(a, b)| a < src + len && src < b)) {
             first.get_or_insert(i);
         }
     }
@@ -4029,14 +4107,22 @@ fn relay_worker() {
 /// once, the pieces that differ found on several threads; but the merge is
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
-fn relay_hand_back(back: &[Declared]) {
+fn relay_hand_back(back: &[Declared], bitmaps: &[&[u32]]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-    for (shadow, declared) in back {
+    for (shadow, declared, unmarked) in back {
         if shadow.carded() || shadow.is_rebar() {
             continue;
         }
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        join_ranges(&mut spans, declared.iter().copied());
+        let spans = if !bitmaps.is_empty() && shadow.marked() {
+            let (filtered, decl_pages, marked_pages) =
+                shadow.filter_marked_spans(declared, unmarked, bitmaps);
+            crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+            filtered
+        } else {
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            join_ranges(&mut spans, declared.iter().copied());
+            spans
+        };
         for &(from, to) in &spans {
             shadow.relay_compared(from, to - from);
         }
@@ -4268,15 +4354,23 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len, marked) = step {
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
+                let is_unmarked = !*marked || !shadow.marked();
+                match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                    Some((_, ranges, unmarked)) => {
                         if !ranges.contains(&range) {
                             ranges.push(range);
                         }
+                        if is_unmarked && !unmarked.contains(&range) {
+                            unmarked.push(range);
+                        }
                     }
-                    None => back.push((shadow.clone(), vec![range])),
+                    None => back.push((
+                        shadow.clone(),
+                        vec![range],
+                        if is_unmarked { vec![range] } else { Vec::new() },
+                    )),
                 }
             }
         }
@@ -4362,24 +4456,32 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
+fn hand_back(back: &[Declared], bitmaps: &[&[u32]]) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for (shadow, declared) in back {
+        for (shadow, declared, unmarked) in back {
             if shadow.carded() || shadow.is_rebar() {
                 continue;
             }
-            let mut sorted = declared.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
+            let spans = if !bitmaps.is_empty() && shadow.marked() {
+                let (filtered, decl_pages, marked_pages) =
+                    shadow.filter_marked_spans(declared, unmarked, bitmaps);
+                crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+                filtered
+            } else {
+                let mut sorted = declared.clone();
+                sorted.sort_unstable();
+                let mut spans: Vec<(usize, usize)> = Vec::new();
+                for (from, to) in sorted {
+                    match spans.last_mut() {
+                        Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                        _ => spans.push((from, to)),
+                    }
                 }
-            }
+                spans
+            };
             work.extend(spans.into_iter().map(|(from, to)| (shadow.clone(), from, to)));
         }
         #[cfg(feature = "diagnostics")]
@@ -4393,32 +4495,40 @@ fn hand_back(back: &[Declared]) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written);
         }
-        for (shadow, declared) in back {
+        for (shadow, declared, _) in back {
             shadow.copy_back_done(declared);
         }
         return;
     }
-    for (shadow, declared) in back {
+    for (shadow, declared, unmarked) in back {
         if shadow.carded() || shadow.is_rebar() {
             // Done before (`Host::card_back` / `Host::rebar_back`).
             shadow.copy_back_done(declared);
             continue;
         }
-        // Each byte compared once: the world declares dozens of views
-        // of its 174 MB heap that overlap almost entirely, and comparing
-        // every one whole was gigabytes a frame (0.3-0.5 s) for the few
-        // MB shaders wrote. Only ranges that overlap or touch are
-        // joined: what lies between two was not given to shaders (the
-        // snapshot does not hold it).
-        let mut sorted = declared.clone();
-        sorted.sort_unstable();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (from, to) in sorted {
-            match spans.last_mut() {
-                Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                _ => spans.push((from, to)),
+        let spans = if !bitmaps.is_empty() && shadow.marked() {
+            let (filtered, decl_pages, marked_pages) =
+                shadow.filter_marked_spans(declared, unmarked, bitmaps);
+            crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+            filtered
+        } else {
+            // Each byte compared once: the world declares dozens of views
+            // of its 174 MB heap that overlap almost entirely, and comparing
+            // every one whole was gigabytes a frame (0.3-0.5 s) for the few
+            // MB shaders wrote. Only ranges that overlap or touch are
+            // joined: what lies between two was not given to shaders (the
+            // snapshot does not hold it).
+            let mut sorted = declared.clone();
+            sorted.sort_unstable();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for (from, to) in sorted {
+                match spans.last_mut() {
+                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                    _ => spans.push((from, to)),
+                }
             }
-        }
+            spans
+        };
         for (from, to) in spans {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -4793,21 +4903,30 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
-        // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        // The ranges this submission's shaders may write, per copy, with the
+        // subset declared without shader view-marks.
+        let mut declared: Vec<Declared> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, marked) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
+                    let is_unmarked = !*marked || !shadow.marked();
+                    match declared.iter_mut().find(|(s, _, _)| Arc::ptr_eq(s, shadow)) {
+                        Some((_, ranges, unmarked)) => {
                             if !ranges.contains(&range) {
                                 ranges.push(range);
                             }
+                            if is_unmarked && !unmarked.contains(&range) {
+                                unmarked.push(range);
+                            }
                         }
-                        None => declared.push((shadow.clone(), vec![range])),
+                        None => declared.push((
+                            shadow.clone(),
+                            vec![range],
+                            if is_unmarked { vec![range] } else { Vec::new() },
+                        )),
                     }
                 }
             }
@@ -4831,7 +4950,7 @@ impl Host {
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
-        for (shadow, _) in &declared {
+        for (shadow, _, _) in &declared {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
@@ -4886,6 +5005,7 @@ impl Host {
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(4, work.differs.0.GetGPUVirtualAddress());
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
@@ -4896,7 +5016,16 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
+                            dispatch_card_compare(
+                                list,
+                                run.first,
+                                run.skew,
+                                size as u32,
+                                run.pieces,
+                                0,
+                                0,
+                                victory_shader::emit::VIEW_MARK_NONE,
+                            );
                         }
                     }
                     list.Close()?;
@@ -4924,7 +5053,10 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
+        let view_marks_gpu = crate::shadow::view_marks_on()
+            .then(crate::shadow::view_writes)
+            .flatten();
+        for (shadow, ranges, unmarked) in &declared {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4940,12 +5072,19 @@ impl Host {
                     continue;
                 };
                 let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let has_unmarked = unmarked.iter().any(|&(u0, u1)| u0 < to && from < u1);
+                let mark_base = if view_marks_gpu.is_some() && !has_unmarked {
+                    shadow.mark_base().unwrap_or(victory_shader::emit::VIEW_MARK_NONE)
+                } else {
+                    victory_shader::emit::VIEW_MARK_NONE
+                };
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
                     at,
                     compared,
+                    mark_base,
                 });
                 if compared {
                     at += span.pieces;
@@ -4978,6 +5117,10 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(
+                        4,
+                        view_marks_gpu.unwrap_or_else(|| work.differs.0.GetGPUVirtualAddress()),
+                    );
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
@@ -4992,6 +5135,7 @@ impl Host {
                             r.span.pieces,
                             r.at * 4,
                             if flown { 2 } else { 1 },
+                            r.mark_base,
                         );
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
@@ -5127,7 +5271,13 @@ impl Host {
     /// With [`inflight_fetch`], card-copy pieces are first looked for where the
     /// flights' own compare lists put them ([`Host::relay_card_inflight`]);
     /// when that succeeds only ReBAR spans (if any) are DMAed here.
-    fn relay_fetch_back(&self, plans: &[&CardPlan], back: &[Declared], fetch: &mut Option<RelayFetch>) {
+    fn relay_fetch_back(
+        &self,
+        plans: &[&CardPlan],
+        back: &[Declared],
+        bitmaps: &[&[u32]],
+        fetch: &mut Option<RelayFetch>,
+    ) {
         struct RebarEntry {
             shadow: std::sync::Arc<crate::shadow::Shadow>,
             spans: Vec<(usize, usize)>,
@@ -5185,13 +5335,33 @@ impl Host {
             }
         }
 
+        if !bitmaps.is_empty() {
+            for plan in plans {
+                for r in &plan.ranges {
+                    if r.mark_base != victory_shader::emit::VIEW_MARK_NONE {
+                        let (_, decl_pages, marked_pages) =
+                            r.shadow.filter_marked_spans(&[r.declared], &[], bitmaps);
+                        crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+                    }
+                }
+            }
+        }
+
         let mut rebar_entries: Vec<RebarEntry> = Vec::new();
         let mut total = card_total;
-        for (shadow, declared) in back {
+        for (shadow, declared, unmarked) in back {
             if !shadow.is_rebar() {
                 continue;
             }
-            let ranges: Vec<(usize, usize)> = declared
+            let title_spans = if !bitmaps.is_empty() && shadow.marked() {
+                let (filtered, decl_pages, marked_pages) =
+                    shadow.filter_marked_spans(declared, unmarked, bitmaps);
+                crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+                filtered
+            } else {
+                declared.clone()
+            };
+            let ranges: Vec<(usize, usize)> = title_spans
                 .iter()
                 .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
                 .filter(|&(from, to)| from < to)
@@ -5377,7 +5547,7 @@ impl Host {
 
     #[cfg(test)]
     fn relay_rebar_back(&self, back: &[Declared], fetch: &mut Option<RelayFetch>) {
-        self.relay_fetch_back(&[], back, fetch);
+        self.relay_fetch_back(&[], back, &[], fetch);
     }
 
     /// [`Host::relay_fetch_back`] with [`inflight_fetch`]: the pieces these
@@ -5561,29 +5731,44 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
+                let bitmaps: Vec<&[u32]> = flights
+                    .iter()
+                    .filter_map(|f| f.marks.as_ref().map(ViewMarksCapture::words))
+                    .collect();
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
+                    let flight_has_marks = flight.marks.is_some();
+                    for (shadow, ranges, unmarked) in &flight.back {
+                        let flight_unmarked = if flight_has_marks { unmarked } else { ranges };
+                        match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                            Some((_, all, all_unmarked)) => {
                                 for range in ranges {
                                     if !all.contains(range) {
                                         all.push(*range);
                                     }
                                 }
+                                for range in flight_unmarked {
+                                    if !all_unmarked.contains(range) {
+                                        all_unmarked.push(*range);
+                                    }
+                                }
                             }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                            None => back.push((
+                                shadow.clone(),
+                                ranges.clone(),
+                                flight_unmarked.clone(),
+                            )),
                         }
                     }
                 }
                 fill_ahead::landing(flights.iter().map(|f| f.number).min().unwrap_or(0));
-                self.relay_fetch_back(&plans, &back, fetch);
-                relay_hand_back(&back);
+                self.relay_fetch_back(&plans, &back, &bitmaps, fetch);
+                relay_hand_back(&back, &bitmaps);
                 fill_ahead::landing(0);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
+                    for (shadow, ranges, _) in &flight.back {
                         shadow.copy_back_done(ranges);
                     }
                 }
@@ -5604,6 +5789,9 @@ impl Host {
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
+                    }
+                    if let Some(marks) = flight.marks {
+                        marks.recycle();
                     }
                     landed.push((flight.lists, flight.order));
                 }
@@ -5652,7 +5840,7 @@ impl Host {
             for item in items.iter() {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
-                    ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.back.iter().flat_map(|(_, r, _)| r.iter().copied()));
                 }
             }
             join_ranges(written, ranges);
@@ -5831,7 +6019,7 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, sent.back.iter().flat_map(|(_, ranges, _)| ranges.iter().copied()));
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5841,6 +6029,7 @@ impl Host {
                 order,
                 card: sent.card,
                 back: sent.back,
+                marks: sent.marks,
                 _exec_epoch: sent.exec_epoch,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
@@ -5876,7 +6065,7 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, sent.back.iter().flat_map(|(_, ranges, _)| ranges.iter().copied()));
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5886,6 +6075,7 @@ impl Host {
                 order: Vec::new(),
                 card: sent.card,
                 back: sent.back,
+                marks: sent.marks,
                 _exec_epoch: sent.exec_epoch,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
@@ -5988,6 +6178,13 @@ impl Host {
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
+                let bitmaps: Vec<&[u32]> = items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Late::Run(flight) => flight.marks.as_ref().map(ViewMarksCapture::words),
+                        _ => None,
+                    })
+                    .collect();
                 let mut back: Vec<Declared> = Vec::new();
                 for item in &items {
                     let Late::Run(flight) = item else {
@@ -5995,22 +6192,42 @@ impl Host {
                     };
                     if let Some(card) = &flight.card {
                         self.card_back(card, submitted, &mut seen);
+                        if !bitmaps.is_empty() {
+                            for r in &card.ranges {
+                                if r.mark_base != victory_shader::emit::VIEW_MARK_NONE {
+                                    let (_, decl_pages, marked_pages) =
+                                        r.shadow.filter_marked_spans(&[r.declared], &[], &bitmaps);
+                                    crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+                                }
+                            }
+                        }
                     }
-                    for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
+                    let flight_has_marks = flight.marks.is_some();
+                    for (shadow, ranges, unmarked) in &flight.back {
+                        let flight_unmarked = if flight_has_marks { unmarked } else { ranges };
+                        match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                            Some((_, all, all_unmarked)) => {
                                 for range in ranges {
                                     if !all.contains(range) {
                                         all.push(*range);
                                     }
                                 }
+                                for range in flight_unmarked {
+                                    if !all_unmarked.contains(range) {
+                                        all_unmarked.push(*range);
+                                    }
+                                }
                             }
-                            None => back.push((shadow.clone(), ranges.clone())),
+                            None => back.push((
+                                shadow.clone(),
+                                ranges.clone(),
+                                flight_unmarked.clone(),
+                            )),
                         }
                     }
                 }
-                self.rebar_back(submitted, &back);
-                hand_back(&back);
+                self.rebar_back(submitted, &back, &bitmaps);
+                hand_back(&back, &bitmaps);
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
             // In the order given: what tells the title the card is done.
@@ -6025,6 +6242,9 @@ impl Host {
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
+                        }
+                        if let Some(marks) = flight.marks {
+                            marks.recycle();
                         }
                         landed.push((flight.lists, flight.order));
                     }
@@ -6203,7 +6423,7 @@ impl Host {
         let back = declared_writes(runs);
         let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
         if !late {
-            for (shadow, declared) in &back {
+            for (shadow, declared, unmarked) in &back {
                 if !shadow.is_rebar() {
                     continue;
                 }
@@ -6214,12 +6434,20 @@ impl Host {
                     .collect();
                 let declared_spans = merge_ranges(ranges);
                 let piece_runs = spans_to_piece_runs(&declared_spans);
+                let mark_base = if crate::shadow::view_marks_on() && unmarked.is_empty() {
+                    shadow.mark_base()
+                } else {
+                    None
+                };
                 rebar_entries.push(RebarWriteEntry {
                     shadow: shadow.clone(),
+                    declared_title: declared.clone(),
+                    unmarked_title: unmarked.clone(),
                     declared_spans,
                     piece_runs,
                     compare_out_base: None,
                     compare_pieces: 0,
+                    mark_base,
                 });
             }
         }
@@ -6228,8 +6456,19 @@ impl Host {
         } else {
             self.prepare_rebar_hash_plan(&mut rebar_entries)
         };
+        let (mut marks_list, marks_capture) = if !back.is_empty() {
+            match self.record_view_marks_capture() {
+                Some((cl, cap)) => (Some(cl), Some(cap)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         let prepared = std::time::Instant::now();
         if late {
+            if let Some(cl) = marks_list.take() {
+                lists.push(Some(cl));
+            }
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -6249,6 +6488,7 @@ impl Host {
                 number: this_submission,
                 card,
                 back,
+                marks: marks_capture,
                 writes,
                 exec_epoch,
             };
@@ -6270,14 +6510,20 @@ impl Host {
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
-        } else if rebar_hash_plan.pre_list.is_some() || rebar_hash_plan.post_list.is_some() {
-            batched_lists.reserve(lists.len() + 2);
+        } else if rebar_hash_plan.pre_list.is_some()
+            || rebar_hash_plan.post_list.is_some()
+            || marks_list.is_some()
+        {
+            batched_lists.reserve(lists.len() + 3);
             if let Some(pre) = rebar_hash_plan.pre_list.take() {
                 batched_lists.push(Some(pre));
             }
             batched_lists.extend(lists.iter().cloned());
             if let Some(post) = rebar_hash_plan.post_list.take() {
                 batched_lists.push(Some(post));
+            }
+            if let Some(cl) = marks_list.take() {
+                batched_lists.push(Some(cl));
             }
             vec![&batched_lists[..]]
         } else {
@@ -6345,6 +6591,10 @@ impl Host {
         if timed && let Some(post) = rebar_hash_plan.post_list {
             post_compare_ok = self.submit_helper_list(&mut submitted, post, "ReBAR post-compare");
         }
+        let mut marks_capture_ok = true;
+        if timed && let Some(cl) = marks_list.take() {
+            marks_capture_ok = self.submit_helper_list(&mut submitted, cl, "view-marks capture");
+        }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         let gpu = prepared.elapsed();
@@ -6382,10 +6632,24 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        let bitmaps: Vec<&[u32]> = if marks_capture_ok {
+            marks_capture.iter().map(ViewMarksCapture::words).collect()
+        } else {
+            Vec::new()
+        };
         // For copies in the card's memory the compare has run there: the
         // pieces that differ are fetched and merged.
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+            if !bitmaps.is_empty() {
+                for r in &card.ranges {
+                    if r.mark_base != victory_shader::emit::VIEW_MARK_NONE {
+                        let (_, decl_pages, marked_pages) =
+                            r.shadow.filter_marked_spans(&[r.declared], &[], &bitmaps);
+                        crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+                    }
+                }
+            }
         }
         if !rebar_entries.is_empty() {
             self.finish_rebar_copy_back(
@@ -6396,9 +6660,13 @@ impl Host {
                 } else {
                     0
                 },
+                &bitmaps,
             );
         }
-        hand_back(&back);
+        hand_back(&back, &bitmaps);
+        if let Some(marks) = marks_capture {
+            marks.recycle();
+        }
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -7612,7 +7880,7 @@ impl HostList {
         if copy_after() {
             let (from, to) = (src as usize, src as usize + len);
             let gpu_written = deferred.copies.iter().any(|step| {
-                matches!(step, Step::GpuWrite(_, at, n) if *at < to && from < *at + *n)
+                matches!(step, Step::GpuWrite(_, at, n, _) if *at < to && from < *at + *n)
             });
             if gpu_written {
                 let n = COPIES_AFTER.fetch_add(1, Ordering::Relaxed) + 1;
@@ -7709,15 +7977,17 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// `marked`: shaders mark the 64 KiB pages they write in `SLOT_VIEW_WRITES`.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        marked: bool,
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7963,7 +8233,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -9172,7 +9442,7 @@ impl Host {
 
     /// Copies back GPU-written ranges of any ReBAR shadows in `back` via a
     /// batched `READBACK` DMA so write-combining VRAM is never read by the CPU.
-    fn rebar_back(&self, submitted: &mut u64, back: &[Declared]) {
+    fn rebar_back(&self, submitted: &mut u64, back: &[Declared], bitmaps: &[&[u32]]) {
         struct RebarMerged {
             shadow: std::sync::Arc<crate::shadow::Shadow>,
             spans: Vec<(usize, usize)>,
@@ -9181,11 +9451,19 @@ impl Host {
         }
         let mut merged: Vec<RebarMerged> = Vec::new();
         let mut total_jobs = 0usize;
-        for (shadow, declared) in back {
+        for (shadow, declared, unmarked) in back {
             if !shadow.is_rebar() {
                 continue;
             }
-            let ranges: Vec<(usize, usize)> = declared
+            let title_spans = if !bitmaps.is_empty() && shadow.marked() {
+                let (filtered, decl_pages, marked_pages) =
+                    shadow.filter_marked_spans(declared, unmarked, bitmaps);
+                crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+                filtered
+            } else {
+                declared.clone()
+            };
+            let ranges: Vec<(usize, usize)> = title_spans
                 .iter()
                 .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
                 .filter(|&(from, to)| from < to)
@@ -9201,6 +9479,12 @@ impl Host {
             });
         }
         if merged.is_empty() {
+            return;
+        }
+        if total_jobs == 0 {
+            for entry in &merged {
+                entry.shadow.clear_pending_rebar();
+            }
             return;
         }
         let mut copy_jobs: Vec<(&ID3D12Resource, u64, u64)> = Vec::with_capacity(total_jobs);
@@ -9352,12 +9636,17 @@ impl Host {
 /// One unique ReBAR shadow with declared `GpuWrite` ranges in a submission.
 struct RebarWriteEntry {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
+    declared_title: Vec<(usize, usize)>,
+    unmarked_title: Vec<(usize, usize)>,
     declared_spans: Vec<(usize, usize)>,
     piece_runs: Vec<(u32, u32)>,
     /// Starting index in the GPU hash-compare `flags` array if GPU hashing ran
     /// for this entry; `None` falls back to reading back all `declared_spans`.
     compare_out_base: Option<usize>,
     compare_pieces: usize,
+    /// Base bit in `SLOT_VIEW_WRITES` when all writes to this shadow in this
+    /// submission were shader-marked (`None` = no view-mark filter).
+    mark_base: Option<u32>,
 }
 
 /// Optional pre-submission rehash and post-submission hash-compare command
@@ -9370,6 +9659,102 @@ struct RebarHashPlan {
 }
 
 impl Host {
+    /// Records a tiny direct command list that copies the active prefix of the
+    /// GPU shader view-writes bitmap (`SLOT_VIEW_WRITES`) into a pooled
+    /// `READBACK` slot and zeroes the GPU bitmap back to 0 on the GPU timeline
+    /// before the next submission runs.
+    fn record_view_marks_capture(&self) -> Option<(ID3D12CommandList, ViewMarksCapture)> {
+        if !crate::shadow::view_marks_on() {
+            return None;
+        }
+        self.record_view_marks_capture_inner()
+    }
+
+    fn record_view_marks_capture_inner(&self) -> Option<(ID3D12CommandList, ViewMarksCapture)> {
+        self.record_view_marks_capture_words(0)
+    }
+
+    fn record_view_marks_capture_words(
+        &self,
+        min_words: usize,
+    ) -> Option<(ID3D12CommandList, ViewMarksCapture)> {
+        let (uav, _gpu, zero) = crate::shadow::view_writes_resources()?;
+        let bitmap_bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
+        let used_words = (crate::shadow::marks_end() as usize)
+            .div_ceil(32)
+            .max(min_words)
+            .min((victory_shader::emit::VIEW_WRITE_BITS / 32) as usize);
+        let copy_bytes = ((used_words as u64) * 4).max(4);
+        let (list, slot) = {
+            let mut pool = VIEW_MARKS_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            (pool.lists.pop(), pool.slots.pop())
+        };
+        let list = list.or_else(|| self.make_prelude())?;
+        let slot = match slot {
+            Some(s) if s.2 >= bitmap_bytes => s,
+            _ => {
+                let (rb, ptr) = self.readback_buffer(bitmap_bytes)?;
+                name(&rb, || "shader view-writes readback".into());
+                (rb, ptr as usize, bitmap_bytes)
+            }
+        };
+        let (allocator, cmd) = &list;
+        // SAFETY: `list` is recycled only after its previous submission finished;
+        // `uav` enters and exits in `UNORDERED_ACCESS`; `zero` is `UPLOAD`
+        // (`GENERIC_READ`); `slot.0` is `READBACK` (`COPY_DEST`).
+        let recorded: windows::core::Result<ID3D12CommandList> = unsafe {
+            (|| {
+                allocator.Reset()?;
+                cmd.Reset(allocator, None)?;
+                cmd.ResourceBarrier(&[
+                    crate::indirect::uav_barrier(),
+                    transition(
+                        uav,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    ),
+                ]);
+                cmd.CopyBufferRegion(&slot.0, 0, uav, 0, copy_bytes);
+                cmd.ResourceBarrier(&[transition(
+                    uav,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                cmd.CopyBufferRegion(uav, 0, zero, 0, copy_bytes);
+                if copy_bytes < bitmap_bytes {
+                    cmd.CopyBufferRegion(uav, bitmap_bytes - 4, zero, bitmap_bytes - 4, 4);
+                }
+                cmd.ResourceBarrier(&[transition(
+                    uav,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                cmd.Close()?;
+                cmd.cast()
+            })()
+        };
+        match recorded {
+            Ok(cl) => {
+                crate::shadow::record_view_marks_capture();
+                Some((
+                    cl,
+                    ViewMarksCapture {
+                        list,
+                        slot,
+                        words: used_words,
+                    },
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not record shader view-writes capture");
+                let mut pool = VIEW_MARKS_POOL.lock().unwrap_or_else(|e| e.into_inner());
+                pool.lists.push(list);
+                pool.slots.push(slot);
+                None
+            }
+        }
+    }
+
     /// Ensures a reusable closed direct command list exists in `slot`.
     fn ensure_direct_list<'a>(
         &self,
@@ -9563,6 +9948,7 @@ impl Host {
                     list.SetComputeRootSignature(&pipe.root);
                     list.SetPipelineState(&pipe.pso);
                     list.SetComputeRootUnorderedAccessView(3, flags_uav_gpu);
+                    list.SetComputeRootUnorderedAccessView(4, flags_uav_gpu);
                     for p in prepared.iter().filter(|p| !p.pre_runs.is_empty()) {
                         list.SetComputeRootShaderResourceView(
                             1,
@@ -9570,8 +9956,16 @@ impl Host {
                         );
                         list.SetComputeRootUnorderedAccessView(2, p.hashes_gpu);
                         for &(first, count) in &p.pre_runs {
-                            let constants = [first, p.aligned_len, 0u32, 0u32, count];
-                            list.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+                            let constants = [
+                                first,
+                                p.aligned_len,
+                                0u32,
+                                0u32,
+                                count,
+                                victory_shader::emit::VIEW_MARK_NONE,
+                                0u32,
+                            ];
+                            list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                             list.Dispatch(count, 1, 1);
                         }
                     }
@@ -9629,19 +10023,38 @@ impl Host {
                 allocator.Reset()?;
                 list.Reset(allocator, None)?;
                 list.ResourceBarrier(&before_barriers);
+                let view_marks_gpu = crate::shadow::view_marks_on()
+                    .then(crate::shadow::view_writes)
+                    .flatten();
                 list.SetComputeRootSignature(&pipe.root);
                 list.SetPipelineState(&pipe.pso);
                 list.SetComputeRootUnorderedAccessView(3, flags_uav_gpu);
+                list.SetComputeRootUnorderedAccessView(
+                    4,
+                    view_marks_gpu.unwrap_or(flags_uav_gpu),
+                );
                 for p in &prepared {
-                    list.SetComputeRootShaderResourceView(
-                        1,
-                        entries[p.entry_idx].shadow.base_gpu(),
-                    );
+                    let entry = &entries[p.entry_idx];
+                    list.SetComputeRootShaderResourceView(1, entry.shadow.base_gpu());
                     list.SetComputeRootUnorderedAccessView(2, p.hashes_gpu);
+                    let mark_base = if view_marks_gpu.is_some() {
+                        entry.mark_base.unwrap_or(victory_shader::emit::VIEW_MARK_NONE)
+                    } else {
+                        victory_shader::emit::VIEW_MARK_NONE
+                    };
+                    let mark_skew = u32::from((entry.shadow.span().0 & 0xFFFF) != 0);
                     let mut out_idx = p.out_base;
-                    for &(first, count) in &entries[p.entry_idx].piece_runs {
-                        let constants = [first, p.aligned_len, (out_idx * 4) as u32, 1u32, count];
-                        list.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+                    for &(first, count) in &entry.piece_runs {
+                        let constants = [
+                            first,
+                            p.aligned_len,
+                            (out_idx * 4) as u32,
+                            1u32,
+                            count,
+                            mark_base,
+                            mark_skew,
+                        ];
+                        list.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                         list.Dispatch(count, 1, 1);
                         out_idx += count as usize;
                     }
@@ -9691,6 +10104,7 @@ impl Host {
         submitted: &mut u64,
         entries: Vec<RebarWriteEntry>,
         total_flag_pieces: usize,
+        bitmaps: &[&[u32]],
     ) {
         struct PendingCopy {
             shadow: std::sync::Arc<crate::shadow::Shadow>,
@@ -9727,6 +10141,14 @@ impl Host {
                 let spans = if let (Some(base), Some(all)) = (entry.compare_out_base, flags_all)
                     && base + entry.compare_pieces <= all.len()
                 {
+                    if !bitmaps.is_empty() && entry.mark_base.is_some() {
+                        let (_, decl_pages, marked_pages) = entry.shadow.filter_marked_spans(
+                            &entry.declared_title,
+                            &entry.unmarked_title,
+                            bitmaps,
+                        );
+                        crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+                    }
                     let slice = &all[base..base + entry.compare_pieces];
                     let (flagged, changed) = flagged_piece_byte_runs(
                         &entry.piece_runs,
@@ -9736,6 +10158,22 @@ impl Host {
                     compared_total += entry.compare_pieces as u64;
                     changed_total += changed;
                     intersect_ranges(&flagged, &entry.declared_spans)
+                } else if !bitmaps.is_empty() && entry.shadow.marked() {
+                    let (filtered_title, decl_pages, marked_pages) =
+                        entry.shadow.filter_marked_spans(
+                            &entry.declared_title,
+                            &entry.unmarked_title,
+                            bitmaps,
+                        );
+                    crate::shadow::record_view_marks_filter(decl_pages, marked_pages);
+                    let ranges: Vec<(usize, usize)> = filtered_title
+                        .iter()
+                        .map(|&(from, to)| entry.shadow.inside(from, to.saturating_sub(from)))
+                        .filter(|&(from, to)| from < to)
+                        .collect();
+                    let filtered = merge_ranges(ranges);
+                    entry.shadow.mark_rebar_dirty_spans(&filtered);
+                    filtered
                 } else {
                     // Fallback: read back the entire merged declared spans and
                     // mark them dirty in any existing hash buffer.
@@ -10152,6 +10590,7 @@ impl Meter {
         // (kept for the frametime dump below)
         let (card_passes, card_compares, texture_refresh_ms);
         crate::shadow::back_line(frames);
+        crate::shadow::view_marks_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             (card_passes, card_compares) = (passes, compares);
@@ -10863,7 +11302,7 @@ impl Host {
     }
 
     /// A GPU-only default-heap UAV buffer created in `initial_state`.
-    fn default_buffer_in_state(
+    pub(crate) fn default_buffer_in_state(
         &self,
         size: u64,
         initial_state: D3D12_RESOURCE_STATES,
@@ -11884,7 +12323,15 @@ mod rebar_tests {
         let run_pass = |mode: u32| -> [u32; 2] {
             let list = h.new_list().expect("host list");
             let l = &list.list;
-            let constants = [0u32, total_bytes as u32, 0u32, mode, 2u32];
+            let constants = [
+                0u32,
+                total_bytes as u32,
+                0u32,
+                mode,
+                2u32,
+                victory_shader::emit::VIEW_MARK_NONE,
+                0u32,
+            ];
             // SAFETY: open list with live buffers and valid state transitions.
             unsafe {
                 l.ResourceBarrier(&[transition(
@@ -11894,10 +12341,11 @@ mod rebar_tests {
                 )]);
                 l.SetComputeRootSignature(&pipe.root);
                 l.SetPipelineState(&pipe.pso);
-                l.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+                l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
                 l.SetComputeRootShaderResourceView(1, src_gpu);
                 l.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 l.SetComputeRootUnorderedAccessView(3, flags_gpu);
+                l.SetComputeRootUnorderedAccessView(4, flags_gpu);
                 l.Dispatch(2, 1, 1);
                 if mode != 0 {
                     l.ResourceBarrier(&[
@@ -12014,6 +12462,7 @@ mod rebar_tests {
             &[(
                 shadow.clone(),
                 vec![(start as usize, start as usize + len as usize)],
+                vec![(start as usize, start as usize + len as usize)],
             )],
             &mut fetch,
         );
@@ -12038,5 +12487,211 @@ mod rebar_tests {
         shadow.copy_back_done(&[(start as usize, start as usize + len as usize)]);
         drop(shadow);
         crate::shadow::unregister(start as usize, start);
+    }
+
+    #[test]
+    fn view_marks_gpu_capture_clear_and_rebar_hash_filter() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        // 1. Both CARD_COMPARE and rebar_hash HLSL compile with marks UAV bindings.
+        compile(
+            super::CARD_COMPARE,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+        )
+        .expect("CARD_COMPARE HLSL compiles");
+
+        let Some(h) = host() else {
+            return; // no host GPU here
+        };
+        let Some(pipe) = rebar_hash_pipeline(&h.device) else {
+            panic!("rebar_hash compute pipeline failed to build on a live host");
+        };
+        let errors_before = h.d3d12_errors();
+
+        // 2. Verify rebar_hash skips unmarked pieces and checks both adjacent bits
+        //    when mark_skew != 0 (unaligned shadow start).
+        let total_bytes = (2 * PAGE) as u64;
+        let (src_buf, src_ptr) = h.shared_buffer(total_bytes).expect("shared src");
+        let hashes_buf = h
+            .default_buffer_in_state(32, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .expect("hashes UAV");
+        let flags_uav = h
+            .default_buffer_in_state(16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .expect("flags UAV");
+        let marks_uav = h
+            .default_buffer_in_state(64, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .expect("marks UAV");
+        let (marks_up, marks_up_ptr) = h.upload_buffer(64).expect("marks upload");
+        let (flags_rb, flags_ptr) = h.readback_buffer(16).expect("flags readback");
+
+        // SAFETY: `src_ptr` maps `2 * PAGE` bytes.
+        let src_slice = unsafe { std::slice::from_raw_parts_mut(src_ptr, 2 * PAGE) };
+        for (i, b) in src_slice.iter_mut().enumerate() {
+            *b = ((i.wrapping_mul(29) ^ (i >> 7)) & 0xFF) as u8;
+        }
+        // Set bit 6 (= mark_base 5 + piece 1); leave bit 5 (= mark_base 5 + piece 0) clear.
+        // SAFETY: `marks_up_ptr` maps 64 bytes.
+        unsafe {
+            std::ptr::write_bytes(marks_up_ptr, 0, 64);
+            *marks_up_ptr.cast::<u32>() = 1u32 << 6;
+        }
+        {
+            let list = h.new_list().expect("seed marks list");
+            // SAFETY: open list, valid transitions.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    &marks_uav,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.list.CopyBufferRegion(&marks_uav, 0, &marks_up, 0, 64);
+                list.list.ResourceBarrier(&[transition(
+                    &marks_uav,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            list.close();
+            h.execute(&[&list]);
+            list.reset();
+        }
+
+        // SAFETY: live D3D12 resources.
+        let (src_gpu, hashes_gpu, flags_gpu, marks_gpu) = unsafe {
+            (
+                src_buf.GetGPUVirtualAddress(),
+                hashes_buf.GetGPUVirtualAddress(),
+                flags_uav.GetGPUVirtualAddress(),
+                marks_uav.GetGPUVirtualAddress(),
+            )
+        };
+
+        let run_pass = |mode: u32, mark_base: u32, mark_skew: u32| -> [u32; 2] {
+            let list = h.new_list().expect("host list");
+            let l = &list.list;
+            let constants = [0u32, total_bytes as u32, 0u32, mode, 2u32, mark_base, mark_skew];
+            // SAFETY: open list with live buffers and valid state transitions.
+            unsafe {
+                l.ResourceBarrier(&[transition(
+                    &src_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+                l.SetComputeRootSignature(&pipe.root);
+                l.SetPipelineState(&pipe.pso);
+                l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src_gpu);
+                l.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                l.SetComputeRootUnorderedAccessView(3, flags_gpu);
+                l.SetComputeRootUnorderedAccessView(4, marks_gpu);
+                l.Dispatch(2, 1, 1);
+                if mode != 0 {
+                    l.ResourceBarrier(&[
+                        transition(
+                            &flags_uav,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ),
+                        transition(
+                            &src_buf,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        ),
+                    ]);
+                    l.CopyBufferRegion(&flags_rb, 0, &flags_uav, 0, 8);
+                    l.ResourceBarrier(&[transition(
+                        &flags_uav,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                } else {
+                    l.ResourceBarrier(&[transition(
+                        &src_buf,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+            }
+            list.close();
+            h.execute(&[&list]);
+            list.reset();
+            // SAFETY: fence completed and `flags_ptr` covers 16 bytes of READBACK.
+            let out = unsafe { std::slice::from_raw_parts(flags_ptr.cast::<u32>(), 2) };
+            [out[0], out[1]]
+        };
+
+        // Seed initial hashes, then flip a byte in BOTH pieces.
+        let _ = run_pass(0, victory_shader::emit::VIEW_MARK_NONE, 0);
+        src_slice[123] ^= 0xFF;
+        src_slice[PAGE + 456] ^= 0xFF;
+
+        // With mark_base = 5 and skew = 0: only bit 6 (piece 1) is set, so piece 0
+        // early-exits with flag 0 while piece 1 detects the change and updates its hash.
+        assert_eq!(run_pass(1, 5, 0), [0, 1]);
+        // With mark_skew = 1: piece 0 also checks bit 5 + 1 = 6 (which is set), so piece 0
+        // now hashes and detects its change while piece 1's updated hash matches.
+        assert_eq!(run_pass(1, 5, 1), [1, 0]);
+        assert_eq!(run_pass(1, 5, 1), [0, 0]);
+
+        // 3. Verify GPU-timeline bitmap capture + clear round-trip on the real
+        //    SLOT_VIEW_WRITES resource (`view_writes_resources`).
+        let (vw_uav, _, _) = crate::shadow::view_writes_resources().expect("view_writes bitmap");
+        let (seed_up, seed_ptr) = h.upload_buffer(16).expect("seed upload");
+        // SAFETY: `seed_ptr` maps 16 bytes.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(seed_ptr.cast::<u32>(), 4);
+            words[0] = 0xA55A_1234;
+            words[1] = 0x0000_00F0;
+            words[2] = 0;
+            words[3] = 0;
+        }
+        {
+            let list = h.new_list().expect("seed view_writes list");
+            // SAFETY: `vw_uav` is always in UNORDERED_ACCESS between submissions.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    vw_uav,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                list.list.CopyBufferRegion(vw_uav, 0, &seed_up, 0, 16);
+                list.list.ResourceBarrier(&[transition(
+                    vw_uav,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            list.close();
+            h.execute(&[&list]);
+            list.reset();
+        }
+        let (cl1, cap1) = h
+            .record_view_marks_capture_words(2)
+            .expect("first view-marks capture");
+        {
+            let mut submitted = h.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(h.submit_helper_list(&mut submitted, cl1, "test view-marks capture 1"));
+        }
+        assert_eq!(&cap1.words()[..2], &[0xA55A_1234, 0x0000_00F0]);
+        cap1.recycle();
+
+        // Second capture must read back all zeros, proving the GPU-timeline clear ran.
+        let (cl2, cap2) = h
+            .record_view_marks_capture_words(2)
+            .expect("second view-marks capture");
+        {
+            let mut submitted = h.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(h.submit_helper_list(&mut submitted, cl2, "test view-marks capture 2"));
+        }
+        assert_eq!(&cap2.words()[..2], &[0, 0]);
+        cap2.recycle();
+
+        h.log_messages();
+        assert_eq!(
+            h.d3d12_errors(),
+            errors_before,
+            "unexpected D3D12 debug layer error during view-marks GPU test"
+        );
     }
 }
