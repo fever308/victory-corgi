@@ -148,21 +148,18 @@ struct LeafChunk {
 
 impl LeafChunk {
     fn new() -> Self {
-        const ZERO_U64: AtomicU64 = AtomicU64::new(0);
-        const ZERO_U32: AtomicU32 = AtomicU32::new(0);
-        const ZERO_U8: AtomicU8 = AtomicU8::new(0);
         Self {
-            written_bits: [ZERO_U64; CHUNK_WORDS],
-            written_epoch: [ZERO_U64; CHUNK_PAGES],
-            watched_bits: [ZERO_U64; CHUNK_WORDS],
-            cold_ro_bits: [ZERO_U64; CHUNK_WORDS],
-            cold_streak: [ZERO_U8; CHUNK_PAGES],
-            cold_last_frame: [ZERO_U32; CHUNK_PAGES],
-            guard_protected_bits: [ZERO_U64; CHUNK_WORDS],
-            guard_clean_bits: [ZERO_U64; CHUNK_WORDS],
-            guard_absent_bits: [ZERO_U64; CHUNK_WORDS],
-            guard_aliased_bits: [ZERO_U64; CHUNK_WORDS],
-            guard_viewed_bits: [ZERO_U64; CHUNK_WORDS],
+            written_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
+            written_epoch: [const { AtomicU64::new(0) }; CHUNK_PAGES],
+            watched_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
+            cold_ro_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
+            cold_streak: [const { AtomicU8::new(0) }; CHUNK_PAGES],
+            cold_last_frame: [const { AtomicU32::new(0) }; CHUNK_PAGES],
+            guard_protected_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
+            guard_clean_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
+            guard_absent_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
+            guard_aliased_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
+            guard_viewed_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
         }
     }
 
@@ -186,9 +183,8 @@ struct MidNode {
 
 impl MidNode {
     fn new() -> Self {
-        const NULL_LEAF: AtomicPtr<LeafChunk> = AtomicPtr::new(std::ptr::null_mut());
         Self {
-            leaves: [NULL_LEAF; MID_LEN],
+            leaves: [const { AtomicPtr::new(std::ptr::null_mut()) }; MID_LEN],
         }
     }
 }
@@ -197,9 +193,8 @@ struct PageDir {
     top: [AtomicPtr<MidNode>; TOP_LEN],
 }
 
-const NULL_MID: AtomicPtr<MidNode> = AtomicPtr::new(std::ptr::null_mut());
 static DIR: PageDir = PageDir {
-    top: [NULL_MID; TOP_LEN],
+    top: [const { AtomicPtr::new(std::ptr::null_mut()) }; TOP_LEN],
 };
 
 #[inline]
@@ -391,11 +386,11 @@ impl PageDir {
     }
 
     #[inline]
-    fn record_written_swap(&self, page: usize, epoch: u64) -> u64 {
+    fn record_written_prev(&self, page: usize, epoch: u64) -> u64 {
         let Some((leaf, idx)) = self.get_or_alloc(page) else {
             return 0;
         };
-        let prev = leaf.written_epoch[idx].swap(epoch, Ordering::AcqRel);
+        let prev = leaf.written_epoch[idx].fetch_max(epoch, Ordering::AcqRel);
         leaf.written_bits[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
         prev
     }
@@ -617,8 +612,8 @@ impl PageDir {
     #[inline]
     fn reset_cold(&self, page: usize, frame32: u32) {
         if let Some((leaf, idx)) = self.get(page) {
-            leaf.cold_streak[idx].store(0, Ordering::Relaxed);
-            leaf.cold_last_frame[idx].store(frame32, Ordering::Relaxed);
+            leaf.cold_streak[idx].store(0, Ordering::Release);
+            leaf.cold_last_frame[idx].store(frame32, Ordering::Release);
         }
     }
 
@@ -628,8 +623,8 @@ impl PageDir {
         }
         self.for_each_chunk(first, last, false, |_, leaf, lo_idx, hi_idx| {
             for idx in lo_idx..hi_idx {
-                leaf.cold_streak[idx].store(0, Ordering::Relaxed);
-                leaf.cold_last_frame[idx].store(frame32, Ordering::Relaxed);
+                leaf.cold_streak[idx].store(0, Ordering::Release);
+                leaf.cold_last_frame[idx].store(frame32, Ordering::Release);
             }
             true
         });
@@ -638,7 +633,7 @@ impl PageDir {
     #[inline]
     fn cold_streak(&self, page: usize) -> u8 {
         self.get(page)
-            .map_or(0, |(leaf, idx)| leaf.cold_streak[idx].load(Ordering::Relaxed))
+            .map_or(0, |(leaf, idx)| leaf.cold_streak[idx].load(Ordering::Acquire))
     }
 
     #[cfg(test)]
@@ -674,7 +669,7 @@ impl PageDir {
         self.for_each_chunk(first, last, true, |chunk_page, leaf, lo_idx, hi_idx| {
             // Mark pages confirmed write-watched.
             for_each_word_in_chunk(lo_idx, hi_idx, |w, mask| {
-                leaf.watched_bits[w].fetch_or(mask, Ordering::Relaxed);
+                leaf.watched_bits[w].fetch_or(mask, Ordering::Release);
                 true
             });
             for idx in lo_idx..hi_idx {
@@ -683,21 +678,21 @@ impl PageDir {
                     dirty_idx += 1;
                 }
                 if dirty_idx < dirty_sorted.len() && dirty_sorted[dirty_idx] == page {
-                    leaf.cold_streak[idx].store(0, Ordering::Relaxed);
-                    leaf.cold_last_frame[idx].store(frame32, Ordering::Relaxed);
+                    leaf.cold_streak[idx].store(0, Ordering::Release);
+                    leaf.cold_last_frame[idx].store(frame32, Ordering::Release);
                     continue;
                 }
                 if threshold == 0 {
                     continue;
                 }
                 let (w, bit) = (idx / 64, 1u64 << (idx % 64));
-                if leaf.cold_ro_bits[w].load(Ordering::Relaxed) & bit != 0 {
+                if leaf.cold_ro_bits[w].load(Ordering::Acquire) & bit != 0 {
                     continue;
                 }
-                if leaf.cold_last_frame[idx].swap(frame32, Ordering::Relaxed) != frame32 {
-                    let prev = leaf.cold_streak[idx].load(Ordering::Relaxed);
+                if leaf.cold_last_frame[idx].swap(frame32, Ordering::AcqRel) != frame32 {
+                    let prev = leaf.cold_streak[idx].load(Ordering::Acquire);
                     let next = prev.saturating_add(1).min(threshold);
-                    leaf.cold_streak[idx].store(next, Ordering::Relaxed);
+                    leaf.cold_streak[idx].store(next, Ordering::Release);
                     if next >= threshold {
                         out_promote.push(page);
                     }
@@ -867,7 +862,8 @@ pub(crate) fn asks_say(frames: f64) {
 /// Whether pages `[first, last)` begin in a view of the title's physical
 /// pages (`crate::inplace`'s record of what the runtime mapped). View
 /// memory is not write-watched: the kernel refuses the asking, and the
-/// guards answer instead.
+/// guards answer instead. `VICTORY_WATCH_VIEWS=0` asks the kernel all the
+/// same, as before.
 fn in_view(first: usize, last: usize) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_VIEWS").is_none_or(|v| v != "0")) {
@@ -931,6 +927,22 @@ fn call_get_write_watch(first: usize, last: usize, stats_kind_base: usize) -> Op
     })
 }
 
+/// Invokes `f(from, to)` for each maximal contiguous `[from, to)` run in
+/// sorted, deduplicated `blocks`.
+fn for_each_contiguous_run(blocks: &[usize], mut f: impl FnMut(usize, usize)) {
+    let mut i = 0;
+    while i < blocks.len() {
+        let from = blocks[i];
+        let mut to = from + 1;
+        i += 1;
+        while i < blocks.len() && blocks[i] == to {
+            to += 1;
+            i += 1;
+        }
+        f(from, to);
+    }
+}
+
 /// Promotes contiguous runs of newly-cold write-watched 64 KiB blocks to
 /// `PAGE_READONLY` VEH guards, then re-verifies `GetWriteWatch(RESET)` while
 /// `PAGE_READONLY` is active so any write sneaking in right before
@@ -975,15 +987,7 @@ fn promote_cold_pages(candidates: &[usize]) {
     }
 
     let mut promoted_runs: Vec<(usize, usize)> = Vec::new();
-    let mut idx = 0;
-    while idx < eligible.len() {
-        let from = eligible[idx];
-        let mut to = from + 1;
-        idx += 1;
-        while idx < eligible.len() && eligible[idx] == to {
-            to += 1;
-            idx += 1;
-        }
+    for_each_contiguous_run(&eligible, |from, to| {
         virtual_protect_adaptive(
             from,
             to,
@@ -993,7 +997,7 @@ fn promote_cold_pages(candidates: &[usize]) {
             &mut |_, _| {},
             &mut |bad| DIR.reset_cold(bad, frame32),
         );
-    }
+    });
     if promoted_runs.is_empty() {
         return;
     }
@@ -1514,7 +1518,7 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
             ahead.epoch = now;
         }
     }
-    let before = DIR.record_written_swap(page, now);
+    let before = DIR.record_written_prev(page, now);
     for &other in others {
         if other != page {
             DIR.record_written(other, now);
@@ -1914,6 +1918,8 @@ impl Guards {
     }
 }
 
+/// Lock-free `GuardClean` bitmap fast path; `VICTORY_GUARD_BITS=0` takes the
+/// `GUARDS` lock on every guard check, as before.
 fn guard_bits_fast_enabled() -> bool {
     static BITS: OnceLock<bool> = OnceLock::new();
     lockfree_enabled()
@@ -1950,6 +1956,33 @@ pub(crate) fn is_pinned_block(block: usize) -> bool {
         .is_some_and(|(_, &(end, until))| block < end && until > now)
 }
 
+/// Atomically checks pin state, clears guard/cold metadata for `blocks`, and
+/// invokes `arm()` under `GUARDS` (`GUARDS -> LAZY_STATE` lock order) so no
+/// concurrent `guard()`, `promote_cold_pages()`, or `kernel_writing()` can
+/// re-arm or pin `blocks` between disarming and `LAZY_STATE` insertion.
+#[allow(dead_code)]
+pub(crate) fn try_arm_lazy_under_guards(blocks: &[usize], arm: impl FnOnce() -> bool) -> bool {
+    if blocks.is_empty() {
+        return false;
+    }
+    let mut g = guards();
+    g.prune_pins();
+    if blocks.iter().any(|&b| g.pinned(b)) {
+        return false;
+    }
+    let mut sorted = blocks.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    for_each_contiguous_run(&sorted, |from, to| {
+        open_here(&mut g, from * BLOCK, to * BLOCK, |_| {});
+        demote_cold_range(&mut g, from, to);
+        DIR.set_bits_range(from, to, BitField::GuardClean, false, Ordering::SeqCst);
+        DIR.set_bits_range(from, to, BitField::GuardAbsent, false, Ordering::SeqCst);
+        DIR.set_bits_range(from, to, BitField::GuardAliased, false, Ordering::SeqCst);
+    });
+    arm()
+}
+
 pub(crate) fn disarm_for_lazy(block: usize) {
     let mut g = guards();
     let start = block * BLOCK;
@@ -1959,29 +1992,20 @@ pub(crate) fn disarm_for_lazy(block: usize) {
     DIR.set_bit(block, BitField::GuardClean, false, Ordering::SeqCst);
     DIR.set_bit(block, BitField::GuardAbsent, false, Ordering::SeqCst);
     if view_guard() {
-        let alias_blocks: Vec<usize> = crate::inplace::pages_of(start)
+        let mut sorted: Vec<usize> = crate::inplace::pages_of(start)
             .into_iter()
             .map(|a| a / BLOCK)
             .filter(|&b| b != block)
             .collect();
-        if !alias_blocks.is_empty() {
-            let mut sorted = alias_blocks;
+        if !sorted.is_empty() {
             sorted.sort_unstable();
             sorted.dedup();
-            let mut i = 0;
-            while i < sorted.len() {
-                let from = sorted[i];
-                let mut to = from + 1;
-                i += 1;
-                while i < sorted.len() && sorted[i] == to {
-                    to += 1;
-                    i += 1;
-                }
+            for_each_contiguous_run(&sorted, |from, to| {
                 open_here(&mut g, from * BLOCK, to * BLOCK, |_| {});
                 demote_cold_range(&mut g, from, to);
                 DIR.set_bits_range(from, to, BitField::GuardClean, false, Ordering::SeqCst);
                 DIR.set_bits_range(from, to, BitField::GuardAbsent, false, Ordering::SeqCst);
-            }
+            });
         }
     }
 }
@@ -1994,6 +2018,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     if guard_bits_fast_enabled() && DIR.all_guard_clean(first, last) {
         return Some(Vec::new());
     }
+    // `VICTORY_GUARD_ASK=1` asks Windows (`is_view`) on every guard check even
+    // when the block is already known to `GUARDS` or `inplace`.
     static ASK: OnceLock<bool> = OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && (DIR.is_known_view(first, view_known())
@@ -2064,6 +2090,8 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
 }
 
 /// Whether `[start, end)` is view memory.
+/// `VICTORY_GUARD_HOLES=0` inspects only the first address instead of
+/// walking past uncommitted placeholder holes.
 fn is_view(start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
@@ -2159,17 +2187,9 @@ fn virtual_protect_adaptive(
 /// Applies `VirtualProtect(..., prot)` over sorted block numbers, coalescing
 /// contiguous runs into single syscalls (adaptive bisect if a run spans views).
 fn protect_block_runs(blocks: &[usize], prot: u32) {
-    let mut i = 0;
-    while i < blocks.len() {
-        let from = blocks[i];
-        let mut to = from + 1;
-        i += 1;
-        while i < blocks.len() && blocks[i] == to {
-            to += 1;
-            i += 1;
-        }
+    for_each_contiguous_run(blocks, |from, to| {
         virtual_protect_adaptive(from, to, prot, false, &mut |_, _| {}, &mut |_, _| {}, &mut |_| {});
-    }
+    });
 }
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean,
@@ -2231,15 +2251,7 @@ fn protect_alias_blocks(mut aliases: Vec<usize>) {
     aliases.sort_unstable();
     aliases.dedup();
     let vk = view_known();
-    let mut i = 0;
-    while i < aliases.len() {
-        let from = aliases[i];
-        let mut to = from + 1;
-        i += 1;
-        while i < aliases.len() && aliases[i] == to {
-            to += 1;
-            i += 1;
-        }
+    for_each_contiguous_run(&aliases, |from, to| {
         virtual_protect_adaptive(
             from,
             to,
@@ -2254,7 +2266,7 @@ fn protect_alias_blocks(mut aliases: Vec<usize>) {
             &mut |_, _| {},
             &mut |_| {},
         );
-    }
+    });
 }
 
 /// [`protect`] for one range, without the other views of its pages.
@@ -2336,20 +2348,12 @@ fn open(g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)
     if !alias_blocks.is_empty() {
         alias_blocks.sort_unstable();
         alias_blocks.dedup();
-        let mut i = 0;
-        while i < alias_blocks.len() {
-            let r_from = alias_blocks[i];
-            let mut r_to = r_from + 1;
-            i += 1;
-            while i < alias_blocks.len() && alias_blocks[i] == r_to {
-                r_to += 1;
-                i += 1;
-            }
+        for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
             if open_here(g, r_from * BLOCK, r_to * BLOCK, &mut dirtied) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add((r_to - r_from) as u64, Ordering::Relaxed);
             }
-        }
+        });
     }
     any
 }
@@ -2413,9 +2417,11 @@ pub fn kernel_writing(at: usize, len: usize) {
     if len == 0 {
         return;
     }
-    crate::lazy_back::materialize_range(at, len);
     let end = at.saturating_add(len);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    // Pin + open/demote under `GUARDS` BEFORE `lazy_back::materialize_range`
+    // so a concurrent `try_arm_lazy_under_guards` cannot re-defer the blocks
+    // after materialization and before pinning.
     {
         let mut g = guards();
         g.prune_pins();
@@ -2441,21 +2447,14 @@ pub fn kernel_writing(at: usize, len: usize) {
             if !alias_blocks.is_empty() {
                 alias_blocks.sort_unstable();
                 alias_blocks.dedup();
-                let mut i = 0;
-                while i < alias_blocks.len() {
-                    let r_from = alias_blocks[i];
-                    let mut r_to = r_from + 1;
-                    i += 1;
-                    while i < alias_blocks.len() && alias_blocks[i] == r_to {
-                        r_to += 1;
-                        i += 1;
-                    }
+                for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
                     open_here(&mut g, r_from * BLOCK, r_to * BLOCK, |_| {});
                     demote_cold_range(&mut g, r_from, r_to);
-                }
+                });
             }
         }
     }
+    crate::lazy_back::materialize_range(at, len);
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -2880,9 +2879,7 @@ fn install() {
             let mut g = guards();
             if open(&mut g, at, at + 1, |block| dirty_blocks.push(block)) {
                 Some(true)
-            } else if open_cold_ro(&mut g, at) {
-                Some(false)
-            } else if writable(at) {
+            } else if open_cold_ro(&mut g, at) || writable(at) {
                 Some(false)
             } else {
                 None
@@ -2955,8 +2952,11 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    static JOURNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -2989,8 +2989,8 @@ mod tests {
             )
             .is_none()
         );
-        // SAFETY: our allocation.
         DIR.clear_written_range(p / PAGE, p / PAGE + 4);
+        // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
@@ -3571,7 +3571,6 @@ mod tests {
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
             UnmapViewOfFile,
         };
-        static JOURNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         struct AskOnceGuard;
         impl Drop for AskOnceGuard {
             fn drop(&mut self) {
@@ -3586,6 +3585,7 @@ mod tests {
         impl Drop for CleanupGuard {
             fn drop(&mut self) {
                 title_memory_remapped(self.view_p, PAGE);
+                DIR.clear_written_range(self.priv_p / PAGE, self.priv_p / PAGE + 1);
                 // SAFETY: clean up view, section, and private allocation owned by this test.
                 unsafe {
                     UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
@@ -3654,6 +3654,7 @@ mod tests {
 
     #[test]
     fn lock_free_page_dir_dirty_fast_path_and_ask_once_coherence() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct AllocGuard(usize);
         impl Drop for AllocGuard {
             fn drop(&mut self) {
@@ -3725,6 +3726,7 @@ mod tests {
 
     #[test]
     fn cold_pages_promote_to_readonly_and_fault_back_on_write() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct AllocGuard(usize, usize);
         impl Drop for AllocGuard {
             fn drop(&mut self) {
@@ -3908,6 +3910,7 @@ mod tests {
 
     #[test]
     fn concurrent_watch_writes_faults_and_remaps_are_safe() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const SIZE: usize = 4 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         // SAFETY: private write-watched buffer for concurrent `writes` + `asked`.
@@ -3974,6 +3977,76 @@ mod tests {
         DIR.clear_written_range(priv_p / PAGE, (priv_p + SIZE) / PAGE);
         // SAFETY: private allocation owned by this test.
         unsafe { VirtualFree(priv_p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn try_arm_lazy_under_guards_respects_pins_and_clears_guard_and_cold_state() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (section, one, two) = two_views(2 * BLOCK);
+        let b0 = one / BLOCK;
+        let b1 = b0 + 1;
+        let b2 = two / BLOCK;
+
+        // Guard `one` so `b0`, `b1` are protected/clean and `b2` is aliased/protected.
+        assert!(guard(one, one + 2 * BLOCK).is_some());
+        assert!(DIR.is_guard_protected(b0));
+        assert!(DIR.is_guard_clean(b0));
+        assert!(DIR.is_guard_protected(b2));
+
+        // Pin `b1`: `try_arm_lazy_under_guards(&[b0, b1])` must refuse without
+        // invoking `arm` or clearing `b0`'s guard metadata.
+        {
+            let mut g = guards();
+            g.pin(b1, b1 + 1, std::time::Instant::now() + PIN);
+        }
+        let mut armed = false;
+        assert!(!try_arm_lazy_under_guards(&[b0, b1, b2], || {
+            armed = true;
+            true
+        }));
+        assert!(!armed, "arm closure must not run when any block is pinned");
+        assert!(DIR.is_guard_protected(b0));
+
+        // Clear pin, simulate a cold bit on `b1`, and arm under `GUARDS`.
+        guards().pins.clear();
+        DIR.set_bit(b1, BitField::ColdRo, true, Ordering::SeqCst);
+        let blocks = [b0, b1, b2];
+        let ok = try_arm_lazy_under_guards(&blocks, || {
+            for &b in &blocks {
+                assert!(!DIR.is_guard_protected(b));
+                assert!(!DIR.is_guard_clean(b));
+                assert!(!DIR.get_bit(b, BitField::GuardAliased, Ordering::SeqCst));
+                assert!(!DIR.is_cold_ro(b));
+                assert!(writable(b * BLOCK));
+            }
+            true
+        });
+        assert!(ok);
+        drop_views(section, &[one, two], 2 * BLOCK);
+    }
+
+    #[test]
+    fn wrote_own_epoch_is_monotonic_against_concurrent_higher_epoch() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let page = 0x7df0_0000_0000usize / PAGE;
+        DIR.clear_written_range(page, page + 2);
+
+        let high = ASK_EPOCH.fetch_add(10, Ordering::AcqRel) + 10;
+        DIR.record_written(page, high);
+        // Even if `record_written_prev` is called with a lower epoch, `written_epoch`
+        // must never roll backwards below `high`.
+        let prev = DIR.record_written_prev(page, high - 5);
+        assert_eq!(prev, high);
+        let (entries, max_e) = DIR.collect_written(page, page + 1);
+        assert_eq!(entries, vec![(page, high)]);
+        assert_eq!(max_e, high);
+
+        let (_, now) = wrote_own(page, &[page + 1]);
+        assert!(now > high);
+        let (entries2, max_e2) = DIR.collect_written(page, page + 2);
+        assert_eq!(entries2, vec![(page, now), (page + 1, now)]);
+        assert_eq!(max_e2, now);
+        DIR.clear_written_range(page, page + 2);
     }
 }
 
