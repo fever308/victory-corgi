@@ -373,11 +373,25 @@ impl Spans {
         let rule = self.rule;
         // The spans the view cannot be there with.
         let clashing: Vec<u64> = match rule {
-            Rule::Start => self
-                .by_start
-                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
-                .map(|(at, _)| *at)
-                .collect(),
+            // A texture's head block is at most its own size: the title packs
+            // tint palettes of 256 B to 4 KiB (13x1 to 1024x1) side by side on
+            // one page, and a 4 KiB head for each made every palette written
+            // stale its neighbours, whose slots then stayed null: faces drawn
+            // black (fxceless/victory-fork issue #923: with min(4 KiB, size)
+            // the main character's face was lit in 2 of 2 runs, black in every
+            // run before).
+            Rule::Start => {
+                let head_new = HEAD.min(end - start);
+                self.by_start
+                    .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+                    .filter(|&(&at, &(old_end, _))| {
+                        let head_old = HEAD.min(old_end.saturating_sub(at)).max(1);
+                        (at <= start && start < at.saturating_add(head_old))
+                            || (start <= at && at < start.saturating_add(head_new))
+                    })
+                    .map(|(at, _)| *at)
+                    .collect()
+            }
             Rule::Overlap | Rule::Never => self.overlapping(start, end),
         };
         let mut stale = Vec::new();
@@ -428,7 +442,13 @@ impl Spans {
     /// The first span that starts inside `[start, end)` past the first
     /// [`HEAD`] bytes of it.
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+        // A texture smaller than HEAD has nothing past its head to look in
+        // (BTreeMap::range panics when the start is past the end).
+        let from = start.saturating_add(HEAD);
+        if from >= end {
+            return None;
+        }
+        self.by_start.range(from..end).next().map(|(at, _)| *at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -762,9 +782,12 @@ impl TextureQueue {
     ///   nothing at all waited, the oldest of them 1,615 frames (run
     ///   20261124-184104, every frame at the byte limit).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut looked: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        let mut partial: Vec<(u64, u32, u64)> = Vec::new();
+        if max == 0 {
+            return Vec::new();
+        }
+        let mut looked: Vec<(u32, u64)> = Vec::new();
+        let mut fresh: Vec<(u32, u64)> = Vec::new();
+        let mut partial: Vec<(u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
             let class = if w.mapped > 0 {
                 &mut partial
@@ -773,25 +796,50 @@ impl TextureQueue {
             } else {
                 &mut fresh
             };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        // Write numbers are unique. Partition each end before sorting so a
+        // full queue sorts only the entries this pass can actually serve.
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if looked.len() > max {
+            looked.select_nth_unstable_by(max, newest_first);
+            looked.truncate(max);
+        }
         looked.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        partial.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = looked.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut order = looked;
+        let take_fresh = (max - order.len()).min(fresh.len());
+        if take_fresh > 0 {
+            let new_count = take_fresh.div_ceil(2);
+            let old_count = take_fresh / 2;
+            if new_count < fresh.len() {
+                fresh.select_nth_unstable_by(new_count, newest_first);
+            }
+            let (newest, rest) = fresh.split_at_mut(new_count);
+            newest.sort_unstable_by(newest_first);
+            let mut oldest = &mut rest[..0];
+            if old_count > 0 {
+                let oldest_at = rest.len() - old_count;
+                if oldest_at > 0 {
+                    rest.select_nth_unstable_by(oldest_at, newest_first);
+                }
+                oldest = &mut rest[oldest_at..];
+                oldest.sort_unstable_by(|a, b| newest_first(b, a));
+            }
+            order.reserve(take_fresh);
+            for (position, &entry) in newest.iter().enumerate() {
+                order.push(entry);
+                order.extend(oldest.get(position).copied());
             }
         }
-        order.extend(partial.iter().map(|&(_, index, write)| (index, write)));
-        order.truncate(max);
+        let take_partial = (max - order.len()).min(partial.len());
+        if take_partial > 0 {
+            if partial.len() > take_partial {
+                partial.select_nth_unstable_by(take_partial, newest_first);
+                partial.truncate(take_partial);
+            }
+            partial.sort_unstable_by(newest_first);
+            order.extend(partial);
+        }
         order
     }
 
@@ -1303,6 +1351,26 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Find the first contiguous run in next-fit order. A run that starts
+/// before the cursor can finish after it, up to `n - 1` slots beyond.
+fn find_dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let prefix_end = if cursor == 0 {
+        0
+    } else {
+        (cursor + n - 1).min(taken.len())
+    };
+    for (base, slots) in [(cursor, &taken[cursor..]), (0, &taken[..prefix_end])] {
+        let mut run = 0;
+        for (offset, &used) in slots.iter().enumerate() {
+            run = if used { 0 } else { run + 1 };
+            if run == n {
+                return Some(base + offset + 1 - n);
+            }
+        }
+    }
+    None
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1332,23 +1400,9 @@ impl HostHeap {
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed)
             && FAILED[1].load(std::sync::atomic::Ordering::Relaxed) < WALKS;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = enough
+            .then(|| find_dynamic_run(taken, *next as usize, n))
+            .flatten();
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -2523,122 +2577,184 @@ impl HostHeap {
                 copied.prints.resize(self.count as usize, 0);
             }
 
-            if plans.len() >= PARALLEL_PAGES && disjoint {
-                let workers = (plans.len() / 8).clamp(2, 6);
-                let chunk_len = plans.len().div_ceil(workers);
-                let copied_ptr = copied.prints.as_mut_ptr() as usize;
-                let tabled_ptr = self.tabled.as_ptr() as usize;
-                let results: Arc<Vec<Mutex<(u64, u64, u64, Vec<ChangedSlot>)>>> = Arc::new(
-                    (0..plans.len().div_ceil(chunk_len))
-                        .map(|_| Mutex::new((0, 0, 0, Vec::new())))
-                        .collect(),
-                );
-                let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(results.len());
-                for (chunk_idx, slice) in plans.chunks(chunk_len).enumerate() {
-                    let chunk_plans = slice.to_vec();
-                    let results = results.clone();
-                    jobs.push(Box::new(move || {
-                        let mut page_bytes = vec![0u8; crate::watch::PAGE];
-                        let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
-                        let mut changed = Vec::new();
-                        for (from, to, first, end, offset) in chunk_plans {
-                            let len = to.saturating_sub(from);
-                            if len > page_bytes.len() {
-                                page_bytes.resize(len, 0);
-                            }
-                            let buf = &mut page_bytes[..len];
-                            if crate::host::read_into_fast(from as *const u8, buf) {
-                                p += 1;
-                                if first < end {
-                                    let n = (end - first) as usize;
-                                    // SAFETY: `plans` verified strictly disjoint
-                                    // `[first, end)` ranges within `0..self.count`,
-                                    // `self.copied` is locked for the duration of
-                                    // `wide_run`, and `self.tabled` has `self.count`
-                                    // fixed-length atomics when `check_tabled`.
-                                    let copied_sub = unsafe {
-                                        std::slice::from_raw_parts_mut(
-                                            (copied_ptr as *mut u64).add(first as usize),
-                                            n,
-                                        )
-                                    };
-                                    let tabled_sub = check_tabled.then(|| unsafe {
-                                        std::slice::from_raw_parts(
-                                            (tabled_ptr as *const std::sync::atomic::AtomicU32)
-                                                .add(first as usize),
-                                            n,
-                                        )
-                                    });
-                                    let (pl, pt) = scan_page_records(
-                                        buf,
-                                        first,
-                                        end,
-                                        offset,
-                                        heap_start,
-                                        step_usize,
-                                        copied_sub,
-                                        tabled_sub,
-                                        now,
-                                        &mut changed,
+            let (p, mut l, mut t, mut chunks, mut straddlers) =
+                if plans.len() >= PARALLEL_PAGES && disjoint {
+                    let workers = (plans.len() / 8).clamp(2, 6);
+                    let chunk_len = plans.len().div_ceil(workers);
+                    let copied_ptr = copied.prints.as_mut_ptr() as usize;
+                    let tabled_ptr = self.tabled.as_ptr() as usize;
+                    let results: Arc<Vec<Mutex<(u64, u64, u64, Vec<ChangedSlot>, Vec<u32>)>>> =
+                        Arc::new(
+                            (0..plans.len().div_ceil(chunk_len))
+                                .map(|_| Mutex::new((0, 0, 0, Vec::new(), Vec::new())))
+                                .collect(),
+                        );
+                    let mut jobs: Vec<Box<dyn FnOnce() + Send>> =
+                        Vec::with_capacity(results.len());
+                    for (chunk_idx, slice) in plans.chunks(chunk_len).enumerate() {
+                        let chunk_plans = slice.to_vec();
+                        let results = results.clone();
+                        jobs.push(Box::new(move || {
+                            let mut page_bytes = vec![0u8; crate::watch::PAGE];
+                            let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
+                            let mut changed = Vec::new();
+                            let mut local_straddlers = Vec::new();
+                            for (from, to, first, end, offset) in chunk_plans {
+                                let len = to.saturating_sub(from);
+                                if len > page_bytes.len() {
+                                    page_bytes.resize(len, 0);
+                                }
+                                let buf = &mut page_bytes[..len];
+                                if crate::host::read_into_fast(from as *const u8, buf) {
+                                    p += 1;
+                                    if first < end {
+                                        let n = (end - first) as usize;
+                                        // SAFETY: `plans` verified strictly disjoint
+                                        // `[first, end)` ranges within `0..self.count`,
+                                        // `self.copied` is locked for the duration of
+                                        // `wide_run`, and `self.tabled` has `self.count`
+                                        // fixed-length atomics when `check_tabled`.
+                                        let copied_sub = unsafe {
+                                            std::slice::from_raw_parts_mut(
+                                                (copied_ptr as *mut u64).add(first as usize),
+                                                n,
+                                            )
+                                        };
+                                        let tabled_sub = check_tabled.then(|| unsafe {
+                                            std::slice::from_raw_parts(
+                                                (tabled_ptr
+                                                    as *const std::sync::atomic::AtomicU32)
+                                                    .add(first as usize),
+                                                n,
+                                            )
+                                        });
+                                        let (pl, pt) = scan_page_records(
+                                            buf,
+                                            first,
+                                            end,
+                                            offset,
+                                            heap_start,
+                                            step_usize,
+                                            copied_sub,
+                                            tabled_sub,
+                                            now,
+                                            &mut changed,
+                                        );
+                                        l += pl;
+                                        t += pt;
+                                    }
+                                    let (s, sn) = page_straddle_slots(
+                                        from,
+                                        to,
+                                        heap_start as usize,
+                                        step,
+                                        limit,
                                     );
-                                    l += pl;
-                                    t += pt;
+                                    if sn > 0 {
+                                        local_straddlers.extend_from_slice(&s[..sn]);
+                                    }
                                 }
                             }
-                        }
-                        *results[chunk_idx].lock().unwrap_or_else(|e| e.into_inner()) =
-                            (p, l, t, changed);
-                    }));
-                }
-                crate::shadow::wide_run(jobs);
-                let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
-                let mut chunks = Vec::with_capacity(results.len());
-                for slot in results.iter() {
-                    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-                    p += guard.0;
-                    l += guard.1;
-                    t += guard.2;
-                    chunks.push(std::mem::take(&mut guard.3));
-                }
-                (p, l, t, chunks)
-            } else {
-                let CopiedState { prints, scratch } = &mut *copied;
-                if scratch.len() < crate::watch::PAGE {
-                    scratch.resize(crate::watch::PAGE, 0);
-                }
-                let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
-                let mut changed = Vec::new();
-                for (from, to, first, end, offset) in plans {
-                    let len = to.saturating_sub(from);
-                    if len > scratch.len() {
-                        scratch.resize(len, 0);
+                            *results[chunk_idx].lock().unwrap_or_else(|e| e.into_inner()) =
+                                (p, l, t, changed, local_straddlers);
+                        }));
                     }
-                    let buf = &mut scratch[..len];
-                    if crate::host::read_into_fast(from as *const u8, buf) {
-                        p += 1;
-                        if first < end {
-                            let copied_sub = &mut prints[first as usize..end as usize];
-                            let tabled_sub =
-                                check_tabled.then(|| &self.tabled[first as usize..end as usize]);
-                            let (pl, pt) = scan_page_records(
-                                buf,
-                                first,
-                                end,
-                                offset,
-                                heap_start,
-                                step_usize,
-                                copied_sub,
-                                tabled_sub,
-                                now,
-                                &mut changed,
-                            );
-                            l += pl;
-                            t += pt;
+                    crate::shadow::wide_run(jobs);
+                    let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
+                    let mut chunks = Vec::with_capacity(results.len());
+                    let mut straddlers = Vec::new();
+                    for slot in results.iter() {
+                        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                        p += guard.0;
+                        l += guard.1;
+                        t += guard.2;
+                        chunks.push(std::mem::take(&mut guard.3));
+                        straddlers.append(&mut guard.4);
+                    }
+                    (p, l, t, chunks, straddlers)
+                } else {
+                    let CopiedState { prints, scratch } = &mut *copied;
+                    if scratch.len() < crate::watch::PAGE {
+                        scratch.resize(crate::watch::PAGE, 0);
+                    }
+                    let (mut p, mut l, mut t) = (0u64, 0u64, 0u64);
+                    let mut changed = Vec::new();
+                    let mut straddlers = Vec::new();
+                    for (from, to, first, end, offset) in plans {
+                        let len = to.saturating_sub(from);
+                        if len > scratch.len() {
+                            scratch.resize(len, 0);
+                        }
+                        let buf = &mut scratch[..len];
+                        if crate::host::read_into_fast(from as *const u8, buf) {
+                            p += 1;
+                            if first < end {
+                                let copied_sub = &mut prints[first as usize..end as usize];
+                                let tabled_sub = check_tabled
+                                    .then(|| &self.tabled[first as usize..end as usize]);
+                                let (pl, pt) = scan_page_records(
+                                    buf,
+                                    first,
+                                    end,
+                                    offset,
+                                    heap_start,
+                                    step_usize,
+                                    copied_sub,
+                                    tabled_sub,
+                                    now,
+                                    &mut changed,
+                                );
+                                l += pl;
+                                t += pt;
+                            }
+                            let (s, sn) =
+                                page_straddle_slots(from, to, heap_start as usize, step, limit);
+                            if sn > 0 {
+                                straddlers.extend_from_slice(&s[..sn]);
+                            }
                         }
                     }
+                    (p, l, t, vec![changed], straddlers)
+                };
+
+            // A record across a 64 KiB page end, read whole (FX #802: before,
+            // both pages skipped it for good).
+            if !straddlers.is_empty() && step_usize <= 32 {
+                straddlers.sort_unstable();
+                straddlers.dedup();
+                let mut straddle = [0u8; 32];
+                let mut straddle_changed = Vec::new();
+                for index in straddlers {
+                    let handle = heap_start + u64::from(index) * step;
+                    if !crate::host::read_into_fast(
+                        handle as *const u8,
+                        &mut straddle[..step_usize],
+                    ) {
+                        continue;
+                    }
+                    let copied_sub = &mut copied.prints[index as usize..index as usize + 1];
+                    let tabled_sub =
+                        check_tabled.then(|| &self.tabled[index as usize..index as usize + 1]);
+                    let (pl, pt) = scan_page_records(
+                        &straddle[..step_usize],
+                        index,
+                        index + 1,
+                        0,
+                        heap_start,
+                        step_usize,
+                        copied_sub,
+                        tabled_sub,
+                        now,
+                        &mut straddle_changed,
+                    );
+                    l += pl;
+                    t += pt;
                 }
-                (p, l, t, vec![changed])
+                if !straddle_changed.is_empty() {
+                    chunks.push(straddle_changed);
+                }
             }
+            (p, l, t, chunks)
         };
 
         if tabled_skipped != 0 {
@@ -3635,6 +3751,49 @@ fn page_slot_range(
     }
     let first_addr = heap_start + (first * step) as usize;
     (first as u32, end as u32, first_addr - from)
+}
+
+/// Title descriptor slots that partially overlap `[from, to)` (straddling a
+/// 64 KiB page boundary, FX #802) and are excluded by [`page_slot_range`].
+/// Returns up to 2 slot indices `(slots, count)`.
+fn page_straddle_slots(
+    from: usize,
+    to: usize,
+    heap_start: usize,
+    step: u64,
+    mirrored_count: u32,
+) -> ([u32; 2], usize) {
+    let mut out = [0u32; 2];
+    let mut n = 0usize;
+    if to <= from || to <= heap_start || step == 0 || mirrored_count == 0 {
+        return (out, 0);
+    }
+    let rel_from = from.saturating_sub(heap_start) as u64;
+    let rel_to = (to - heap_start) as u64;
+    let limit = u64::from(mirrored_count);
+    let overlap_first = rel_from / step;
+    let overlap_end = rel_to.div_ceil(step).min(limit);
+    if overlap_first >= overlap_end {
+        return (out, 0);
+    }
+    let first = rel_from.div_ceil(step);
+    let end = (rel_to / step).min(limit);
+    if first >= end {
+        for idx in overlap_first..overlap_end {
+            out[n] = idx as u32;
+            n += 1;
+        }
+    } else {
+        if overlap_first < first {
+            out[n] = overlap_first as u32;
+            n += 1;
+        }
+        if end < overlap_end {
+            out[n] = end as u32;
+            n += 1;
+        }
+    }
+    (out, n)
 }
 
 /// Scans one copied page's complete descriptor records, updating `copied_sub`
@@ -5355,6 +5514,17 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
     }
 
+    /// A texture no larger than the head has nothing past it to look in
+    /// (the range's start would lie past its end).
+    #[test]
+    fn a_texture_within_the_head_has_no_next_start() {
+        let mut spans = Spans::default();
+        spans.note(1, 0x1_0000, 0x1_0000 + 0x800, true);
+        spans.note(2, 0x1_0400, 0x1_0400 + 0x800, true);
+        assert_eq!(spans.next_start(0x1_0000, 0x1_0000 + 0x800), None);
+        assert_eq!(spans.next_start(0x1_0000, 0x1_0000 + HEAD), None);
+    }
+
     /// What the texture code asks of the spans (levels on demand): where
     /// the next texture starts inside a span, the lowest level a view of a
     /// texture shows, and a texture's slots.
@@ -5498,6 +5668,65 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
 
+    fn due_full_sort(q: &TextureQueue, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let mut looked = Vec::new();
+        let mut fresh = Vec::new();
+        let mut partial = Vec::new();
+        for (&index, w) in q.slots.iter().filter(|(_, w)| w.due <= frame) {
+            let queue = if w.mapped > 0 {
+                &mut partial
+            } else if w.looks > 0 {
+                &mut looked
+            } else {
+                &mut fresh
+            };
+            queue.push((index, w.write));
+        }
+        looked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
+        fresh.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
+        partial.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
+        let mut order = looked;
+        let mut fresh = fresh.into_iter();
+        while order.len() < max {
+            let Some(entry) = fresh.next() else { break };
+            order.push(entry);
+            if order.len() < max && let Some(entry) = fresh.next_back() {
+                order.push(entry);
+            }
+        }
+        order.extend(partial);
+        order.truncate(max);
+        order
+    }
+
+    fn due_fixture(slots: u32, repeat_every: u32) -> TextureQueue {
+        let mut q = TextureQueue::default();
+        for i in 0..slots {
+            // An odd multiplier gives unique slots in the 64K table and
+            // puts write order out of slot order, as in a streamed heap.
+            let index = i.wrapping_mul(32749) & 0xffff;
+            q.written(index, u64::from(i), u64::from(i % 11 == 0), false);
+            if i.is_multiple_of(repeat_every) {
+                q.slots.get_mut(&index).unwrap().looks = 1;
+            } else if i % 5 == 0 {
+                q.slots.get_mut(&index).unwrap().mapped = 4096;
+            }
+        }
+        q
+    }
+
+    #[test]
+    fn bounded_texture_selection_matches_full_sort() {
+        for repeat_every in [1, 3, 17] {
+            let q = due_fixture(73, repeat_every);
+            for frame in [0, 1] {
+                for max in 0..=75 {
+                    assert_eq!(q.due(frame, max), due_full_sort(&q, frame, max));
+                }
+            }
+        }
+    }
+
     /// Remapped ranges past the limit are joined into wider ones that
     /// still cover every byte, never dropped.
     #[test]
@@ -5620,6 +5849,23 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    #[test]
+    fn packed_small_palettes_stay() {
+        // Tint palettes of 256 B to 4 KiB side by side on one page
+        // (fxceless/victory-fork issue #923): none makes another stale.
+        let mut spans = Spans::default();
+        let at = 0x5_0000_0000u64;
+        assert!(spans.note(1, at, at + 0x100, true).is_empty());
+        assert!(spans.note(2, at + 0x100, at + 0x200, true).is_empty());
+        assert!(spans.note(3, at + 0x200, at + 0x600, true).is_empty());
+        assert!(spans.note(4, at + 0x600, at + 0x1600, true).is_empty());
+        let mut all = spans.slots_in(0, u64::MAX);
+        all.sort_unstable();
+        assert_eq!(all, [1, 2, 3, 4]);
+        // One written inside another's own bytes still replaces it.
+        assert_eq!(spans.note(5, at + 0x40, at + 0x80, true), [1]);
     }
 
     /// Textures of which only the smallest levels are held, packed into
@@ -5906,6 +6152,21 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     }
 
     #[test]
+    fn dynamic_slots_can_span_the_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let first = heap.dynamic(heap.dynamic).unwrap();
+        heap.release(first, 12);
+        assert_eq!(heap.dynamic(12), Some(first));
+
+        // The cursor is at 12 and everything is taken. Free slots 10..14:
+        // the only four-slot run starts before the cursor and ends after it.
+        heap.release(first + 10, 4);
+        assert_eq!(heap.dynamic(4), Some(first + 10));
+    }
+
+    #[test]
     fn kept_slot_holds_shadow_arc_and_release_clears_kept() {
         let _retire = crate::host::isolated_retire_scope();
         let Some(heap) = HostHeap::new(false, 4) else {
@@ -5979,6 +6240,35 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         );
         // Empty range.
         assert_eq!(page_slot_range(start, start, start, step, 10), (0, 0, 0));
+    }
+
+    #[test]
+    fn page_straddle_slots_identifies_boundary_crossing_records() {
+        let start = 0x1000usize;
+        let step = 32u64;
+        // Aligned range: no straddlers.
+        assert_eq!(page_straddle_slots(start, start + 10 * 32, start, step, 10), ([0, 0], 0));
+        // Both ends straddling with no complete slot in between: slots 3 and 4.
+        assert_eq!(
+            page_straddle_slots(start + 3 * 32 + 4, start + 4 * 32 + 8, start, step, 5),
+            ([3, 4], 2)
+        );
+        // Unaligned `from` and `to` with complete slots 1..3 in between: straddlers 0 and 3.
+        assert_eq!(
+            page_straddle_slots(start + 4, start + 3 * 32 + 4, start, step, 10),
+            ([0, 3], 2)
+        );
+        // Single straddler across 64 KiB page boundary (16-byte sampler heap at +8).
+        let unaligned_start = 0x1_0008usize;
+        let page_end = 0x2_0000usize;
+        assert_eq!(
+            page_straddle_slots(unaligned_start, page_end, unaligned_start, 16, 4096),
+            ([4095, 0], 1)
+        );
+        assert_eq!(
+            page_straddle_slots(page_end, page_end + 8, unaligned_start, 16, 4096),
+            ([4095, 0], 1)
+        );
     }
 
     #[test]

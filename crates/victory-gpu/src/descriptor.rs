@@ -1341,6 +1341,59 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// A descriptor record straddling a 64 KiB page boundary in an unaligned
+    /// placed heap must be mirrored instead of skipped by both pages (FX #802).
+    #[cfg(windows)]
+    #[test]
+    fn straddling_record_across_page_boundary_is_mirrored_on_sync() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        // Place 4096 16-byte sampler slots starting 8 bytes into page 0 so slot
+        // 4095 spans [memory + PAGE - 8, memory + PAGE + 8).
+        let start = memory as u64 + 8;
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 4096,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: start,
+            size: 4096 * 16,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let source = elsewhere.as_mut_ptr() as u64;
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &sampler, source);
+            let slot_addr = (start + 4095 * 16) as *mut u8;
+            // SAFETY: slot 4095 lies inside our 2-page allocation.
+            unsafe { std::ptr::copy_nonoverlapping(source as *const u8, slot_addr, 16) };
+            assert!(!host.made(4095));
+            sync_heaps();
+            assert!(
+                host.made(4095),
+                "straddling record across 64 KiB page boundary must be mirrored"
+            );
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
