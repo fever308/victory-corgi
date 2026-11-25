@@ -949,6 +949,11 @@ fn promote_cold_pages(candidates: &[usize]) {
     let frame32 = current_frame32();
     let lazy = crate::lazy_back::active();
 
+    // Lock order: `WATCH_SERIAL` -> `GUARDS`. Holding both across `VirtualProtect` +
+    // `GetWriteWatch` verification ensures `ColdRo` is never visible until
+    // verified clean, and `on_write` (which acquires `GUARDS` without `WATCH_SERIAL`)
+    // serializes cleanly if a title thread faults before `GUARDS` drops.
+    let _serial = WATCH_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
     g.prune_pins();
 
@@ -979,7 +984,6 @@ fn promote_cold_pages(candidates: &[usize]) {
             to += 1;
             idx += 1;
         }
-        DIR.set_bits_range(from, to, BitField::ColdRo, true, Ordering::SeqCst);
         virtual_protect_adaptive(
             from,
             to,
@@ -987,60 +991,64 @@ fn promote_cold_pages(candidates: &[usize]) {
             false,
             &mut |ok_from, ok_to| promoted_runs.push((ok_from, ok_to)),
             &mut |_, _| {},
-            &mut |bad| {
-                DIR.set_bit(bad, BitField::ColdRo, false, Ordering::SeqCst);
-                DIR.reset_cold(bad, frame32);
-            },
+            &mut |bad| DIR.reset_cold(bad, frame32),
         );
     }
     if promoted_runs.is_empty() {
         return;
     }
 
-    // Re-check `GetWriteWatch(RESET)` while `PAGE_READONLY` is in effect to
-    // close the race between the initial `GetWriteWatch` and `VirtualProtect`.
-    fn verify_run(from: usize, to: usize, frame32: u32) {
+    // Re-check `GetWriteWatch(RESET)` while `PAGE_READONLY` is in effect and
+    // before setting `BitField::ColdRo = true`, closing any race with writes
+    // that landed right before `VirtualProtect`.
+    fn verify_and_mark_cold(from: usize, to: usize, frame32: u32) {
         if from >= to {
             return;
         }
         let mut old = 0u32;
         if let Some(dirty) = call_get_write_watch(from, to, 2) {
-            if !dirty.is_empty() {
-                let now = next_epoch();
-                for block in dirty {
-                    if block >= from && block < to {
-                        DIR.set_bit(block, BitField::ColdRo, false, Ordering::SeqCst);
-                        DIR.reset_cold(block, frame32);
-                        // SAFETY: restoring `PAGE_READWRITE` on a block whose write snuck in before promotion.
-                        unsafe {
-                            VirtualProtect(
-                                (block * PAGE) as *const _,
-                                PAGE,
-                                PAGE_READWRITE,
-                                &mut old,
-                            );
-                        }
-                        DIR.record_written(block, now);
+            if dirty.is_empty() {
+                DIR.set_bits_range(from, to, BitField::ColdRo, true, Ordering::SeqCst);
+                return;
+            }
+            let now = next_epoch();
+            let mut d_idx = dirty.partition_point(|&b| b < from);
+            for block in from..to {
+                while d_idx < dirty.len() && dirty[d_idx] < block {
+                    d_idx += 1;
+                }
+                if d_idx < dirty.len() && dirty[d_idx] == block {
+                    DIR.reset_cold(block, frame32);
+                    // SAFETY: restoring `PAGE_READWRITE` on a block whose write snuck in before promotion.
+                    unsafe {
+                        VirtualProtect(
+                            (block * PAGE) as *const _,
+                            PAGE,
+                            PAGE_READWRITE,
+                            &mut old,
+                        );
                     }
+                    DIR.record_written(block, now);
+                } else {
+                    DIR.set_bit(block, BitField::ColdRo, true, Ordering::SeqCst);
                 }
             }
             return;
         }
         if to - from > 1 {
             let mid = from + (to - from) / 2;
-            verify_run(from, mid, frame32);
-            verify_run(mid, to, frame32);
+            verify_and_mark_cold(from, mid, frame32);
+            verify_and_mark_cold(mid, to, frame32);
             return;
         }
-        // Single block failed `GetWriteWatch` verification: do not keep cold-promoted.
-        DIR.set_bit(from, BitField::ColdRo, false, Ordering::SeqCst);
+        // Single block failed `GetWriteWatch` verification: restore RW and do not mark cold.
         DIR.reset_cold(from, frame32);
         // SAFETY: restoring `PAGE_READWRITE` on unverified block.
         unsafe { VirtualProtect((from * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
     }
 
     for (from, to) in promoted_runs {
-        verify_run(from, to, frame32);
+        verify_and_mark_cold(from, to, frame32);
     }
 }
 
@@ -1588,76 +1596,76 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
 
     // Path 3: non-view write-watched memory (skipping `cold_ro` sub-runs).
+    // Evaluate `known_view` / `in_view` before taking `WATCH_SERIAL` so
+    // `WATCH_SERIAL` never nests `GUARDS` even under `VICTORY_WATCH_LOCKFREE=0`.
+    let kv = guarded && known_view(first * PAGE);
+    let view = kv || in_view(first, last);
     let threshold = cold_after().min(u8::MAX as u32) as u8;
     let frame32 = current_frame32();
     let mut to_promote = Vec::new();
-    let result: Option<u64> = {
+    let result: Option<u64> = if view {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
+        None
+    } else {
         let _serial = WATCH_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let kv = guarded && known_view(first * PAGE);
-        let view = kv || in_view(first, last);
-        if view {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::WatchKnownView, 1);
-            None
+        let non_cold = if v2_enabled() && threshold > 0 {
+            DIR.collect_clear_runs(first, last, BitField::ColdRo)
         } else {
-            let non_cold = if v2_enabled() && threshold > 0 {
-                DIR.collect_clear_runs(first, last, BitField::ColdRo)
-            } else {
-                vec![(first, last)]
-            };
-            if non_cold.is_empty() {
-                if asks_on() {
-                    CLEAN[4].fetch_add(1, Ordering::Relaxed);
-                    CLEAN[5].fetch_add((last - first) as u64, Ordering::Relaxed);
-                }
-                Some(next_epoch())
-            } else {
-                let mut all_ok = true;
-                let mut run_dirty: Vec<Vec<usize>> = Vec::with_capacity(non_cold.len());
-                for &(r0, r1) in &non_cold {
-                    if let Some(d) = call_get_write_watch(r0, r1, 2) {
-                        run_dirty.push(d);
-                    } else {
-                        all_ok = false;
-                        break;
-                    }
-                }
-                if !all_ok {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        crate::copystat::add(crate::copystat::C::WatchFailed, 1);
-                        if guarded {
-                            failed_asking(first * PAGE, last * PAGE);
-                        }
-                    }
-                    None
+            vec![(first, last)]
+        };
+        if non_cold.is_empty() {
+            if asks_on() {
+                CLEAN[4].fetch_add(1, Ordering::Relaxed);
+                CLEAN[5].fetch_add((last - first) as u64, Ordering::Relaxed);
+            }
+            Some(next_epoch())
+        } else {
+            let mut all_ok = true;
+            let mut run_dirty: Vec<Vec<usize>> = Vec::with_capacity(non_cold.len());
+            for &(r0, r1) in &non_cold {
+                if let Some(d) = call_get_write_watch(r0, r1, 2) {
+                    run_dirty.push(d);
                 } else {
-                    if asks_on() {
-                        let non_cold_pages: usize = non_cold.iter().map(|&(a, b)| b - a).sum();
-                        if non_cold_pages < last - first {
-                            CLEAN[4].fetch_add(1, Ordering::Relaxed);
-                            CLEAN[5].fetch_add(
-                                ((last - first) - non_cold_pages) as u64,
-                                Ordering::Relaxed,
-                            );
-                        }
+                    all_ok = false;
+                    break;
+                }
+            }
+            if !all_ok {
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::WatchFailed, 1);
+                    if guarded {
+                        failed_asking(first * PAGE, last * PAGE);
                     }
-                    let now = next_epoch();
-                    for (&(r0, r1), dirty) in non_cold.iter().zip(&run_dirty) {
-                        for &p in dirty {
-                            DIR.record_written(p, now);
-                        }
-                        DIR.note_clean_for_cold(
-                            r0,
-                            r1,
-                            dirty,
-                            frame32,
-                            threshold,
-                            &mut to_promote,
+                }
+                None
+            } else {
+                if asks_on() {
+                    let non_cold_pages: usize = non_cold.iter().map(|&(a, b)| b - a).sum();
+                    if non_cold_pages < last - first {
+                        CLEAN[4].fetch_add(1, Ordering::Relaxed);
+                        CLEAN[5].fetch_add(
+                            ((last - first) - non_cold_pages) as u64,
+                            Ordering::Relaxed,
                         );
                     }
-                    Some(now)
                 }
+                let now = next_epoch();
+                for (&(r0, r1), dirty) in non_cold.iter().zip(&run_dirty) {
+                    for &p in dirty {
+                        DIR.record_written(p, now);
+                    }
+                    DIR.note_clean_for_cold(
+                        r0,
+                        r1,
+                        dirty,
+                        frame32,
+                        threshold,
+                        &mut to_promote,
+                    );
+                }
+                Some(now)
             }
         }
     };
