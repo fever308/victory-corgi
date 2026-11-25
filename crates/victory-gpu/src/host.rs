@@ -40,16 +40,86 @@ const RTV_RING: u32 = 1024;
 /// One-off readbacks larger than this are dropped right after use.
 const REBAR_READBACK_KEEP_CAP: u64 = 256 << 20;
 
-/// Reusable command list and readback buffer for DMAing GPU-written ranges of
-/// ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) shadow buffers into cached system RAM.
+/// Minimum and maximum cached byte sizes for the ReBAR GPU hash-compare flags
+/// (`DEFAULT` UAV + `READBACK`, 4 bytes per 64 KiB piece: 16 KiB = 4,096
+/// pieces = 256 MiB; 4 MiB = 1,048,576 pieces = 64 GiB per submission).
+const REBAR_FLAGS_MIN_BYTES: u64 = 16 << 10;
+const REBAR_FLAGS_MAX_BYTES: u64 = 4 << 20;
+
+const REBAR_HASH_SOURCE: &str = include_str!("../shaders/rebar_hash.hlsl");
+
+struct RebarHashPipeline {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+}
+
+// SAFETY: D3D12 root signatures and pipeline states are free-threaded.
+unsafe impl Send for RebarHashPipeline {}
+// SAFETY: as above.
+unsafe impl Sync for RebarHashPipeline {}
+
+fn rebar_hash_pipeline(device: &ID3D12Device) -> Option<&'static RebarHashPipeline> {
+    static PIPELINE: OnceLock<Option<RebarHashPipeline>> = OnceLock::new();
+    PIPELINE
+        .get_or_init(|| match make_rebar_hash_pipeline(device) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "no ReBAR hash-compare pipeline; falling back to full-range readbacks"
+                );
+                None
+            }
+        })
+        .as_ref()
+}
+
+fn make_rebar_hash_pipeline(device: &ID3D12Device) -> windows::core::Result<RebarHashPipeline> {
+    let bytes = compile(
+        REBAR_HASH_SOURCE,
+        windows::core::s!("main"),
+        windows::core::s!("cs_5_1"),
+    )?;
+    let bytes = &bytes[..];
+    // SAFETY: plain object creation; the root signature is embedded in the shader.
+    unsafe {
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            },
+            ..Default::default()
+        })?;
+        Ok(RebarHashPipeline { root, pso })
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RebarHashStats {
+    pub(crate) compared_pieces: u64,
+    pub(crate) changed_pieces: u64,
+    pub(crate) post_readback_calls: u64,
+    pub(crate) post_readback_bytes: u64,
+}
+
+/// Reusable command lists and readback/hash-flag buffers for DMAing changed
+/// GPU-written ranges of ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) shadow buffers
+/// into cached system RAM.
 #[derive(Default)]
 struct RebarReadback {
     list: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    pre_hash_list: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+    post_compare_list: Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+    flags_uav: Option<(ID3D12Resource, u64, u64)>,
+    flags_readback: Option<(ID3D12Resource, usize, u64)>,
 }
 
-// SAFETY: D3D12 objects are free-threaded; the mapped pointer is read only
-// under `Host::rebar_readback` after the copy fence has completed.
+// SAFETY: D3D12 objects are free-threaded; mapped pointers are read only
+// under `Host::rebar_readback` after the corresponding GPU fence has completed.
 unsafe impl Send for RebarReadback {}
 
 pub(crate) struct Host {
@@ -81,6 +151,16 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    #[cfg(test)]
+    d3d12_errors: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    rebar_hash_compared_pieces: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    rebar_hash_changed_pieces: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    rebar_post_readback_calls: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    rebar_post_readback_bytes: std::sync::atomic::AtomicU64,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -784,6 +864,16 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            #[cfg(test)]
+            d3d12_errors: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            rebar_hash_compared_pieces: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            rebar_hash_changed_pieces: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            rebar_post_readback_calls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            rebar_post_readback_bytes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -3570,6 +3660,20 @@ impl Host {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn d3d12_errors(&self) -> u64 {
+        self.d3d12_errors.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rebar_hash_stats(&self) -> RebarHashStats {
+        RebarHashStats {
+            compared_pieces: self.rebar_hash_compared_pieces.load(Ordering::Relaxed),
+            changed_pieces: self.rebar_hash_changed_pieces.load(Ordering::Relaxed),
+            post_readback_calls: self.rebar_post_readback_calls.load(Ordering::Relaxed),
+            post_readback_bytes: self.rebar_post_readback_bytes.load(Ordering::Relaxed),
+        }
+    }
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         #[cfg(feature = "diagnostics")]
@@ -5148,6 +5252,34 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        let back = declared_writes(runs);
+        let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
+        if !late {
+            for (shadow, declared) in &back {
+                if !shadow.is_rebar() {
+                    continue;
+                }
+                let ranges: Vec<(usize, usize)> = declared
+                    .iter()
+                    .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
+                    .filter(|&(from, to)| from < to)
+                    .collect();
+                let declared_spans = merge_ranges(ranges);
+                let piece_runs = spans_to_piece_runs(&declared_spans);
+                rebar_entries.push(RebarWriteEntry {
+                    shadow: shadow.clone(),
+                    declared_spans,
+                    piece_runs,
+                    compare_out_base: None,
+                    compare_pieces: 0,
+                });
+            }
+        }
+        let mut rebar_hash_plan = if rebar_entries.is_empty() {
+            RebarHashPlan::default()
+        } else {
+            self.prepare_rebar_hash_plan(&mut rebar_entries)
+        };
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -5160,7 +5292,6 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
-            let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -5177,17 +5308,32 @@ impl Host {
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let timed = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let timed = false;
+        let mut batched_lists: Vec<Option<ID3D12CommandList>> = Vec::new();
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timed {
+            if let Some(pre) = rebar_hash_plan.pre_list.take() {
+                let _ = self.submit_helper_list(&mut submitted, pre, "ReBAR pre-hash");
+            }
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
+        } else if rebar_hash_plan.pre_list.is_some() || rebar_hash_plan.post_list.is_some() {
+            batched_lists.reserve(lists.len() + 2);
+            if let Some(pre) = rebar_hash_plan.pre_list.take() {
+                batched_lists.push(Some(pre));
+            }
+            batched_lists.extend(lists.iter().cloned());
+            if let Some(post) = rebar_hash_plan.post_list.take() {
+                batched_lists.push(Some(post));
+            }
+            vec![&batched_lists[..]]
         } else {
             vec![&lists[..]]
         };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -5246,6 +5392,10 @@ impl Host {
             }
             let _ = (i, started);
         }
+        let mut post_compare_ok = true;
+        if timed && let Some(post) = rebar_hash_plan.post_list {
+            post_compare_ok = self.submit_helper_list(&mut submitted, post, "ReBAR post-compare");
+        }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
@@ -5289,8 +5439,17 @@ impl Host {
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
-        let back = declared_writes(runs);
-        self.rebar_back(&mut submitted, &back);
+        if !rebar_entries.is_empty() {
+            self.finish_rebar_copy_back(
+                &mut submitted,
+                rebar_entries,
+                if post_compare_ok {
+                    rebar_hash_plan.total_flag_pieces
+                } else {
+                    0
+                },
+            );
+        }
         hand_back(&back);
         if let Some(card) = card {
             self.card_done(card);
@@ -5462,8 +5621,12 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
-                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
-                        first_error = Some(text.to_owned());
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
+                        #[cfg(test)]
+                        self.d3d12_errors.fetch_add(1, Ordering::Relaxed);
+                        if first_error.is_none() {
+                            first_error = Some(text.to_owned());
+                        }
                     }
                 }
             }
@@ -7156,6 +7319,106 @@ fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     merged
 }
 
+/// Converts sorted disjoint buffer-offset byte intervals `[from, to)` into
+/// sorted, disjoint, non-adjacent 64 KiB piece runs `(first_piece, count)` so
+/// each overlapping piece is hashed and compared at most once per submission.
+fn spans_to_piece_runs(spans: &[(usize, usize)]) -> Vec<(u32, u32)> {
+    use crate::watch::PAGE;
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &(from, to) in spans {
+        if from >= to {
+            continue;
+        }
+        let Ok(first) = u32::try_from(from / PAGE) else {
+            continue;
+        };
+        let Ok(end) = u32::try_from(to.div_ceil(PAGE)) else {
+            continue;
+        };
+        if first >= end {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(last) if first <= last.0 + last.1 => {
+                let new_end = (last.0 + last.1).max(end);
+                last.1 = new_end - last.0;
+            }
+            _ => runs.push((first, end - first)),
+        }
+    }
+    runs
+}
+
+/// Walks `piece_runs` paired with their per-piece GPU comparison `flags`,
+/// coalescing contiguous flagged (`!= 0`) 64 KiB pieces into sorted disjoint
+/// buffer-offset byte intervals clamped to `len`. Returns `(byte_runs, changed_pieces)`.
+fn flagged_piece_byte_runs(
+    piece_runs: &[(u32, u32)],
+    flags: &[u32],
+    len: usize,
+) -> (Vec<(usize, usize)>, u64) {
+    use crate::watch::PAGE;
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut cur: Option<(u32, u32)> = None;
+    let mut idx = 0usize;
+    let mut changed = 0u64;
+    for &(first, count) in piece_runs {
+        for off in 0..count {
+            let flagged = flags.get(idx).copied().unwrap_or(1) != 0;
+            idx += 1;
+            if flagged {
+                changed += 1;
+                let piece = first + off;
+                match cur {
+                    Some((s, e)) if e == piece => cur = Some((s, piece + 1)),
+                    Some((s, e)) => {
+                        let lo = (s as usize) * PAGE;
+                        let hi = ((e as usize) * PAGE).min(len);
+                        if lo < hi {
+                            out.push((lo, hi));
+                        }
+                        cur = Some((piece, piece + 1));
+                    }
+                    None => cur = Some((piece, piece + 1)),
+                }
+            } else if let Some((s, e)) = cur.take() {
+                let lo = (s as usize) * PAGE;
+                let hi = ((e as usize) * PAGE).min(len);
+                if lo < hi {
+                    out.push((lo, hi));
+                }
+            }
+        }
+    }
+    if let Some((s, e)) = cur {
+        let lo = (s as usize) * PAGE;
+        let hi = ((e as usize) * PAGE).min(len);
+        if lo < hi {
+            out.push((lo, hi));
+        }
+    }
+    (out, changed)
+}
+
+/// Intersects two sorted disjoint half-open interval lists `a` and `b`.
+fn intersect_ranges(a: &[(usize, usize)], b: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let lo = a[i].0.max(b[j].0);
+        let hi = a[i].1.min(b[j].1);
+        if lo < hi {
+            out.push((lo, hi));
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
 impl Host {
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
@@ -7341,6 +7604,460 @@ impl Host {
         }
         self.gpu_upload_buffer(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
     }
+}
+
+/// One unique ReBAR shadow with declared `GpuWrite` ranges in a submission.
+struct RebarWriteEntry {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    declared_spans: Vec<(usize, usize)>,
+    piece_runs: Vec<(u32, u32)>,
+    /// Starting index in the GPU hash-compare `flags` array if GPU hashing ran
+    /// for this entry; `None` falls back to reading back all `declared_spans`.
+    compare_out_base: Option<usize>,
+    compare_pieces: usize,
+}
+
+/// Optional pre-submission rehash and post-submission hash-compare command
+/// lists recorded for ReBAR UAV shadows in one submission.
+#[derive(Default)]
+struct RebarHashPlan {
+    pre_list: Option<ID3D12CommandList>,
+    post_list: Option<ID3D12CommandList>,
+    total_flag_pieces: usize,
+}
+
+impl Host {
+    /// Ensures a reusable closed direct command list exists in `slot`.
+    fn ensure_direct_list<'a>(
+        &self,
+        slot: &'a mut Option<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+    ) -> windows::core::Result<&'a (ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+        if slot.is_none() {
+            // SAFETY: valid device creating a direct allocator and closed list.
+            let pair = unsafe {
+                let allocator: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None,
+                )?;
+                list.Close()?;
+                (allocator, list)
+            };
+            *slot = Some(pair);
+        }
+        Ok(slot.as_ref().unwrap())
+    }
+
+    /// Submits a single closed helper command list on `self.queue` and waits
+    /// on `self.fence` (`submitted` must be held by the caller).
+    fn submit_helper_list(&self, submitted: &mut u64, cmd: ID3D12CommandList, label: &str) -> bool {
+        *submitted += 1;
+        // SAFETY: `cmd` is closed; `fence` and `event` are owned by `self` and
+        // serialized under `submitted`.
+        unsafe {
+            self.queue.ExecuteCommandLists(&[Some(cmd)]);
+            match self.queue.Signal(&self.fence, *submitted) {
+                Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                    Ok(()) => {
+                        let waited = WaitForSingleObject(self.event, INFINITE);
+                        if waited != WAIT_OBJECT_0 {
+                            self.poll_fence(*submitted);
+                        }
+                    }
+                    Err(_) => self.poll_fence(*submitted),
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "{label} fence signal failed");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Builds optional pre-submission hash-update and post-submission
+    /// hash-compare command lists for UAV-written ReBAR shadows so copy-back
+    /// only DMAs 64 KiB pieces whose GPU hash actually changed. Falls back
+    /// cleanly to full-range readbacks if the compute pipeline or buffers are
+    /// unavailable.
+    fn prepare_rebar_hash_plan(&self, entries: &mut [RebarWriteEntry]) -> RebarHashPlan {
+        let Some(pipe) = rebar_hash_pipeline(&self.device) else {
+            return RebarHashPlan::default();
+        };
+        struct PreparedHash {
+            entry_idx: usize,
+            hashes_gpu: u64,
+            aligned_len: u32,
+            pre_runs: Vec<(u32, u32)>,
+            out_base: usize,
+            pieces: usize,
+        }
+        let mut prepared: Vec<PreparedHash> = Vec::with_capacity(entries.len());
+        let mut total_flag_pieces = 0usize;
+        for (entry_idx, entry) in entries.iter().enumerate() {
+            let entry_pieces: usize = entry.piece_runs.iter().map(|&(_, c)| c as usize).sum();
+            if entry_pieces == 0 {
+                continue;
+            }
+            let Some(crate::shadow::PreparedRebarHashes {
+                hashes_gpu,
+                aligned_len,
+                pre_runs,
+            }) = entry.shadow.prepare_rebar_hashes(|n| {
+                self.default_buffer_in_state(n, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            })
+            else {
+                continue;
+            };
+            let Some(next_total) = total_flag_pieces.checked_add(entry_pieces) else {
+                entry.shadow.mark_rebar_dirty_runs(&pre_runs);
+                continue;
+            };
+            if (next_total as u64).saturating_mul(4) > REBAR_FLAGS_MAX_BYTES {
+                entry.shadow.mark_rebar_dirty_runs(&pre_runs);
+                continue;
+            }
+            prepared.push(PreparedHash {
+                entry_idx,
+                hashes_gpu,
+                aligned_len,
+                pre_runs,
+                out_base: total_flag_pieces,
+                pieces: entry_pieces,
+            });
+            total_flag_pieces = next_total;
+        }
+        if prepared.is_empty() {
+            return RebarHashPlan::default();
+        }
+        let restore_dirty = |entries: &[RebarWriteEntry], prepared: &[PreparedHash]| {
+            for p in prepared {
+                if !p.pre_runs.is_empty() {
+                    entries[p.entry_idx]
+                        .shadow
+                        .mark_rebar_dirty_runs(&p.pre_runs);
+                }
+            }
+        };
+        let mut rb = self
+            .rebar_readback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let need_bytes = ((total_flag_pieces as u64) * 4).max(4);
+        let need_flags_alloc = rb
+            .flags_uav
+            .as_ref()
+            .is_none_or(|(_, _, c)| *c < need_bytes)
+            || rb
+                .flags_readback
+                .as_ref()
+                .is_none_or(|(_, _, c)| *c < need_bytes);
+        if need_flags_alloc {
+            let cap = need_bytes
+                .next_power_of_two()
+                .clamp(REBAR_FLAGS_MIN_BYTES, REBAR_FLAGS_MAX_BYTES);
+            let Some(uav) =
+                self.default_buffer_in_state(cap, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            else {
+                restore_dirty(entries, &prepared);
+                return RebarHashPlan::default();
+            };
+            let Some((rb_buf, rb_ptr)) = self.readback_buffer(cap) else {
+                restore_dirty(entries, &prepared);
+                return RebarHashPlan::default();
+            };
+            name(&uav, || format!("ReBAR hash flags UAV {cap:#x}"));
+            name(&rb_buf, || format!("ReBAR hash flags readback {cap:#x}"));
+            // SAFETY: live D3D12 buffer.
+            let uav_gpu = unsafe { uav.GetGPUVirtualAddress() };
+            rb.flags_uav = Some((uav, uav_gpu, cap));
+            rb.flags_readback = Some((rb_buf, rb_ptr as usize, cap));
+        }
+        let (flags_uav_res, flags_uav_gpu, _) = rb.flags_uav.as_ref().unwrap().clone();
+        let flags_rb_res = rb.flags_readback.as_ref().unwrap().0.clone();
+
+        // Record pre-submission hash pass for shadows that just created `hashes`
+        // or received CPU writes (`Shadow::copy` / `copy_back_rebar`) since last hash.
+        let pre_list = if prepared.iter().any(|p| !p.pre_runs.is_empty()) {
+            let Ok((allocator, list)) = self.ensure_direct_list(&mut rb.pre_hash_list) else {
+                restore_dirty(entries, &prepared);
+                return RebarHashPlan::default();
+            };
+            let to_srv: Vec<D3D12_RESOURCE_BARRIER> = prepared
+                .iter()
+                .filter(|p| !p.pre_runs.is_empty())
+                .map(|p| {
+                    transition(
+                        &entries[p.entry_idx].shadow.buffer,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    )
+                })
+                .collect();
+            let to_common: Vec<D3D12_RESOURCE_BARRIER> = prepared
+                .iter()
+                .filter(|p| !p.pre_runs.is_empty())
+                .map(|p| {
+                    transition(
+                        &entries[p.entry_idx].shadow.buffer,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )
+                })
+                .collect();
+            // SAFETY: `submitted` is held exclusively so no prior pre-hash list
+            // is in flight; all shadow buffers enter in COMMON and return to
+            // COMMON; `hashes` and `flags_uav` live in UNORDERED_ACCESS.
+            let recorded = unsafe {
+                (|| -> windows::core::Result<ID3D12CommandList> {
+                    allocator.Reset()?;
+                    list.Reset(allocator, None)?;
+                    list.ResourceBarrier(&to_srv);
+                    list.SetComputeRootSignature(&pipe.root);
+                    list.SetPipelineState(&pipe.pso);
+                    list.SetComputeRootUnorderedAccessView(3, flags_uav_gpu);
+                    for p in prepared.iter().filter(|p| !p.pre_runs.is_empty()) {
+                        list.SetComputeRootShaderResourceView(
+                            1,
+                            entries[p.entry_idx].shadow.base_gpu(),
+                        );
+                        list.SetComputeRootUnorderedAccessView(2, p.hashes_gpu);
+                        for &(first, count) in &p.pre_runs {
+                            let constants = [first, p.aligned_len, 0u32, 0u32, count];
+                            list.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+                            list.Dispatch(count, 1, 1);
+                        }
+                    }
+                    list.ResourceBarrier(&to_common);
+                    list.Close()?;
+                    list.cast()
+                })()
+            };
+            match recorded {
+                Ok(cmd) => Some(cmd),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not record ReBAR pre-hash list");
+                    restore_dirty(entries, &prepared);
+                    return RebarHashPlan::default();
+                }
+            }
+        } else {
+            None
+        };
+
+        // Record post-submission hash-compare pass over all declared piece runs,
+        // copying the tiny `flags` dword array to `flags_readback`.
+        let Ok((allocator, list)) = self.ensure_direct_list(&mut rb.post_compare_list) else {
+            restore_dirty(entries, &prepared);
+            return RebarHashPlan::default();
+        };
+        let mut before_barriers = Vec::with_capacity(prepared.len() + 1);
+        before_barriers.push(crate::indirect::uav_barrier());
+        for p in &prepared {
+            before_barriers.push(transition(
+                &entries[p.entry_idx].shadow.buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            ));
+        }
+        let mut after_barriers = Vec::with_capacity(prepared.len() + 1);
+        after_barriers.push(transition(
+            &flags_uav_res,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        ));
+        for p in &prepared {
+            after_barriers.push(transition(
+                &entries[p.entry_idx].shadow.buffer,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            ));
+        }
+        // SAFETY: `submitted` is held exclusively so no prior post-compare list
+        // is in flight; `HostList::close` returned every shadow buffer to
+        // COMMON; `flags_uav` transitions UAV -> COPY_SOURCE -> UAV and
+        // `flags_rb_res` stays permanently in COPY_DEST covering `total_flag_pieces * 4`.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<ID3D12CommandList> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                list.ResourceBarrier(&before_barriers);
+                list.SetComputeRootSignature(&pipe.root);
+                list.SetPipelineState(&pipe.pso);
+                list.SetComputeRootUnorderedAccessView(3, flags_uav_gpu);
+                for p in &prepared {
+                    list.SetComputeRootShaderResourceView(
+                        1,
+                        entries[p.entry_idx].shadow.base_gpu(),
+                    );
+                    list.SetComputeRootUnorderedAccessView(2, p.hashes_gpu);
+                    let mut out_idx = p.out_base;
+                    for &(first, count) in &entries[p.entry_idx].piece_runs {
+                        let constants = [first, p.aligned_len, (out_idx * 4) as u32, 1u32, count];
+                        list.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+                        list.Dispatch(count, 1, 1);
+                        out_idx += count as usize;
+                    }
+                }
+                list.ResourceBarrier(&after_barriers);
+                list.CopyBufferRegion(
+                    &flags_rb_res,
+                    0,
+                    &flags_uav_res,
+                    0,
+                    (total_flag_pieces as u64) * 4,
+                );
+                list.ResourceBarrier(&[transition(
+                    &flags_uav_res,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+                list.Close()?;
+                list.cast()
+            })()
+        };
+        let post_list = match recorded {
+            Ok(cmd) => Some(cmd),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not record ReBAR post-compare list");
+                restore_dirty(entries, &prepared);
+                return RebarHashPlan::default();
+            }
+        };
+        drop(rb);
+        for p in prepared {
+            entries[p.entry_idx].compare_out_base = Some(p.out_base);
+            entries[p.entry_idx].compare_pieces = p.pieces;
+        }
+        RebarHashPlan {
+            pre_list,
+            post_list,
+            total_flag_pieces,
+        }
+    }
+
+    /// Reads GPU hash-compare flags (if run), coalesces contiguous flagged
+    /// 64 KiB pieces intersected with declared UAV spans, and DMAs only those
+    /// changed runs into `READBACK` for [`crate::shadow::Shadow::copy_back_rebar`].
+    fn finish_rebar_copy_back(
+        &self,
+        submitted: &mut u64,
+        entries: Vec<RebarWriteEntry>,
+        total_flag_pieces: usize,
+    ) {
+        struct PendingCopy {
+            shadow: std::sync::Arc<crate::shadow::Shadow>,
+            spans: Vec<(usize, usize)>,
+            first: usize,
+            end: usize,
+        }
+        let mut pending: Vec<PendingCopy> = Vec::with_capacity(entries.len());
+        let mut total_jobs = 0usize;
+        let mut compared_total = 0u64;
+        let mut changed_total = 0u64;
+        {
+            let rb = self
+                .rebar_readback
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let flags_all: Option<&[u32]> = if total_flag_pieces > 0 {
+                rb.flags_readback.as_ref().and_then(|(_, ptr, cap)| {
+                    ((total_flag_pieces as u64) * 4 <= *cap).then(|| {
+                        // SAFETY: submission fence completed and `ptr` is mapped
+                        // for `*cap >= total_flag_pieces * 4` bytes of `READBACK`.
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                (*ptr as *const u8).cast::<u32>(),
+                                total_flag_pieces,
+                            )
+                        }
+                    })
+                })
+            } else {
+                None
+            };
+            for entry in entries {
+                let spans = if let (Some(base), Some(all)) = (entry.compare_out_base, flags_all)
+                    && base + entry.compare_pieces <= all.len()
+                {
+                    let slice = &all[base..base + entry.compare_pieces];
+                    let (flagged, changed) = flagged_piece_byte_runs(
+                        &entry.piece_runs,
+                        slice,
+                        entry.shadow.len() as usize,
+                    );
+                    compared_total += entry.compare_pieces as u64;
+                    changed_total += changed;
+                    intersect_ranges(&flagged, &entry.declared_spans)
+                } else {
+                    // Fallback: read back the entire merged declared spans and
+                    // mark them dirty in any existing hash buffer.
+                    entry.shadow.mark_rebar_dirty_spans(&entry.declared_spans);
+                    entry.declared_spans
+                };
+                let first = total_jobs;
+                total_jobs += spans.len();
+                pending.push(PendingCopy {
+                    shadow: entry.shadow,
+                    spans,
+                    first,
+                    end: total_jobs,
+                });
+            }
+        }
+        #[cfg(test)]
+        if compared_total > 0 {
+            self.rebar_hash_compared_pieces
+                .fetch_add(compared_total, Ordering::Relaxed);
+            self.rebar_hash_changed_pieces
+                .fetch_add(changed_total, Ordering::Relaxed);
+        }
+        let _ = (compared_total, changed_total);
+        if total_jobs == 0 {
+            for entry in &pending {
+                entry.shadow.clear_pending_rebar();
+            }
+            return;
+        }
+        let mut copy_jobs: Vec<(&ID3D12Resource, u64, u64)> = Vec::with_capacity(total_jobs);
+        let mut copy_bytes = 0u64;
+        for entry in &pending {
+            for &(from, to) in &entry.spans {
+                let len = (to - from) as u64;
+                copy_bytes += len;
+                copy_jobs.push((&entry.shadow.buffer, from as u64, len));
+            }
+        }
+        #[cfg(test)]
+        {
+            self.rebar_post_readback_calls
+                .fetch_add(1, Ordering::Relaxed);
+            self.rebar_post_readback_bytes
+                .fetch_add(copy_bytes, Ordering::Relaxed);
+        }
+        let _ = copy_bytes;
+        let ok = self.copy_rebar_readback(submitted, &copy_jobs, |slices| {
+            for entry in &pending {
+                if entry.first < entry.end {
+                    let written = entry
+                        .shadow
+                        .copy_back_rebar(&entry.spans, &slices[entry.first..entry.end]);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                } else {
+                    entry.shadow.clear_pending_rebar();
+                }
+            }
+        });
+        if !ok {
+            for entry in &pending {
+                entry.shadow.clear_pending_rebar();
+            }
+        }
+    }
 
     /// DMAs `copies` (`(src_buffer, src_offset, len)`) from ReBAR buffers into
     /// a cached system-RAM readback buffer on `self.queue`, waits for `submitted`
@@ -7373,30 +8090,9 @@ impl Host {
             .rebar_readback
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if rb.list.is_none() {
-            // SAFETY: valid device creating a direct allocator and closed list.
-            let created = unsafe {
-                (|| -> windows::core::Result<_> {
-                    let allocator: ID3D12CommandAllocator = self
-                        .device
-                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                    let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                        0,
-                        D3D12_COMMAND_LIST_TYPE_DIRECT,
-                        &allocator,
-                        None,
-                    )?;
-                    list.Close()?;
-                    Ok((allocator, list))
-                })()
-            };
-            match created {
-                Ok(pair) => rb.list = Some(pair),
-                Err(e) => {
-                    tracing::warn!(error = %e, "could not create ReBAR readback command list");
-                    return false;
-                }
-            }
+        if let Err(e) = self.ensure_direct_list(&mut rb.list) {
+            tracing::warn!(error = %e, "could not create ReBAR readback command list");
+            return false;
         }
         let mut transient: Option<(ID3D12Resource, *const u8)> = None;
         let (dst_res, dst_ptr): (ID3D12Resource, *const u8) = if total > REBAR_READBACK_KEEP_CAP {
@@ -7447,27 +8143,9 @@ impl Host {
             drop(transient);
             return false;
         };
-        *submitted += 1;
-        // SAFETY: `cmd` is closed; `fence` and `event` are owned by `self` and
-        // serialized under `submitted`.
-        unsafe {
-            self.queue.ExecuteCommandLists(&[Some(cmd)]);
-            match self.queue.Signal(&self.fence, *submitted) {
-                Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                    Ok(()) => {
-                        let waited = WaitForSingleObject(self.event, INFINITE);
-                        if waited != WAIT_OBJECT_0 {
-                            self.poll_fence(*submitted);
-                        }
-                    }
-                    Err(_) => self.poll_fence(*submitted),
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "ReBAR readback fence signal failed");
-                    drop(transient);
-                    return false;
-                }
-            }
+        if !self.submit_helper_list(submitted, cmd, "ReBAR readback") {
+            drop(transient);
+            return false;
         }
         let slices: Vec<&[u8]> = offsets
             .iter()
@@ -8333,6 +9011,21 @@ impl Host {
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
+        self.default_buffer_in_state(size, D3D12_RESOURCE_STATE_COMMON)
+    }
+
+    /// A GPU-only default-heap buffer that shaders can write (unordered
+    /// access). Starts in the common state.
+    pub(crate) fn default_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_in_state(size, D3D12_RESOURCE_STATE_COMMON)
+    }
+
+    /// A GPU-only default-heap UAV buffer created in `initial_state`.
+    fn default_buffer_in_state(
+        &self,
+        size: u64,
+        initial_state: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
@@ -8358,7 +9051,7 @@ impl Host {
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
-                D3D12_RESOURCE_STATE_COMMON,
+                initial_state,
                 None,
                 &mut buffer,
             )
@@ -8698,7 +9391,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
 #[cfg(test)]
 mod rebar_tests {
-    use super::{merge_ranges, rebar_policy};
+    use super::{
+        REBAR_HASH_SOURCE, compile, flagged_piece_byte_runs, host, intersect_ranges, merge_ranges,
+        rebar_hash_pipeline, rebar_policy, spans_to_piece_runs, transition,
+    };
+    use crate::watch::PAGE;
 
     #[test]
     fn rebar_policy_handles_all_hardware_tiers_and_fallbacks() {
@@ -8761,6 +9458,165 @@ mod rebar_tests {
         assert_eq!(
             merge_ranges(vec![(0, 100), (10, 40), (20, 90)]),
             vec![(0, 100)]
+        );
+    }
+
+    #[test]
+    fn piece_runs_and_flagged_intersection_dedupe_and_clamp() {
+        // Two disjoint spans inside piece 0 plus a span in piece 1 coalesce into
+        // one contiguous run `(0, 2)`, while piece 4 stays separate.
+        let declared = vec![
+            (0x100, 0x200),
+            (0x8000, 0x9000),
+            (PAGE + 16, PAGE + 64),
+            (4 * PAGE, 5 * PAGE + 128),
+        ];
+        let runs = spans_to_piece_runs(&declared);
+        assert_eq!(runs, vec![(0, 2), (4, 2)]);
+
+        // Flag pieces 0, 4, and 5 (skip piece 1); clamp end to buffer length.
+        let len = 5 * PAGE + 256;
+        let (flagged, changed) = flagged_piece_byte_runs(&runs, &[1, 0, 1, 1], len);
+        assert_eq!(changed, 3);
+        assert_eq!(flagged, vec![(0, PAGE), (4 * PAGE, len)]);
+
+        // Intersecting with declared spans yields only the declared bytes in
+        // flagged pieces (both disjoint spans inside piece 0 are preserved).
+        assert_eq!(
+            intersect_ranges(&flagged, &declared),
+            vec![(0x100, 0x200), (0x8000, 0x9000), (4 * PAGE, 5 * PAGE + 128)]
+        );
+
+        // Zero flagged pieces produces zero readback spans.
+        let (none, changed) = flagged_piece_byte_runs(&runs, &[0, 0, 0, 0], len);
+        assert_eq!(changed, 0);
+        assert!(none.is_empty());
+        assert!(intersect_ranges(&none, &declared).is_empty());
+    }
+
+    #[test]
+    fn rebar_hash_hlsl_compiles_and_builds_on_host() {
+        compile(
+            REBAR_HASH_SOURCE,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+        )
+        .expect("rebar_hash HLSL compiles");
+        if let Some(h) = host() {
+            assert!(rebar_hash_pipeline(&h.device).is_some());
+        }
+    }
+
+    #[test]
+    fn rebar_hash_shader_detects_single_byte_change_and_swap_on_gpu() {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(h) = host() else {
+            return; // no host GPU here
+        };
+        let Some(pipe) = rebar_hash_pipeline(&h.device) else {
+            panic!("rebar_hash compute pipeline failed to build on a live host");
+        };
+        let errors_before = h.d3d12_errors();
+        let total_bytes = (2 * PAGE) as u64;
+        let (src_buf, src_ptr) = h.shared_buffer(total_bytes).expect("shared src");
+        let hashes_buf = h
+            .default_buffer_in_state(32, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .expect("hashes UAV");
+        let flags_uav = h
+            .default_buffer_in_state(16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .expect("flags UAV");
+        let (flags_rb, flags_ptr) = h.readback_buffer(16).expect("flags readback");
+
+        // Seed two 64 KiB pieces with distinct non-repeating synthetic bytes.
+        // SAFETY: `src_ptr` is mapped for `2 * PAGE` bytes.
+        let src_slice = unsafe { std::slice::from_raw_parts_mut(src_ptr, 2 * PAGE) };
+        for (i, b) in src_slice.iter_mut().enumerate() {
+            *b = ((i.wrapping_mul(37) ^ (i >> 8)) & 0xFF) as u8;
+        }
+
+        // SAFETY: live D3D12 resources.
+        let (src_gpu, hashes_gpu, flags_gpu) = unsafe {
+            (
+                src_buf.GetGPUVirtualAddress(),
+                hashes_buf.GetGPUVirtualAddress(),
+                flags_uav.GetGPUVirtualAddress(),
+            )
+        };
+
+        let run_pass = |mode: u32| -> [u32; 2] {
+            let list = h.new_list().expect("host list");
+            let l = &list.list;
+            let constants = [0u32, total_bytes as u32, 0u32, mode, 2u32];
+            // SAFETY: open list with live buffers and valid state transitions.
+            unsafe {
+                l.ResourceBarrier(&[transition(
+                    &src_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+                l.SetComputeRootSignature(&pipe.root);
+                l.SetPipelineState(&pipe.pso);
+                l.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, src_gpu);
+                l.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                l.SetComputeRootUnorderedAccessView(3, flags_gpu);
+                l.Dispatch(2, 1, 1);
+                if mode != 0 {
+                    l.ResourceBarrier(&[
+                        transition(
+                            &flags_uav,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ),
+                        transition(
+                            &src_buf,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        ),
+                    ]);
+                    l.CopyBufferRegion(&flags_rb, 0, &flags_uav, 0, 8);
+                    l.ResourceBarrier(&[transition(
+                        &flags_uav,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                } else {
+                    l.ResourceBarrier(&[transition(
+                        &src_buf,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+            }
+            list.close();
+            h.execute(&[&list]);
+            list.reset();
+            // SAFETY: fence completed and `flags_ptr` covers 16 bytes of READBACK.
+            let out = unsafe { std::slice::from_raw_parts(flags_ptr.cast::<u32>(), 2) };
+            [out[0], out[1]]
+        };
+
+        // 1. Compute initial hashes.
+        let _ = run_pass(0);
+        // 2. Compare unchanged -> both flags must be 0.
+        assert_eq!(run_pass(1), [0, 0]);
+        // 3. Flip a single byte in piece 1 -> only piece 1 flagged (and hash updated).
+        src_slice[PAGE + 12345] ^= 0x01;
+        assert_eq!(run_pass(1), [0, 1]);
+        // 4. Re-compare without further writes -> stored hash was updated, so [0, 0].
+        assert_eq!(run_pass(1), [0, 0]);
+        // 5. Swap two 16-byte chunks at different lanes in piece 0 -> non-commutative
+        //    reduction must detect the swap on piece 0 only.
+        for i in 0..16 {
+            src_slice.swap(i, 16 + i);
+        }
+        assert_eq!(run_pass(1), [1, 0]);
+        assert_eq!(run_pass(1), [0, 0]);
+        assert_eq!(
+            h.d3d12_errors(),
+            errors_before,
+            "unexpected D3D12 debug layer error during rebar_hash test"
         );
     }
 }

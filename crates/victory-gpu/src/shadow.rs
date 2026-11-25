@@ -42,16 +42,159 @@ fn try_reserve_rebar(used: &AtomicU64, size: u64, budget: u64) -> bool {
     .is_ok()
 }
 
+/// Maximum 64 KiB pieces hashed on the GPU for one ReBAR shadow
+/// (`65535 * 64 KiB`, ~4 GiB): keeps 32-bit byte offsets in `rebar_hash.hlsl`
+/// overflow-free and fits in a single 1D D3D12 `Dispatch(pieces, 1, 1)`.
+pub(crate) const REBAR_HASH_MAX_PIECES: u32 = 65535;
+
+/// Compact bitset of 64 KiB pieces whose VRAM contents were modified on the CPU
+/// since their GPU hash was last computed.
+struct RebarDirtyBits {
+    pieces: u32,
+    words: Vec<u64>,
+    any: bool,
+}
+
+impl RebarDirtyBits {
+    fn new(pieces: u32) -> Self {
+        Self {
+            pieces,
+            words: vec![0; (pieces as usize).div_ceil(64)],
+            any: false,
+        }
+    }
+
+    /// Marks pieces `[first, first + count)` (clamped to `self.pieces`) dirty.
+    fn mark_pieces(&mut self, first: u32, count: u32) {
+        let start = first.min(self.pieces);
+        let end = start.saturating_add(count).min(self.pieces);
+        if start >= end {
+            return;
+        }
+        self.any = true;
+        let first_word = (start / 64) as usize;
+        let last_word = ((end - 1) / 64) as usize;
+        let start_bit = start % 64;
+        let end_bit = ((end - 1) % 64) + 1;
+        if first_word == last_word {
+            let mask = if end_bit == 64 {
+                !0u64 << start_bit
+            } else {
+                ((1u64 << (end_bit - start_bit)) - 1) << start_bit
+            };
+            self.words[first_word] |= mask;
+        } else {
+            self.words[first_word] |= !0u64 << start_bit;
+            for w in &mut self.words[first_word + 1..last_word] {
+                *w = !0u64;
+            }
+            let tail_mask = if end_bit == 64 {
+                !0u64
+            } else {
+                (1u64 << end_bit) - 1
+            };
+            self.words[last_word] |= tail_mask;
+        }
+    }
+
+    /// Marks every 64 KiB piece overlapping buffer byte range `[off, off + len)`.
+    fn mark_byte_range(&mut self, off: usize, len: usize) {
+        if len == 0 || self.pieces == 0 {
+            return;
+        }
+        let end_byte = off.saturating_add(len);
+        let first = (off / PAGE).min(self.pieces as usize) as u32;
+        let end = end_byte.div_ceil(PAGE).min(self.pieces as usize) as u32;
+        if first < end {
+            self.mark_pieces(first, end - first);
+        }
+    }
+
+    /// Clears all dirty bits and returns coalesced `(first_piece, count)` runs.
+    fn take_runs(&mut self) -> Vec<(u32, u32)> {
+        if !self.any {
+            return Vec::new();
+        }
+        self.any = false;
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let mut cur: Option<(u32, u32)> = None;
+        for (wi, word) in self.words.iter_mut().enumerate() {
+            let mut w = std::mem::replace(word, 0);
+            let base = (wi as u32) * 64;
+            while w != 0 {
+                let tz = w.trailing_zeros();
+                let shifted = w >> tz;
+                let ones = shifted.trailing_ones();
+                let run_start = base + tz;
+                let run_end = (run_start + ones).min(self.pieces);
+                if run_start < run_end {
+                    match cur {
+                        Some((s, e)) if e == run_start => cur = Some((s, run_end)),
+                        Some((s, e)) => {
+                            runs.push((s, e - s));
+                            cur = Some((run_start, run_end));
+                        }
+                        None => cur = Some((run_start, run_end)),
+                    }
+                }
+                if tz + ones >= 64 {
+                    break;
+                }
+                w &= !(((1u64 << ones) - 1) << tz);
+            }
+        }
+        if let Some((s, e)) = cur {
+            runs.push((s, e - s));
+        }
+        runs
+    }
+}
+
+/// Prepared GPU hash state for one ReBAR shadow before a submission.
+pub(crate) struct PreparedRebarHashes {
+    pub(crate) hashes_gpu: u64,
+    pub(crate) aligned_len: u32,
+    pub(crate) pre_runs: Vec<(u32, u32)>,
+}
+
+/// GPU-side 128-bit per-64-KiB-piece hashes for a UAV-written ReBAR shadow.
+///
+/// Invariant: for every piece whose bit in `dirty` is clear, `buffer[piece]`
+/// holds the 128-bit hash of `Shadow::buffer`'s bytes in that piece.
+struct RebarHashes {
+    _buffer: ID3D12Resource,
+    gpu: u64,
+    dirty: RebarDirtyBits,
+}
+
 /// Extra state for a [`Shadow`] backed by CPU-writable VRAM
 /// (`D3D12_HEAP_TYPE_GPU_UPLOAD`, Resizable BAR).
 ///
 /// `Shadow::data` is a write-combining pointer into VRAM and MUST NEVER be read
-/// on the CPU. Read-only buffers keep `mirror = None` (zero duplicate RAM). On
-/// the first UAV write, `mirror` is lazily populated via a one-time GPU DMA and
-/// kept synced on subsequent `Shadow::copy` / `copy_back_rebar` calls.
+/// on the CPU. Read-only buffers keep `mirror = None` and `hashes = None` (zero
+/// duplicate RAM or hash VRAM). On the first UAV write, `mirror` is lazily
+/// populated via a one-time GPU DMA and kept synced on subsequent
+/// `Shadow::copy` / `copy_back_rebar` calls; `hashes` is lazily created as a
+/// `DEFAULT` UAV buffer (`16` bytes per 64 KiB piece) so post-submission
+/// copy-back only DMAs 64 KiB pieces whose GPU hash actually changed.
 struct RebarShadow {
     bytes: u64,
     mirror: Mutex<Option<Vec<u8>>>,
+    /// Leaf lock: never acquired while holding `mirror`, `pending`, or `copied`,
+    /// and never held across D3D12 or kernel calls.
+    hashes: Mutex<Option<RebarHashes>>,
+}
+
+impl RebarShadow {
+    fn mark_dirty_range(&self, off: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut guard = self.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = guard.as_mut() {
+            h.dirty.mark_byte_range(off, len);
+        }
+    }
 }
 
 /// A title buffer's host copy.
@@ -2357,6 +2500,7 @@ impl Shadow {
             rebar: rebar_bytes.map(|bytes| RebarShadow {
                 bytes,
                 mirror: Mutex::new(None),
+                hashes: Mutex::new(None),
             }),
         }
     }
@@ -2364,6 +2508,112 @@ impl Shadow {
     /// Whether this copy lives in ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) VRAM.
     pub(crate) fn is_rebar(&self) -> bool {
         self.rebar.is_some()
+    }
+
+    /// Logical byte length of the title buffer.
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Base host GPU virtual address of the shadow buffer.
+    pub(crate) fn base_gpu(&self) -> u64 {
+        self.gpu
+    }
+
+    /// Lazily allocates the per-64-KiB-piece hash UAV buffer for a ReBAR shadow
+    /// and returns [`PreparedRebarHashes`], where `pre_runs` are the
+    /// `(first_piece, piece_count)` runs that must be hashed before the
+    /// submission executes (all pieces on initial creation, or only
+    /// CPU-dirtied pieces thereafter). Returns `None` if this shadow is not
+    /// eligible for GPU hashing or allocation fails.
+    pub(crate) fn prepare_rebar_hashes(
+        &self,
+        alloc: impl FnOnce(u64) -> Option<ID3D12Resource>,
+    ) -> Option<PreparedRebarHashes> {
+        let rebar = self.rebar.as_ref()?;
+        if self.len == 0 {
+            return None;
+        }
+        let pieces = u32::try_from(self.len.div_ceil(PAGE as u64)).ok()?;
+        if pieces > REBAR_HASH_MAX_PIECES {
+            return None;
+        }
+        let aligned_len = u32::try_from(self.len.next_multiple_of(16)).ok()?;
+        if rebar
+            .mirror
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none()
+        {
+            return None;
+        }
+        {
+            let mut guard = rebar.hashes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = guard.as_mut() {
+                return Some(PreparedRebarHashes {
+                    hashes_gpu: h.gpu,
+                    aligned_len,
+                    pre_runs: h.dirty.take_runs(),
+                });
+            }
+        }
+        // Allocate outside the leaf lock.
+        let buffer = alloc(u64::from(pieces) * 16)?;
+        crate::host::name(&buffer, || {
+            format!("ReBAR hashes {:#x}+{:#x}", self.start, self.len)
+        });
+        // SAFETY: live D3D12 buffer resource.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut guard = rebar.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = guard.as_mut() {
+            return Some(PreparedRebarHashes {
+                hashes_gpu: h.gpu,
+                aligned_len,
+                pre_runs: h.dirty.take_runs(),
+            });
+        }
+        *guard = Some(RebarHashes {
+            _buffer: buffer,
+            gpu,
+            dirty: RebarDirtyBits::new(pieces),
+        });
+        Some(PreparedRebarHashes {
+            hashes_gpu: gpu,
+            aligned_len,
+            pre_runs: vec![(0, pieces)],
+        })
+    }
+
+    /// Marks `(first_piece, piece_count)` runs dirty in this ReBAR shadow's
+    /// hash state (e.g. if a pre-hash recording failed after draining dirty
+    /// bits).
+    pub(crate) fn mark_rebar_dirty_runs(&self, runs: &[(u32, u32)]) {
+        let Some(rebar) = &self.rebar else {
+            return;
+        };
+        let mut guard = rebar.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = guard.as_mut() {
+            for &(first, count) in runs {
+                h.dirty.mark_pieces(first, count);
+            }
+        }
+    }
+
+    /// Marks all 64 KiB pieces overlapping buffer-offset `spans` dirty in this
+    /// ReBAR shadow's hash state (used when a submission falls back to
+    /// full-range readback without running the post-compare shader).
+    pub(crate) fn mark_rebar_dirty_spans(&self, spans: &[(usize, usize)]) {
+        let Some(rebar) = &self.rebar else {
+            return;
+        };
+        let mut guard = rebar.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = guard.as_mut() {
+            for &(from, to) in spans {
+                if from < to {
+                    h.dirty.mark_byte_range(from, to - from);
+                }
+            }
+        }
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2554,6 +2804,7 @@ impl Shadow {
         };
         let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
+        let mut vram_dirty: Vec<(usize, usize)> = Vec::new();
         let start = self.start as usize;
         if let Some(mirror) = mirror_guard.as_mut() {
             let mut title = None;
@@ -2593,7 +2844,8 @@ impl Shadow {
                             }
                             if host_differs {
                                 // Only push back to WC VRAM when a concurrent CPU
-                                // write altered bytes in the same page.
+                                // write altered bytes in the same page; record the
+                                // range so its GPU piece hash is refreshed next.
                                 // SAFETY: `at + n <= self.len`, write-only WC store.
                                 unsafe {
                                     std::ptr::copy_nonoverlapping(
@@ -2602,6 +2854,7 @@ impl Shadow {
                                         n,
                                     );
                                 }
+                                vram_dirty.push((at, n));
                             }
                             synced.push((start + at) / PAGE);
                         } else {
@@ -2626,6 +2879,9 @@ impl Shadow {
             }
         }
         drop(mirror_guard);
+        for (at, n) in vram_dirty {
+            rebar.mark_dirty_range(at, n);
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3265,6 +3521,9 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
         let off = from - start;
         let len = to - from;
         if let Some(rebar) = &self.rebar {
@@ -3284,6 +3543,8 @@ impl Shadow {
                 unsafe {
                     std::ptr::copy_nonoverlapping(m.as_ptr().add(off), self.data.add(off), len);
                 }
+                drop(mirror);
+                rebar.mark_dirty_range(off, len);
                 return len;
             }
         }
@@ -3293,6 +3554,9 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(off, off + len);
         self.card_changed(off, off + len);
+        if let Some(rebar) = &self.rebar {
+            rebar.mark_dirty_range(off, len);
+        }
         len
     }
 
@@ -4410,8 +4674,198 @@ mod tests {
         assert!(backing[16..32].iter().all(|&b| b == 0xAA));
         assert_eq!(backing[64], 0x77);
         assert!(backing[65..128].iter().all(|&b| b == 0x11));
+        // Also verify the initial 0x11 bytes ACTUALLY arrived in VRAM (not zeroed
+        // by ReadProcessMemory failing on a PCIe BAR destination!).
+        let rebar_mirror = shadow
+            .rebar
+            .as_ref()
+            .unwrap()
+            .mirror
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("mirror populated after gpu_writes");
+        assert!(
+            rebar_mirror[..16].iter().all(|&b| b == 0x11),
+            "initial title bytes did not reach ReBAR VRAM! got: {:02x?}",
+            &rebar_mirror[..16]
+        );
 
         list.reset();
+        drop(shadow);
+        unregister(resource, start);
+    }
+
+    #[test]
+    fn rebar_dirty_bits_marks_and_coalesces_across_word_boundaries() {
+        let mut bits = RebarDirtyBits::new(140);
+        assert!(bits.take_runs().is_empty());
+
+        // Single piece, cross-word range (62..67), and tail clamped at 140.
+        bits.mark_pieces(3, 1);
+        bits.mark_pieces(62, 5);
+        bits.mark_pieces(138, 10);
+        assert_eq!(bits.take_runs(), vec![(3, 1), (62, 5), (138, 2)]);
+        assert!(bits.take_runs().is_empty());
+
+        // Byte range straddling a 64 KiB boundary marks both pieces.
+        bits.mark_byte_range(PAGE - 8, 16);
+        bits.mark_byte_range(5 * PAGE, PAGE);
+        assert_eq!(bits.take_runs(), vec![(0, 2), (5, 1)]);
+        assert!(bits.take_runs().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rebar_gpu_hash_compare_skips_unchanged_pieces_and_merges_concurrent_writes() {
+        let Some(h) = host() else {
+            return; // no host GPU here
+        };
+        if h.rebar_shadow_budget() == 0 {
+            // Requires a discrete GPU with D3D12 GPU upload heap (ReBAR) support.
+            return;
+        }
+        let errors_before = h.d3d12_errors();
+        let mut backing = vec![0x11u8; 4 * PAGE];
+        let start = backing.as_ptr() as u64;
+        let resource = 0xdead_beef_0004_usize;
+        register(resource, start, backing.len() as u64);
+
+        let shadow = find(start, backing.len() as u64).expect("shadow");
+        assert!(
+            shadow.is_rebar(),
+            "expected ReBAR-backed shadow on ReBAR adapter"
+        );
+
+        let (src_aa, ptr_aa) = h.upload_buffer(16).expect("upload AA");
+        let (src_bb, ptr_bb) = h.upload_buffer(16).expect("upload BB");
+        let (src_11, ptr_11) = h.upload_buffer(16).expect("upload 11");
+        // SAFETY: each upload buffer is mapped for 16 bytes.
+        unsafe {
+            std::ptr::write_bytes(ptr_aa, 0xAA, 16);
+            std::ptr::write_bytes(ptr_bb, 0xBB, 16);
+            std::ptr::write_bytes(ptr_11, 0x11, 16);
+        }
+
+        // Submission 1: declare the entire 256 KiB buffer as UAV-written, but
+        // only modify piece 1 (+32..+48) and piece 3 (+64..+80) on the GPU
+        // while the CPU concurrently writes piece 1 (+128) and piece 0 (+128).
+        let stats0 = h.rebar_hash_stats();
+        let list = h.new_list().expect("host list");
+        shadow.refresh(&list, start, backing.len() as u64);
+        shadow.gpu_writes(&list, start, backing.len() as u64);
+        // SAFETY: live buffers and in-bounds 16-byte copies.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&shadow.buffer, (PAGE + 32) as u64, &src_aa, 0, 16);
+            list.list
+                .CopyBufferRegion(&shadow.buffer, (3 * PAGE + 64) as u64, &src_bb, 0, 16);
+        }
+        let base_addr = backing.as_mut_ptr() as usize;
+        list.defer_host(move || {
+            // SAFETY: `backing` stays alive for the duration of this test.
+            unsafe {
+                *(base_addr as *mut u8).add(128) = 0x55;
+                *(base_addr as *mut u8).add(PAGE + 128) = 0x77;
+            }
+        });
+        list.close();
+        h.execute(&[&list]);
+        list.reset();
+
+        let stats1 = h.rebar_hash_stats();
+        assert_eq!(stats1.compared_pieces - stats0.compared_pieces, 4);
+        assert_eq!(
+            stats1.changed_pieces - stats0.changed_pieces,
+            2,
+            "pieces 0 and 2 were untouched by the GPU and must be skipped"
+        );
+        assert_eq!(stats1.post_readback_calls - stats0.post_readback_calls, 1);
+        assert_eq!(
+            stats1.post_readback_bytes - stats0.post_readback_bytes,
+            (2 * PAGE) as u64,
+            "only the 2 changed 64 KiB pieces should be DMAed back"
+        );
+        assert_eq!(backing[128], 0x55);
+        assert!(backing[PAGE + 32..PAGE + 48].iter().all(|&b| b == 0xAA));
+        assert_eq!(backing[PAGE + 128], 0x77);
+        assert!(backing[2 * PAGE..3 * PAGE].iter().all(|&b| b == 0x11));
+        assert!(
+            backing[3 * PAGE + 64..3 * PAGE + 80]
+                .iter()
+                .all(|&b| b == 0xBB)
+        );
+
+        // Submission 2: speculative UAV over all 256 KiB with zero GPU writes.
+        // Piece 1 was pushed back to VRAM at the end of submission 1 (due to
+        // the concurrent 0x77 write), so pre-hash must re-hash piece 1 and
+        // post-compare must report 0 changed pieces and 0 readback DMAs.
+        shadow.refresh(&list, start, backing.len() as u64);
+        shadow.gpu_writes(&list, start, backing.len() as u64);
+        list.close();
+        h.execute(&[&list]);
+        list.reset();
+
+        let stats2 = h.rebar_hash_stats();
+        assert_eq!(stats2.compared_pieces - stats1.compared_pieces, 4);
+        assert_eq!(stats2.changed_pieces - stats1.changed_pieces, 0);
+        assert_eq!(
+            stats2.post_readback_calls - stats1.post_readback_calls,
+            0,
+            "0 changed pieces must trigger 0 readback DMAs"
+        );
+        assert_eq!(stats2.post_readback_bytes - stats1.post_readback_bytes, 0);
+        assert_eq!(backing[128], 0x55);
+        assert_eq!(backing[PAGE + 128], 0x77);
+
+        // Submission 3: GPU overwrites byte PAGE + 128 back to 0x11 (replacing
+        // the concurrent CPU 0x77 write). Only piece 1 must be flagged & DMAed.
+        shadow.refresh(&list, start, backing.len() as u64);
+        shadow.gpu_writes(&list, start, backing.len() as u64);
+        // SAFETY: live buffers and in-bounds 16-byte copy.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&shadow.buffer, (PAGE + 128) as u64, &src_11, 0, 16);
+        }
+        list.close();
+        h.execute(&[&list]);
+        list.reset();
+
+        let stats3 = h.rebar_hash_stats();
+        assert_eq!(stats3.compared_pieces - stats2.compared_pieces, 4);
+        assert_eq!(stats3.changed_pieces - stats2.changed_pieces, 1);
+        assert_eq!(
+            stats3.post_readback_bytes - stats2.post_readback_bytes,
+            PAGE as u64
+        );
+        assert!(backing[PAGE + 128..PAGE + 144].iter().all(|&b| b == 0x11));
+
+        // Submission 4: CPU modifies piece 2 and refreshes it, then declares a
+        // speculative UAV write with no GPU writes. Pre-hash must refresh piece
+        // 2's hash so post-compare sees 0 changes and 0 readback DMAs.
+        backing[2 * PAGE + 16..2 * PAGE + 32].fill(0xCC);
+        shadow.refresh(&list, start, backing.len() as u64);
+        shadow.gpu_writes(&list, start, backing.len() as u64);
+        list.close();
+        h.execute(&[&list]);
+        list.reset();
+
+        let stats4 = h.rebar_hash_stats();
+        assert_eq!(stats4.compared_pieces - stats3.compared_pieces, 4);
+        assert_eq!(stats4.changed_pieces - stats3.changed_pieces, 0);
+        assert_eq!(stats4.post_readback_calls - stats3.post_readback_calls, 0);
+        assert_eq!(stats4.post_readback_bytes - stats3.post_readback_bytes, 0);
+        assert!(
+            backing[2 * PAGE + 16..2 * PAGE + 32]
+                .iter()
+                .all(|&b| b == 0xCC)
+        );
+        assert_eq!(
+            h.d3d12_errors(),
+            errors_before,
+            "unexpected D3D12 debug layer error during ReBAR hash-compare test"
+        );
+
         drop(shadow);
         unregister(resource, start);
     }
