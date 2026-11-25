@@ -302,9 +302,16 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// Tables made afresh in this list, by a hash of the table and what it
+    /// holds ([`table_hash`]).
+    fresh_tables: std::collections::HashMap<u64, Fresh, std::hash::BuildHasherDefault<Plain>>,
+    /// The record words of [`Fresh`] tables, one after the other.
+    fresh_records: Vec<[u32; 3]>,
+    /// The `k` indices of entries in [`Fresh`] tables that had a `half` view.
+    fresh_halves: Vec<u32>,
+    /// What [`State::tables`] made for the stage being bound: root slot, byte
+    /// offset of its fresh table. Kept to reuse its storage across draws.
+    made: Vec<(u8, u32)>,
     /// `VICTORY_TABLES_MEMO=1` (experiment): the views already made
     /// readable for this list since the last thing that can change what
     /// "readable" asks for ([`State::seen_gone`]).
@@ -564,6 +571,9 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.fresh_records.clear();
+        self.fresh_halves.clear();
+        self.made.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -880,9 +890,89 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
+}
+
+/// Root slots (bytes) as a set that lives on the stack: a draw collects them
+/// without the heap, and they come out in order.
+#[derive(Default)]
+struct Slots([u64; 4]);
+
+impl Slots {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot / 64)] |= 1 << (slot % 64);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        (self.0[usize::from(slot / 64)] >> (slot % 64)) & 1 != 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u8> {
+        let words = self.0;
+        (0..4u8).flat_map(move |w| {
+            let mut bits = words[usize::from(w)];
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as u8;
+                    bits &= bits - 1;
+                    w * 64 + bit
+                })
+            })
+        })
+    }
+}
+
+/// A table made afresh: what it was made from (the `n` records at `at` in
+/// [`State::fresh_records`], and `half_len` `half` indices at `half_at` in
+/// [`State::fresh_halves`]) and its first dynamic slot.
+struct Fresh {
+    table: u64,
+    n: u32,
+    at: usize,
+    half_at: usize,
+    half_len: u32,
+    first: u32,
+}
+
+/// A hash that is mixed already, used as it is.
+#[derive(Default)]
+struct Plain(u64);
+
+impl std::hash::Hasher for Plain {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0 << 8 | u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+/// A quick hash of `table`, its `n` records, and any `half` entries for `slot`.
+/// It only finds the table made before: the records and `half` entries are
+/// compared too, so a collision costs a copy, not wrong descriptors.
+fn table_hash(table: u64, n: u32, slot: u8, half: &[(u8, u32)], has_half: bool) -> u64 {
+    let mix = |h: u64, x: u64| (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let mut h = (0..n).fold(table, |h, k| {
+        let [a, b, c] = record(table, k);
+        mix(mix(h, u64::from(a) | u64::from(b) << 32), u64::from(c))
+    });
+    if has_half {
+        for k in (0..n).filter(|&k| half.contains(&(slot, k * 8))) {
+            h = mix(h, u64::from(k) | (1u64 << 32));
+        }
+    }
+    h ^ h >> 32
+}
+
+/// The words of entry `k` of `table`.
+fn record(table: u64, k: u32) -> [u32; 3] {
+    // SAFETY: a descriptor slot in title memory.
+    unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
 }
 
 /// The last byte of the root view at `address` four dwords can be read from:
@@ -1512,10 +1602,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(p);
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1562,37 +1650,33 @@ impl State {
             } else {
                 None
             };
-            let owned_made;
             let made: &[(u8, u32)] = match key {
                 Some(k) => {
-                    if !self.tables_memo.contains_key(&k) {
-                        let computed = self.tables(
+                    if let Some(cached) = self.tables_memo.get(&k) {
+                        cached.as_slice()
+                    } else {
+                        self.tables(
                             list,
                             &t.used,
                             &t.host.root_indexed_views,
                             &t.host.half_views,
                             compute,
                         );
-                        if computed.iter().any(|m| m.1 == u32::MAX) {
-                            owned_made = computed;
-                            &owned_made
-                        } else {
-                            self.tables_memo.insert(k, computed);
-                            self.tables_memo[&k].as_slice()
+                        if !self.made.iter().any(|m| m.1 == u32::MAX) {
+                            self.tables_memo.insert(k, self.made.clone());
                         }
-                    } else {
-                        self.tables_memo[&k].as_slice()
+                        self.made.as_slice()
                     }
                 }
                 None => {
-                    owned_made = self.tables(
+                    self.tables(
                         list,
                         &t.used,
                         &t.host.root_indexed_views,
                         &t.host.half_views,
                         compute,
                     );
-                    &owned_made
+                    self.made.as_slice()
                 }
             };
             #[cfg(feature = "diagnostics")]
@@ -3435,14 +3519,19 @@ impl State {
         indexed: &[RootIndexedView],
         half: &[(u8, u32)],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+    ) {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
+        // Taken out so `self` stays free to borrow; restored at the end.
+        let mut made = std::mem::take(&mut self.made);
+        made.clear();
+        let mut fresh = Slots::default();
+        for u in used
             .iter()
             .filter(tables)
             .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        {
+            fresh.insert(u.slot);
+        }
         // The view shown in place of the title's at dword `at` of the table
         // in root parameter `slot`, if the shader moves halves there and
         // the title's view is a 16-bit float or signed buffer view.
@@ -3463,9 +3552,7 @@ impl State {
                 continue;
             };
             if crate::descriptor::host::half_view(&view).is_some() {
-                if !fresh.contains(&slot) {
-                    fresh.push(slot);
-                }
+                fresh.insert(slot);
             } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
                 once!(
                     format,
@@ -3477,7 +3564,7 @@ impl State {
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh.contains(u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -3491,18 +3578,15 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.insert(u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        for slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -3553,21 +3637,29 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                    // (Another table than the same slots made for a shader
-                    // that reads them in the title's formats.)
-                    half.contains(&(slot, k * 8)).hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            // The table and what its entries hold (record words + half flags).
+            let has_half = !half.is_empty()
+                && half
+                    .iter()
+                    .any(|&(s, at)| s == slot && at < n * 8 && at.is_multiple_of(8));
+            let key = table_hash(table, n, slot, half, has_half);
+            let same = self.fresh_tables.get(&key).filter(|f| {
+                f.table == table
+                    && f.n == n
+                    && self.fresh_records[f.at..f.at + n as usize]
+                        .iter()
+                        .enumerate()
+                        .all(|(k, r)| *r == record(table, k as u32))
+                    && if has_half {
+                        self.fresh_halves[f.half_at..f.half_at + f.half_len as usize]
+                            .iter()
+                            .copied()
+                            .eq((0..n).filter(|&k| half.contains(&(slot, k * 8))))
+                    } else {
+                        f.half_len == 0
+                    }
+            });
+            if let Some(&Fresh { first, .. }) = same {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -3594,7 +3686,25 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            let at = self.fresh_records.len();
+            self.fresh_records.extend((0..n).map(|k| record(table, k)));
+            let half_at = self.fresh_halves.len();
+            if has_half {
+                self.fresh_halves
+                    .extend((0..n).filter(|&k| half.contains(&(slot, k * 8))));
+            }
+            let half_len = (self.fresh_halves.len() - half_at) as u32;
+            self.fresh_tables.insert(
+                key,
+                Fresh {
+                    table,
+                    n,
+                    at,
+                    half_at,
+                    half_len,
+                    first,
+                },
+            );
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3662,7 +3772,7 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        self.made = made;
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -5077,6 +5187,46 @@ mod tests {
 
         cache.clear();
         assert!(cache.ranges.is_empty() && cache.spans.is_empty() && cache.spans_bytes == 0);
+    }
+
+    #[test]
+    fn slots_bitset_iterates_in_ascending_order_across_all_words() {
+        let mut slots = super::Slots::default();
+        for s in [255u8, 64, 0, 129, 63, 64, 192] {
+            slots.insert(s);
+        }
+        assert!(slots.contains(0));
+        assert!(slots.contains(63));
+        assert!(slots.contains(64));
+        assert!(slots.contains(129));
+        assert!(slots.contains(192));
+        assert!(slots.contains(255));
+        assert!(!slots.contains(1));
+        assert!(!slots.contains(128));
+        assert_eq!(slots.iter().collect::<Vec<_>>(), vec![0, 63, 64, 129, 192, 255]);
+    }
+
+    #[test]
+    fn table_hash_and_record_compare_detect_record_and_half_changes() {
+        #[repr(C, align(32))]
+        struct RawTable([[u32; 8]; 2]);
+
+        let mut raw = RawTable([[0; 8]; 2]);
+        raw.0[0][0..3].copy_from_slice(&[0x1111_2222, 0x3333_4444, 0x5555_6666]);
+        raw.0[1][0..3].copy_from_slice(&[0x7777_8888, 0x9999_aaaa, 0xbbbb_cccc]);
+        let table = std::ptr::from_ref(&raw) as u64;
+
+        let h_plain = super::table_hash(table, 2, 1, &[], false);
+        let h_half = super::table_hash(table, 2, 1, &[(1, 8)], true);
+        assert_ne!(h_plain, h_half);
+        assert_eq!(super::record(table, 0), [0x1111_2222, 0x3333_4444, 0x5555_6666]);
+        assert_eq!(super::record(table, 1), [0x7777_8888, 0x9999_aaaa, 0xbbbb_cccc]);
+
+        // Mutating an entry word changes both the exact record and the quick hash.
+        raw.0[1][2] ^= 1;
+        let table = std::ptr::from_ref(&raw) as u64;
+        assert_ne!(super::table_hash(table, 2, 1, &[], false), h_plain);
+        assert_ne!(super::record(table, 1), [0x7777_8888, 0x9999_aaaa, 0xbbbb_cccc]);
     }
 
     #[test]

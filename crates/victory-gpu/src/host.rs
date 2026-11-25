@@ -1443,13 +1443,15 @@ impl Drop for HostList {
 
 /// A list's buffers for hoisted clamped indirect arguments with their
 /// states, how many are in use since the reset, the bytes taken of the last
-/// of those, and whether the list has the barrier that precedes the clamps.
+/// of those, whether the list has the barrier that precedes the clamps, and
+/// whether it has the clamps' root signature, pipeline and budget bound.
 #[derive(Default)]
 struct ClampChunks {
     all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
     used: usize,
     at: u64,
     barrier: bool,
+    bound: bool,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2731,9 +2733,20 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The host pipelines [`HostList::bind_pipeline`] kept (by address), so a
+    /// pipeline the list binds again is not kept or queried again.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Upload memory filled from title memory since the last title write
+    /// (source, bytes): its host address, which a second fill would find
+    /// holding the same bytes.
+    filled: std::collections::HashMap<(usize, usize), u64>,
+    /// Buffer ranges declared written by shaders since the last title copy
+    /// (host copy, address, bytes, marked): declaring them again would
+    /// change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize, bool)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Title-written textures whose staging buffer is copied into the host
@@ -4441,34 +4454,52 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
-/// The ranges the shaders of `runs` may write, per host copy, as declared.
-/// One list's lock at a time: a submission may name a list twice.
-fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+/// Collects the unique ranges the shaders of `runs` may write, per host copy
+/// matching `include`, in recording order.
+fn collect_declared_writes(
+    runs: &[&HostList],
+    include: impl Fn(&crate::shadow::Shadow) -> bool,
+) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
+    let mut by_shadow: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut seen_ranges: std::collections::HashSet<(usize, usize, usize)> =
+        std::collections::HashSet::new();
+    let mut seen_unmarked: std::collections::HashSet<(usize, usize, usize)> =
+        std::collections::HashSet::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len, marked) = step {
+            if let Step::GpuWrite(shadow, address, len, marked) = step
+                && include(shadow)
+            {
+                let ptr = std::sync::Arc::as_ptr(shadow) as usize;
                 let range = (*address, *address + *len);
                 let is_unmarked = !*marked || !shadow.marked();
-                match back.iter_mut().find(|(s, _, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges, unmarked)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                        if is_unmarked && !unmarked.contains(&range) {
-                            unmarked.push(range);
-                        }
-                    }
-                    None => back.push((
-                        shadow.clone(),
-                        vec![range],
-                        if is_unmarked { vec![range] } else { Vec::new() },
-                    )),
+                let new_range = seen_ranges.insert((ptr, range.0, range.1));
+                let new_unmarked = is_unmarked && seen_unmarked.insert((ptr, range.0, range.1));
+                if !new_range && !new_unmarked {
+                    continue;
+                }
+                let idx = *by_shadow.entry(ptr).or_insert_with(|| {
+                    let i = back.len();
+                    back.push((shadow.clone(), Vec::new(), Vec::new()));
+                    i
+                });
+                if new_range {
+                    back[idx].1.push(range);
+                }
+                if new_unmarked {
+                    back[idx].2.push(range);
                 }
             }
         }
     }
     back
+}
+
+/// The ranges the shaders of `runs` may write, per host copy, as declared.
+/// One list's lock at a time: a submission may name a list twice.
+fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+    collect_declared_writes(runs, |_| true)
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -5012,32 +5043,7 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy, with the
         // subset declared without shader view-marks.
-        let mut declared: Vec<Declared> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len, marked) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    let is_unmarked = !*marked || !shadow.marked();
-                    match declared.iter_mut().find(|(s, _, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges, unmarked)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                            if is_unmarked && !unmarked.contains(&range) {
-                                unmarked.push(range);
-                            }
-                        }
-                        None => declared.push((
-                            shadow.clone(),
-                            vec![range],
-                            if is_unmarked { vec![range] } else { Vec::new() },
-                        )),
-                    }
-                }
-            }
-        }
+        let declared = collect_declared_writes(runs, |shadow| shadow.carded());
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -7263,6 +7269,7 @@ impl HostList {
             chunks.used = 0;
             chunks.at = 0;
             chunks.barrier = false;
+            chunks.bound = false;
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7357,6 +7364,14 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
         Some((buffer, 0))
+    }
+
+    /// Whether the list's clamps still have to bind their root signature,
+    /// pipeline and budget: the first after the reset does, and the rest
+    /// find them bound (nothing else records compute state in the list).
+    pub(crate) fn clamp_unbound(&self) -> bool {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        !std::mem::replace(&mut chunks.bound, true)
     }
 
     /// The clamped arguments written so far become readable as indirect
@@ -8124,6 +8139,7 @@ impl HostList {
     }
 
     /// Notes a pipeline the list binds; called where it is bound.
+    #[cfg(test)]
     pub(crate) fn used_pipeline(&self, name: &str) {
         {
             let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
@@ -8139,6 +8155,38 @@ impl HostList {
             );
             self.pipeline_meter.store(
                 crate::cardmeter::begin_named(&self.list, name).raw(),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Notes a pipeline the list binds and keeps it and its root signature
+    /// until the list is reset, the first time only: the list keeps the
+    /// first, so its address names the same pipeline from then on.
+    pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        let first = {
+            let mut deferred = self.deferred();
+            let first = deferred.bound.insert(p.pso.as_raw() as usize);
+            if first {
+                deferred.kept.push(p.pso.clone().into());
+                deferred.kept.push(p.root.clone().into());
+            }
+            first
+        };
+        if first {
+            let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            if !pipelines.contains(p.name.as_str()) {
+                pipelines.insert(p.name.clone());
+            }
+        }
+        if crate::cardmeter::pipelines() {
+            // The pipeline before it ends here on the card's clock.
+            crate::cardmeter::end(
+                &self.list,
+                crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)),
+            );
+            self.pipeline_meter.store(
+                crate::cardmeter::begin_named(&self.list, &p.name).raw(),
                 Ordering::Relaxed,
             );
         }
@@ -8196,6 +8244,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.filled.clear();
+        deferred.gpu_written.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -8207,6 +8257,20 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host GPU address of `len` bytes of upload memory holding the title
+    /// memory at `src` as of the list's submission: one copy for every ask
+    /// until a title copy or run intervenes.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -8267,9 +8331,13 @@ impl HostList {
         len: usize,
         marked: bool,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len, marked);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -8488,8 +8556,11 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.filled.clear();
+        deferred.gpu_written.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -12353,6 +12424,119 @@ mod retire_tests {
         let (gpu, ptr) = list.scratch(4096).expect("scratch after pool reuse");
         assert_ne!(gpu, 0);
         assert!(!ptr.is_null());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn fill_scratch_deduplicates_until_copy_or_defer_run() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let errors_before = host.d3d12_errors();
+        let mut src = [0x11u8; 64];
+        let mut dst = [0u8; 64];
+
+        let gpu1 = list.fill_scratch(src.as_ptr(), 64).expect("first fill");
+        let gpu2 = list.fill_scratch(src.as_ptr(), 64).expect("dedup fill");
+        assert_eq!(gpu1, gpu2);
+        assert_eq!(
+            list.deferred()
+                .copies
+                .iter()
+                .filter(|s| matches!(s, Step::Fill(..)))
+                .count(),
+            1
+        );
+
+        // Intervening title copy invalidates `filled` cache.
+        list.defer_copy(dst.as_mut_ptr(), src.as_ptr(), 4);
+        let gpu3 = list.fill_scratch(src.as_ptr(), 64).expect("post-copy fill");
+        assert_ne!(gpu3, gpu1);
+
+        // Intervening deferred run also invalidates `filled` cache.
+        list.defer(|| {});
+        src[0] = 0x22;
+        let gpu4 = list.fill_scratch(src.as_ptr(), 64).expect("post-run fill");
+        assert_ne!(gpu4, gpu3);
+
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn defer_gpu_write_deduplicates_preserving_marked_and_clears_on_copy() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let errors_before = host.d3d12_errors();
+        let mut backing = vec![0u8; 4096];
+        let start = backing.as_mut_ptr() as u64;
+        let addr = start as usize;
+        crate::shadow::register(addr, start, backing.len() as u64);
+        let shadow = crate::shadow::find(start, backing.len() as u64).expect("registered shadow");
+
+        list.defer_gpu_write(&shadow, addr, 256, true);
+        list.defer_gpu_write(&shadow, addr, 256, true);
+        // Same range with `marked = false` must not be dropped by the `marked = true` entry.
+        list.defer_gpu_write(&shadow, addr, 256, false);
+
+        let gpu_write_count = list
+            .deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::GpuWrite(..)))
+            .count();
+        assert_eq!(gpu_write_count, 2);
+
+        let declared = declared_writes(&[&list]);
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].1, vec![(addr, addr + 256)]);
+        assert_eq!(declared[0].2, vec![(addr, addr + 256)]);
+
+        let mut dst = [0u8; 16];
+        list.defer_copy(dst.as_mut_ptr(), backing.as_ptr(), 16);
+        list.defer_gpu_write(&shadow, addr, 256, true);
+        let gpu_write_count_after = list
+            .deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::GpuWrite(..)))
+            .count();
+        assert_eq!(gpu_write_count_after, 3);
+
+        list.close();
+        list.reset();
+        drop(declared);
+        drop(shadow);
+        crate::shadow::unregister(addr, start);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn clamp_unbound_returns_true_once_until_reset() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let errors_before = host.d3d12_errors();
+
+        assert!(list.clamp_unbound());
+        assert!(!list.clamp_unbound());
+        assert!(!list.clamp_unbound());
+
+        list.close();
+        list.reset();
+        assert!(list.clamp_unbound());
+        assert!(!list.clamp_unbound());
+
         list.close();
         host.execute(&[&list]);
         assert_eq!(host.d3d12_errors(), errors_before);
