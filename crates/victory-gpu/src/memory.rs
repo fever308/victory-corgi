@@ -298,13 +298,29 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
-        let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh(list, start, len);
-        }
-        if writes && (first_write || n >= numbered) {
-            shadow.gpu_writes(list, start, len);
+    if first_read {
+        list.defer_refresh_batch(
+            m.copies.len(),
+            m.copies.iter().map(|shadow| {
+                let (start, len) = shadow.span();
+                (shadow, start, len)
+            }),
+        );
+    } else if numbered < m.copies.len() {
+        list.defer_refresh_batch(
+            m.copies.len() - numbered,
+            m.copies[numbered..].iter().map(|shadow| {
+                let (start, len) = shadow.span();
+                (shadow, start, len)
+            }),
+        );
+    }
+    if writes {
+        for (n, shadow) in m.copies.iter().enumerate() {
+            if first_write || n >= numbered {
+                let (start, len) = shadow.span();
+                shadow.gpu_writes(list, start, len);
+            }
         }
     }
     if first_read {

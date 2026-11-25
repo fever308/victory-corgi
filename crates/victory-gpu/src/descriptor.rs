@@ -854,16 +854,48 @@ pub(crate) fn forget(resource: usize) {
 
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
-fn view_at(i: u32, generation: u32) -> Option<View> {
+fn view_at_in(views: &Views, i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         0 => {
-            let views = views_read();
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
+        PLACED => views.placed_of(i, generation),
+        _ => None,
+    }
+}
+
+/// The view the record words `i` and `generation` name: the one they hold
+/// whole, or the view of entry `i` if `generation` is still its own.
+fn view_at(i: u32, generation: u32) -> Option<View> {
+    match generation >> KIND_SHIFT {
+        0 => view_at_in(&views_read(), i, generation),
+        CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),
         _ => None,
+    }
+}
+
+/// Resolves a batch of `(i, generation)` records into `out` while locking
+/// `VIEWS` at most once (and skipping the lock entirely if every record is
+/// an inline constant or invalid kind).
+#[cfg(windows)]
+pub(super) fn resolve_views(records: &[[u32; 2]], out: &mut Vec<Option<View>>) {
+    out.clear();
+    out.reserve(records.len());
+    let needs_lock = records
+        .iter()
+        .any(|&[_, generation]| !matches!(generation >> KIND_SHIFT, CONSTANT | 3));
+    if !needs_lock {
+        for &[i, generation] in records {
+            out.push((generation >> KIND_SHIFT == CONSTANT).then(|| constant_of(i, generation)));
+        }
+        return;
+    }
+    let views = views_read();
+    for &[i, generation] in records {
+        out.push(view_at_in(&views, i, generation));
     }
 }
 
@@ -955,6 +987,69 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
     }
 }
 
+/// Mirrors `count` contiguous descriptors of stride `step` starting at `dst`
+/// with a single `SHADER_HEAPS` lookup when `[dst, dst + count * step)` lies
+/// inside one shader-visible heap (skipping CPU-only heaps immediately).
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 || step == 0 {
+        return;
+    }
+    if !host::descriptor_fast() || count == 1 {
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    }
+    let Some(end_addr) = u64::from(count).checked_mul(step).and_then(|len| dst.checked_add(len)) else {
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    };
+    let found = {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        let mut any_overlap = false;
+        let mut single: Option<(&Heap, u32)> = None;
+        for &(start, end, at) in heaps.iter() {
+            if dst < end && end_addr > start {
+                any_overlap = true;
+                if dst >= start && end_addr <= end {
+                    // SAFETY: registered heaps are live (removed when dropped).
+                    let heap = unsafe { &*(at as *const Heap) };
+                    if let Some(first) = heap.index(dst)
+                        && first.saturating_add(count) <= heap.desc.count
+                    {
+                        single = Some((heap, first));
+                    }
+                    break;
+                }
+            }
+        }
+        (any_overlap, single)
+    };
+    let (any_overlap, single) = found;
+    if !any_overlap {
+        return;
+    }
+    if let Some((heap, first)) = single {
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.extend(first..first + count),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    host.mirror_range(first, dst, step, count);
+                }
+            }
+        }
+        return;
+    }
+    for i in 0..u64::from(count) {
+        mirror(dst + i * step);
+    }
+}
+
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
     let step = u64::from(increment(kind).unwrap_or(0));
@@ -963,9 +1058,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 
@@ -1405,5 +1498,72 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_simple_batched_mirrors_shader_visible_range_and_resolve_views_matches_view_at() {
+        let null = std::ptr::null();
+        let mut memory = vec![0u8; 8 * 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 8,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h: This = null;
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address,
+                    size: 8 * 32,
+                },
+                &mut h
+            ),
+            S_OK
+        );
+        let Some(host) = heap(h).host() else {
+            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            return;
+        };
+
+        // Source staging slots (CPU-only memory, not in SHADER_HEAPS).
+        let mut src_mem = vec![0u8; 4 * 32];
+        let src_base = src_mem.as_mut_ptr() as u64;
+        create_srv(null, null, std::ptr::null(), src_base);
+        create_cbv(null, &[0x2000, 1, 256, 0], src_base + 32);
+        create_srv(null, null, std::ptr::null(), src_base + 64);
+        create_cbv(null, &[0x4000, 1, 512, 0], src_base + 96);
+
+        // Copy 4 descriptors into the shader-visible heap via `copy_simple`.
+        copy_simple(null, 4, address + 2 * 32, src_base, VIEWS_KIND);
+        assert!(host.made(2), "SRV slot 2 must be mirrored");
+        assert!(!host.made(3), "CBV slot 3 stays deferred");
+        assert!(host.made(4), "SRV slot 4 must be mirrored");
+        assert!(!host.made(5), "CBV slot 5 stays deferred");
+
+        // Verify `resolve_views` matches `view_at` for inline CBV, table entry, and invalid records.
+        let mut records = Vec::new();
+        for k in 0..4u64 {
+            // SAFETY: slots 2..6 lie inside `memory`.
+            let [tag, i, generation] = unsafe { *((address + (2 + k) * 32) as *const [u32; 3]) };
+            assert_eq!(tag, VIEW_TAG);
+            records.push([i, generation]);
+        }
+        records.push([0, 3 << KIND_SHIFT]); // invalid kind
+        let mut resolved = Vec::new();
+        resolve_views(&records, &mut resolved);
+        for (rec, got) in records.iter().zip(&resolved) {
+            assert_eq!(got, &view_at(rec[0], rec[1]));
+        }
+
+        // Non-shader-visible `copy_simple` completes cleanly without touching `host`.
+        let mut cpu_dst = vec![0u8; 4 * 32];
+        copy_simple(null, 4, cpu_dst.as_mut_ptr() as u64, src_base, VIEWS_KIND);
+        assert_eq!(view(cpu_dst.as_ptr() as u64 + 32), view(src_base + 32));
+
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 }

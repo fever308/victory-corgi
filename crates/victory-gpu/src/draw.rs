@@ -2257,15 +2257,16 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
+        let mut handle_slot = |n: usize,
+                                 index: u32,
+                                 mirrored: Option<(
+            View,
+            Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+        )>| {
             uavs.remove(&index);
-            let Some(handle) = heap.handle(index) else {
+            let Some((view, copy_hint)) = mirrored else {
                 cache.remove_slot(index);
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                cache.remove_slot(index);
-                continue;
+                return;
             };
             // Every 64 views while the device lives (a cheap query).
             if alive
@@ -2284,7 +2285,9 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let Some((shadow, address, len)) =
+                copy_hint.or_else(|| crate::descriptor::host::buffer_copy(&view))
+            else {
                 cache.remove_slot(index);
                 if !full
                     && crate::descriptor::host::buffer_range(&view).is_some_and(|(_, l)| l > 0)
@@ -2297,7 +2300,7 @@ impl State {
                         cache.retry.insert(index, RETRY_ATTEMPTS);
                     }
                 }
-                continue;
+                return;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
@@ -2310,6 +2313,17 @@ impl State {
                 uavs.insert(index, (shadow.clone(), address, address + len));
             }
             cache.set_slot(index, shadow, address, address + len);
+        };
+        if crate::descriptor::host::descriptor_fast() {
+            host.mirror_buffer_slots(heap.start, 32, u32::MAX, &slots, handle_slot);
+        } else {
+            for (n, &index) in slots.iter().enumerate() {
+                let mirrored = heap
+                    .handle(index)
+                    .and_then(|handle| host.mirror(index, handle, true))
+                    .map(|view| (view, None));
+                handle_slot(n, index, mirrored);
+            }
         }
         drop(uavs_guard);
         cache.reconcile_dirty();
