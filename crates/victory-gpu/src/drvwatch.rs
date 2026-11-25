@@ -4,7 +4,7 @@
 //! the card's driver in the system's event log (NVIDIA: provider `nvlddmkm`,
 //! event 153, "Error occurred on GPUID") seconds before the device is removed.
 //!
-//! Here the layer subscribes to that log. Each entry of a display driver
+//! Here the layer subscribes to that log. Each display-driver error or TDR
 //! is written to our log when the system records it, with our own clock,
 //! so it can be laid beside what the layer did in that moment; it is
 //! counted; and the first one trips a switch ([`tripped`]) that the paths
@@ -21,7 +21,14 @@ use windows_sys::Win32::System::EventLog::{
     EvtSubscribeToFutureEvents,
 };
 
-/// Entries of a display driver seen since the start.
+// Watch critical/error events from the display drivers, plus the Display
+// warning for a recovered timeout (TDR 4101). Display also reports routine
+// information, such as Auto HDR activation (4125), that must not trip the watch.
+const DRIVER_EVENT_QUERY: &str =
+    "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' or @Name='igfxn' \
+     or @Name='Display'] and (Level=1 or Level=2 or (Level=3 and EventID=4101 and Provider[@Name='Display']))]]";
+
+/// Driver errors and TDR warnings seen since the start.
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 /// Whether one was seen ([`tripped`]).
 static TRIPPED: AtomicBool = AtomicBool::new(false);
@@ -37,7 +44,7 @@ pub(crate) fn errors() -> u64 {
     ERRORS.load(Relaxed)
 }
 
-/// An entry of a display driver was recorded.
+/// A driver error or TDR warning was recorded.
 fn seen() {
     let n = ERRORS.fetch_add(1, Relaxed) + 1;
     let first = !TRIPPED.swap(true, Relaxed);
@@ -63,7 +70,7 @@ unsafe extern "system" fn on_event(
     0
 }
 
-/// Subscribes to the display drivers' entries in the system's event log,
+/// Subscribes to display-driver errors and TDR warnings in the system's event log,
 /// once. Entries from before the call are not delivered.
 pub(crate) fn start() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -73,12 +80,7 @@ pub(crate) fn start() {
         }
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
         let channel = wide("System");
-        // The kernel drivers of the three vendors, and the system's own
-        // "display driver stopped responding" source.
-        let query = wide(
-            "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' or @Name='igfxn' \
-             or @Name='Display']]]",
-        );
+        let query = wide(DRIVER_EVENT_QUERY);
         // SAFETY: valid strings for the call's length; the callback is a
         // plain function that touches only statics; the subscription is
         // kept for the life of the process.
@@ -217,12 +219,9 @@ mod tests {
     /// (e.g. AppContainer/sandbox) cannot open the System event log and get
     /// `ERROR_ACCESS_DENIED` (5), which is tolerated here.
     #[test]
-    fn the_system_takes_the_subscription() {
+    fn the_system_accepts_the_driver_event_query() {
         let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
-        let (channel, query) = (
-            wide("System"),
-            wide("*[System[Provider[@Name='nvlddmkm' or @Name='Display']]]"),
-        );
+        let (channel, query) = (wide("System"), wide(DRIVER_EVENT_QUERY));
         // SAFETY: as in `start`.
         let subscription = unsafe {
             EvtSubscribe(
