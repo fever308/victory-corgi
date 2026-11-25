@@ -34,6 +34,8 @@ mod draw;
 mod drvwatch;
 pub mod dxgi;
 pub mod fence;
+#[cfg(windows)]
+mod fpsbox;
 pub mod frame;
 pub mod frametime;
 #[cfg(windows)]
