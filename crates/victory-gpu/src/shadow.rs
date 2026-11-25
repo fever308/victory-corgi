@@ -1141,7 +1141,7 @@ fn merge_race(read: Option<&[u8]>, copy: (u64, u64), address: usize, merged: &[u
     let looked: &[(usize, usize)] = &whole;
     let mut again = vec![0u8; n];
     let (mut put_back, mut both, mut first) = (0u64, 0u64, None);
-    if crate::host::read_into(address as *const u8, &mut again) {
+    if crate::host::read_into_raw(address as *const u8, &mut again) {
         for &(off, len) in looked {
             for i in off..off + len {
                 if again[i] == read[i] || again[i] == merged[i] {
@@ -1774,13 +1774,36 @@ fn chunk_copy_segs(segs: &[CopySeg], chunk_bytes: usize) -> Vec<Vec<CopySeg>> {
     buckets
 }
 
+/// Materializes any deferred `lazy_back` blocks in `[addr, addr + buf.len())`
+/// outside the per-`Shadow` lock, then acquires `acquire()` and reads via
+/// `read_into_raw`. If a concurrent relay thread re-deferred the block before
+/// the lock was acquired, drops the lock, materializes once, and retries.
+fn lock_and_read<G>(acquire: impl Fn() -> G, addr: usize, buf: &mut [u8]) -> Option<G> {
+    if crate::lazy_back::active() {
+        crate::lazy_back::materialize_range(addr, buf.len());
+    }
+    let guard = acquire();
+    if crate::host::read_into_raw(addr as *const u8, buf) {
+        return Some(guard);
+    }
+    if crate::lazy_back::has_block(addr / PAGE) {
+        drop(guard);
+        crate::lazy_back::materialize_range(addr, buf.len());
+        let guard = acquire();
+        if crate::host::read_into_raw(addr as *const u8, buf) {
+            return Some(guard);
+        }
+    }
+    None
+}
+
 #[inline]
 fn execute_copy_seg(seg: CopySeg) {
     if seg.len == 0 {
         return;
     }
     if seg.mirror != 0 {
-        crate::host::copy_mapped(seg.mirror as *mut u8, seg.src as *const u8, seg.len, false);
+        crate::host::copy_mapped_raw(seg.mirror as *mut u8, seg.src as *const u8, seg.len, false);
         // SAFETY: `seg` lies inside the shadow's mirror and WC VRAM mapping
         // (`off + len <= self.len`), and chunks are strictly disjoint.
         unsafe {
@@ -1791,7 +1814,7 @@ fn execute_copy_seg(seg: CopySeg) {
             );
         }
     } else {
-        crate::host::copy_mapped(seg.dst as *mut u8, seg.src as *const u8, seg.len, false);
+        crate::host::copy_mapped_raw(seg.dst as *mut u8, seg.src as *const u8, seg.len, false);
     }
 }
 
@@ -1869,6 +1892,9 @@ pub(crate) fn copy_mapped_wide(dst: *mut u8, src: *const u8, len: usize) {
     if !wide_copy() || len < WIDE_COPY_MIN {
         crate::host::copy_mapped(dst, src, len, false);
         return;
+    }
+    if crate::lazy_back::active() {
+        crate::lazy_back::materialize_range(src as usize, len);
     }
     run_copy_segs(&[CopySeg {
         src: src as usize,
@@ -3400,6 +3426,15 @@ impl Shadow {
         let Some(rebar) = &self.rebar else {
             return 0;
         };
+        let start = self.start as usize;
+        if crate::lazy_back::active() {
+            let limit = self.len as usize;
+            for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
+                if from < to && to <= limit && gpu_span.len() == to - from {
+                    crate::lazy_back::materialize_range(start + from, to - from);
+                }
+            }
+        }
         let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mirror) = mirror_guard.as_mut() else {
             return 0;
@@ -3417,13 +3452,12 @@ impl Shadow {
             return 0;
         }
 
-        let start = self.start as usize;
         let apply_subrange =
             |sub_at: usize, gpu: &[u8], old: &mut [u8], title: &mut Vec<u8>| -> usize {
                 let sub_n = gpu.len();
                 title.clear();
                 title.resize(sub_n, 0);
-                if crate::host::read_into((start + sub_at) as *const u8, title) {
+                if crate::host::read_into_raw((start + sub_at) as *const u8, title) {
                     let as_read = merge_race_on().then(|| title.clone());
                     if merge_piece(gpu, old, title) {
                         crate::host::shaders_write(start + sub_at, &title[..]);
@@ -3440,7 +3474,7 @@ impl Shadow {
                             &title[..],
                             "rebar relay",
                         );
-                        crate::host::write_mapped(
+                        crate::host::write_mapped_raw(
                             (start + sub_at) as *mut u8,
                             title.as_ptr(),
                             sub_n,
@@ -3585,10 +3619,18 @@ impl Shadow {
         let Some(rebar) = &self.rebar else {
             return 0;
         };
+        let start = self.start as usize;
+        if crate::lazy_back::active() {
+            let limit = self.len as usize;
+            for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
+                if from < to && to <= limit && gpu_span.len() == to - from {
+                    crate::lazy_back::materialize_range(start + from, to - from);
+                }
+            }
+        }
         let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let mut vram_dirty: Vec<(usize, usize)> = Vec::new();
-        let start = self.start as usize;
         if let Some(mirror) = mirror_guard.as_mut() {
             let mut title = None;
             for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
@@ -3603,7 +3645,7 @@ impl Shadow {
                     let old = &mut mirror[at..at + n];
                     if gpu != old {
                         let title_buf = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n];
-                        if crate::host::read_into((start + at) as *const u8, title_buf) {
+                        if crate::host::read_into_raw((start + at) as *const u8, title_buf) {
                             let mut changed = false;
                             let mut host_differs = false;
                             for ((t, &g), o) in title_buf.iter_mut().zip(gpu).zip(old.iter_mut()) {
@@ -3624,7 +3666,7 @@ impl Shadow {
                                 used_own = self.put_back_own(start + at, title_buf);
                                 if !used_own {
                                     crate::watch::writing(start + at, n);
-                                    crate::host::write_mapped(
+                                    crate::host::write_mapped_raw(
                                         (start + at) as *mut u8,
                                         title_buf.as_ptr(),
                                         n,
@@ -3701,10 +3743,13 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.read().unwrap_or_else(|e| e.into_inner());
-        let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
+        if from < to && crate::lazy_back::active() {
+            crate::lazy_back::materialize_range(start + from, to - from);
+        }
+        let snapshot = self.before.read().unwrap_or_else(|e| e.into_inner());
+        let mut written = 0;
         self.compared(from, to);
         if let Some(before) = &*snapshot
             && from < to
@@ -3742,7 +3787,7 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
+                let read = |first: usize, title: &mut [u8]| crate::host::read_into_raw((start + at + first) as *const u8, title);
                 let Some((first, n)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
                     continue;
                 };
@@ -3760,7 +3805,7 @@ impl Shadow {
                             crate::watch::writing(start + at, n);
                             opened = true;
                         }
-                        crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                        crate::host::write_mapped_raw((start + at + off) as *mut u8, title[off..].as_ptr(), len);
                     }
                     written += len;
                 }
@@ -3815,6 +3860,9 @@ impl Shadow {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
+        if crate::lazy_back::active() {
+            crate::lazy_back::materialize_range(start + at, n);
+        }
         let mut snapshot = self.before.write().unwrap_or_else(|e| e.into_inner());
         let Some(before) = snapshot.as_mut() else {
             return 0;
@@ -3843,7 +3891,7 @@ impl Shadow {
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
-        if !crate::host::read_into((start + at) as *const u8, title) {
+        if !crate::host::read_into_raw((start + at) as *const u8, title) {
             return 0;
         }
         // The stretch as read: what the card did not change is the
@@ -3860,7 +3908,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_mapped_raw((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
 
@@ -3896,7 +3944,7 @@ impl Shadow {
         if check {
             // The title's own address must show what went in through ours.
             let mut back = vec![0u8; bytes.len()];
-            if crate::host::read_into(at as *const u8, &mut back) && back != bytes {
+            if crate::host::read_into_raw(at as *const u8, &mut back) && back != bytes {
                 OWN_WRITES[4].fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -3930,7 +3978,7 @@ impl Shadow {
                                 hi - lo,
                             )
                         };
-                        if crate::host::read_into(lo as *const u8, &mut title) && title != held {
+                        if crate::host::read_into_raw(lo as *const u8, &mut title) && title != held {
                             OWN_WRITES[5].fetch_add(1, Ordering::Relaxed);
                             if crate::watch::clean(page) {
                                 OWN_WRITES[6].fetch_add(1, Ordering::Relaxed);
@@ -4199,6 +4247,11 @@ impl Shadow {
                 stale_pages_in(base, &copied, a, e, &written)
             };
             for page in stale {
+                if crate::lazy_back::active()
+                    && crate::lazy_back::owns_block(self as *const Shadow as usize, page)
+                {
+                    continue;
+                }
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
                     continue;
@@ -4209,10 +4262,13 @@ impl Shadow {
                 if let Some(rebar) = &self.rebar {
                     let mut dirty_runs = Vec::new();
                     {
-                        let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
-                        if !crate::host::read_into(lo as *const u8, title) {
+                        let Some(mut mirror) = lock_and_read(
+                            || rebar.mirror.lock().unwrap_or_else(|e| e.into_inner()),
+                            lo,
+                            title,
+                        ) else {
                             continue;
-                        }
+                        };
                         MERGED[0].fetch_add(1, Ordering::Relaxed);
                         let Some(held_all) = mirror.as_mut() else {
                             return true;
@@ -4253,12 +4309,13 @@ impl Shadow {
                     // reference under the same lock, and a page read before
                     // such a merge and compared after it would take the card's
                     // bytes for the title's.
-                    let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
-                    // A page that is not there is left as it is, and looked at
-                    // again next time.
-                    if !crate::host::read_into(lo as *const u8, title) {
+                    let Some(mut before) = lock_and_read(
+                        || self.before.write().unwrap_or_else(|e| e.into_inner()),
+                        lo,
+                        title,
+                    ) else {
                         continue;
-                    }
+                    };
                     MERGED[0].fetch_add(1, Ordering::Relaxed);
                     if self.card.is_some() {
                         // SAFETY: inside the mapping of the copy's CPU side,
@@ -4452,10 +4509,13 @@ impl Shadow {
             if let Some(rebar) = &self.rebar {
                 let mut dirty_runs = Vec::new();
                 {
-                    let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
-                    if !crate::host::read_into(lo as *const u8, title) {
+                    let Some(mut mirror) = lock_and_read(
+                        || rebar.mirror.lock().unwrap_or_else(|e| e.into_inner()),
+                        lo,
+                        title,
+                    ) else {
                         continue;
-                    }
+                    };
                     if let Some(held_all) = mirror.as_mut()
                         && at + n <= held_all.len()
                     {
@@ -4480,10 +4540,13 @@ impl Shadow {
                     rebar.mark_dirty_range(off, len);
                 }
             } else {
-                let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
-                if !crate::host::read_into(lo as *const u8, title) {
+                let Some(mut before) = lock_and_read(
+                    || self.before.write().unwrap_or_else(|e| e.into_inner()),
+                    lo,
+                    title,
+                ) else {
                     continue;
-                }
+                };
                 if self.card.is_some() {
                     // SAFETY: inside the copy's CPU-side staging mapping.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -4747,6 +4810,11 @@ impl Shadow {
         if total == 0 {
             return 0;
         }
+        if crate::lazy_back::active() {
+            for s in &segs {
+                crate::lazy_back::materialize_range(s.src, s.len);
+            }
+        }
         if let Some(rebar) = &self.rebar {
             let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(m) = mirror.as_mut() {
@@ -4999,6 +5067,9 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        if crate::lazy_back::active() {
+            crate::lazy_back::materialize_range(start + at, gpu.len());
+        }
         let _side = self.before.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
@@ -5025,7 +5096,7 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
+        let mapped = crate::host::read_into_raw((start + at) as *const u8, title);
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
         let as_read = (mapped && merge_race_on()).then(|| title.clone());
@@ -5047,7 +5118,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        crate::host::write_mapped_raw((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
 

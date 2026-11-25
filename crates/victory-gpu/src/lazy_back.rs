@@ -1290,4 +1290,144 @@ mod tests {
         h.log_messages();
         assert_eq!(h.d3d12_errors(), errors_before);
     }
+
+    #[test]
+    fn lazy_merge_under_writes_update_busy_and_copy_runs_never_deadlock() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let pages = 16;
+        let ptr = alloc_watch_pages(pages);
+        // SAFETY: `ptr` owns `pages * PAGE` committed write-watched bytes.
+        unsafe { ptr::write_bytes(ptr, 0x11, pages * PAGE) };
+        let va0 = ptr as usize;
+        clear_hot_for_test(va0 / PAGE);
+
+        let Some((shadow_a, _side_a)) = make_card_shadow_at(va0 as u64, 2, 0x11) else {
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+        let Some((shadow_b, side_b)) = make_card_shadow_at(va0 as u64, 2, 0x11) else {
+            drop(shadow_a);
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+        let Some((shadow_c, side_c)) = make_card_shadow_at(va0 as u64, 2, 0x11) else {
+            drop(shadow_b);
+            drop(shadow_a);
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+
+        // Declare pending ranges on `shadow_a` and `shadow_b` so `merge_under_writes`
+        // and `update` -> `update_busy` exercise the busy-page paths.
+        shadow_a.writing(va0, PAGE, |_, size| Some(vec![0x11u8; size as usize]));
+        shadow_b.writing(va0, PAGE, |_, size| Some(vec![0x11u8; size as usize]));
+
+        // 1. Defer page 0 on `shadow_a`: `shadow_a.merge_under_writes` must skip its own
+        //    deferred block without locking + materializing itself, keeping page 0 deferred.
+        gpu_write_shadow(&shadow_a, 0, &[0xA1; 32]);
+        assert!(try_defer_page_inner(&shadow_a, 0, PAGE, 0));
+        assert!(has_block(va0 / PAGE));
+        let mut runs_left = 1024usize;
+        assert!(!shadow_a.merge_under_writes(va0, PAGE, &mut runs_left));
+        assert!(
+            has_block(va0 / PAGE),
+            "merge_under_writes must skip own deferred block"
+        );
+
+        // 2. Overlapping `shadow_b.merge_under_writes` must materialize `shadow_a`'s
+        //    deferred block outside `shadow_b.before.write()` and see `[0xA1; 32]`.
+        let mut runs_left = 1024usize;
+        assert!(!shadow_b.merge_under_writes(va0, PAGE, &mut runs_left));
+        assert!(!has_block(va0 / PAGE));
+        assert_eq!(&side_b[..32], &[0xA1; 32]);
+
+        // 3. `update` -> `update_busy`: `shadow_a.update` skips own deferred block, while
+        //    overlapping `shadow_b.update` materializes outside `before` lock and copies `[0xB2; 32]`.
+        gpu_write_shadow(&shadow_a, 0, &[0xB2; 32]);
+        assert!(try_defer_page_inner(&shadow_a, 0, PAGE, 0));
+        assert_eq!(shadow_a.update(va0, PAGE), 0);
+        assert!(has_block(va0 / PAGE));
+        assert!(shadow_b.update(va0, PAGE) >= 32);
+        assert!(!has_block(va0 / PAGE));
+        assert_eq!(&side_b[..32], &[0xB2; 32]);
+
+        // 4. `update` -> `copy_runs`: `shadow_c` (no pending ranges) refreshes across
+        //    `shadow_a`'s deferred block without holding any `Shadow` lock during materialization.
+        gpu_write_shadow(&shadow_a, 0, &[0xC3; 32]);
+        assert!(try_defer_page_inner(&shadow_a, 0, PAGE, 0));
+        assert!(has_block(va0 / PAGE));
+        assert!(shadow_c.update(va0, PAGE) > 0);
+        assert!(!has_block(va0 / PAGE));
+        assert_eq!(&side_c[..32], &[0xC3; 32]);
+
+        // 5. `card_merge_relay` directly against an otherwise-deferred block and
+        //    `relay_merge_rebar` / `merge_under_writes` when registered shadow uses ReBAR.
+        let Some((shadow_d, _side_d)) = make_card_shadow_at(va0 as u64, 2, 0x11) else {
+            drop(side_c);
+            drop(shadow_c);
+            drop(side_b);
+            drop(shadow_b);
+            drop(_side_a);
+            drop(shadow_a);
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+        assert!(try_defer_page_inner(&shadow_a, 0, PAGE, 0));
+        let mut scratch = Vec::new();
+        let mut gpu_card = vec![0x11u8; 64];
+        gpu_card[32..64].copy_from_slice(&[0xD4; 32]);
+        assert!(shadow_d.card_merge_relay(0, &gpu_card, 0, &mut scratch) > 0);
+        assert!(!has_block(va0 / PAGE));
+        // SAFETY: merged bytes 32..64 landed in title RAM.
+        assert_eq!(unsafe { std::slice::from_raw_parts(ptr.add(32), 32) }, &[0xD4; 32]);
+
+        drop(_side_d);
+        drop(shadow_d);
+        drop(side_c);
+        drop(shadow_c);
+        drop(side_b);
+        drop(shadow_b);
+        drop(_side_a);
+        drop(shadow_a);
+
+        // SAFETY: reset test memory before registering a fresh shadow over `pages * PAGE`.
+        unsafe { ptr::write_bytes(ptr, 0x11, pages * PAGE) };
+        let reg_len = (pages * PAGE) as u64;
+        crate::shadow::register(va0, va0 as u64, reg_len);
+        let reg_shadow = crate::shadow::find(va0 as u64, reg_len).expect("registered shadow");
+        if reg_shadow.is_rebar() {
+            let list = h.new_list().expect("host list");
+            reg_shadow.refresh(&list, va0 as u64, reg_len);
+            list.close();
+            h.execute(&[&list]);
+            list.reset();
+            reg_shadow.writing(va0, PAGE, |_, size| Some(vec![0x11u8; size as usize]));
+            gpu_write_shadow(&reg_shadow, 0, &[0xE5; 32]);
+            assert!(try_defer_page_inner(&reg_shadow, 0, PAGE, 0));
+            let mut runs_left = 1024usize;
+            assert!(!reg_shadow.merge_under_writes(va0, PAGE, &mut runs_left));
+            assert!(has_block(va0 / PAGE));
+            let mut gpu_rebar = vec![0x11u8; 64];
+            gpu_rebar[..32].copy_from_slice(&[0xE5; 32]);
+            let _ = reg_shadow.relay_merge_rebar(&[(0, 64)], &[&gpu_rebar]);
+            assert!(!has_block(va0 / PAGE));
+            // SAFETY: materialized ReBAR GPU bytes landed in title RAM.
+            assert_eq!(unsafe { std::slice::from_raw_parts(ptr, 32) }, &[0xE5; 32]);
+        }
+        drop(reg_shadow);
+        crate::shadow::unregister(va0, va0 as u64);
+
+        clear_hot_for_test(va0 / PAGE);
+        // SAFETY: test allocation cleanup.
+        unsafe { free_watch_pages(ptr) };
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
 }

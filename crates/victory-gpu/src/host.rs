@@ -9183,6 +9183,20 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    if len == 0 {
+        return;
+    }
+    if crate::lazy_back::active() {
+        let addr = if title_dst { dst as usize } else { src as usize };
+        crate::lazy_back::materialize_range(addr, len);
+    }
+    copy_mapped_raw(dst, src, len, title_dst);
+}
+
+/// [`copy_mapped`] without triggering [`crate::lazy_back::materialize_range`].
+/// Callers holding a `Shadow` lock MUST materialize `[src, src + len)` (or
+/// `[dst, dst + len)`) before taking the lock and call this raw variant inside.
+pub(crate) fn copy_mapped_raw(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -9195,10 +9209,6 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     if len == 0 {
         return;
-    }
-    if crate::lazy_back::active() {
-        let addr = if title_dst { dst as usize } else { src as usize };
-        crate::lazy_back::materialize_range(addr, len);
     }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
@@ -9591,6 +9601,12 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     crate::lazy_back::materialize_range(src as usize, dst.len());
+    read_into_raw(src, dst)
+}
+
+/// [`read_into`] without calling [`crate::lazy_back::materialize_range`].
+/// Safe to call while holding `Shadow` locks after materializing outside.
+pub(crate) fn read_into_raw(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -9706,6 +9722,15 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         return;
     }
     crate::lazy_back::materialize_range(dst as usize, len);
+    write_mapped_raw(dst, src, len);
+}
+
+/// [`write_mapped`] without calling [`crate::lazy_back::materialize_range`].
+/// Safe to call while holding `Shadow` locks after materializing outside.
+pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
     shader_wrote(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
