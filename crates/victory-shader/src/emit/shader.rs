@@ -93,6 +93,15 @@ pub const USER_GROUP_BASE: u32 = 0x106;
 /// byte reads of the root SRV of root parameter `slot` may start at (to the
 /// end of its backing host copy, matching [`crate::RootType::LIMIT`]).
 pub const USER_ROOT_LIMIT: u32 = 0x107;
+/// `RootType::Other` code of a user-data dword the host computes, read by
+/// a program with a ray-tracing node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`): not 0 while the title's structures have
+/// been built (its structure builder runs). While 0, every node test
+/// answers no hit without reading the node: a box node enters no child,
+/// any other node is a triangle missed. The title's passes run whether or
+/// not anything built the structures, and would otherwise walk whatever
+/// bytes lie where they would be.
+pub const USER_STRUCTURES: u32 = 0x108;
 /// The root UAV a traced shader writes its trace to (`lower::with_trace`): word 0
 /// counts the records (a ring); records of [`TRACE_WORDS`] dwords follow from byte
 /// [`TRACE_FIRST`] on.

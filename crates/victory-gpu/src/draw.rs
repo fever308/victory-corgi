@@ -1327,8 +1327,8 @@ impl State {
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
         use victory_shader::emit::{
-            USER_GROUP_BASE, USER_MEMORY_BASE, USER_MESH_ROW, USER_ROOT_LIMIT, USER_VIEW_ADDRESS,
-            USER_VIEW_BIAS,
+            USER_GROUP_BASE, USER_MEMORY_BASE, USER_MESH_ROW, USER_ROOT_LIMIT, USER_STRUCTURES,
+            USER_VIEW_ADDRESS, USER_VIEW_BIAS,
         };
         // Set per mesh dispatch (`dispatch_mesh`, the indirect signature): 0, one row.
         if kind == USER_MESH_ROW || kind == USER_MESH_ROW + 1 {
@@ -1356,6 +1356,10 @@ impl State {
         }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_STRUCTURES {
+            // (0: the program's node tests answer no hit)
+            return u32::from(crate::pipeline::structures_walked());
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
