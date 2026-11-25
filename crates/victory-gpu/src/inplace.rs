@@ -311,7 +311,7 @@ pub(crate) fn generation() -> u64 {
 /// At most `MAX` pieces; more are left out (and `true` says so).
 pub(crate) fn aliases(at: usize, len: usize) -> (Vec<(usize, usize)>, bool) {
     const MAX: usize = 4096;
-    let v = views();
+    let v = views_read();
     let mut found: Vec<(usize, usize)> = Vec::new();
     if (v.by_section.is_empty() && v.long.is_empty()) || len == 0 {
         return (found, false);
@@ -357,6 +357,10 @@ pub(crate) fn aliases(at: usize, len: usize) -> (Vec<(usize, usize)>, bool) {
 
 fn views() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
@@ -426,28 +430,61 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
-/// The title views that overlap `[start, end)`, as `(address, bytes)`.
-pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
+/// Calls `f(block, shown)` once for each 64 KiB block in `[start, end)` that
+/// belongs to a known title view whose physical page is shown in
+/// `2..=MANY_VIEWS` views. Takes the views read lock once for the whole range
+/// and allocates nothing (pages with a single view skip straight past).
+pub(crate) fn for_each_alias_in(start: usize, end: usize, mut f: impl FnMut(usize, &[usize])) {
     if start >= end {
-        return Vec::new();
+        return;
     }
-    let v = views();
-    let mut out = Vec::new();
-    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
-        && base + bytes > start
-    {
-        out.push((base, bytes));
+    let v = views_read();
+    if v.views.is_empty() {
+        return;
     }
-    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
-        out.push((base, bytes));
+    let from = start / K64;
+    let to = end.div_ceil(K64);
+    let first = v
+        .views
+        .range(..=start)
+        .next_back()
+        .filter(|&(base, view)| base.saturating_add(view.0) > start)
+        .map(|(&b, &view)| (b, view));
+    let overlapping = first
+        .into_iter()
+        .chain(v.views.range(start.saturating_add(1)..end).map(|(&b, &view)| (b, view)));
+    for (base, (bytes, section, offset)) in overlapping {
+        let first_block = (base / K64).max(from);
+        let last_block = base.saturating_add(bytes).div_ceil(K64).min(to);
+        for block in first_block..last_block {
+            let page = block * K64;
+            let within = page.wrapping_sub(base);
+            if within >= bytes || !within.is_multiple_of(K64) {
+                continue;
+            }
+            if let Some(shown) = v.pages.get(&(section, offset + within as u64))
+                && shown.len() >= 2
+                && shown.len() <= crate::watch::MANY_VIEWS
+            {
+                f(block, shown);
+            }
+        }
     }
-    out
+}
+
+/// Whether `at` lies inside a known title view (zero allocations).
+pub(crate) fn has_view_at(at: usize) -> bool {
+    let v = views_read();
+    let Some((&base, &(bytes, _, _))) = v.views.range(..=at).next_back() else {
+        return false;
+    };
+    at.wrapping_sub(base) < bytes
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views();
+    let v = views_read();
     let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
         return Vec::new();
     };
@@ -465,7 +502,7 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     if len == 0 {
         return Vec::new();
     }
-    let v = views();
+    let v = views_read();
     let end = offset.saturating_add(len as u64);
     let mut pages: Vec<usize> = Vec::new();
     let mut at = offset - offset % K64 as u64;
