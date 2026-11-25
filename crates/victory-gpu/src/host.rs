@@ -5414,9 +5414,14 @@ impl Host {
             offsets: Vec<u64>,
         }
 
+        let lazy = crate::lazy_back::enabled();
         let mut card_done_inflight = false;
         if inflight_fetch() {
-            let landed = self.relay_card_inflight(plans);
+            let landed = if lazy {
+                false
+            } else {
+                self.relay_card_inflight(plans)
+            };
             inflight_tickets_landed(plans);
             if landed {
                 card_done_inflight = true;
@@ -5455,6 +5460,16 @@ impl Host {
                             }
                             let (lo, hi) = r.shadow.card_piece(&r.span, p);
                             if lo < hi && seen.insert((copy, lo, hi)) {
+                                if lazy
+                                    && crate::lazy_back::try_defer_page(
+                                        &r.shadow,
+                                        lo,
+                                        hi - lo,
+                                        plan.sent_as,
+                                    )
+                                {
+                                    continue;
+                                }
                                 pieces.push((r.shadow.clone(), lo, hi, card_total));
                                 card_total += (hi - lo) as u64;
                             }
@@ -5496,7 +5511,35 @@ impl Host {
                 .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
                 .filter(|&(from, to)| from < to)
                 .collect();
-            let spans = merge_ranges(ranges);
+            let merged = merge_ranges(ranges);
+            if merged.is_empty() {
+                continue;
+            }
+            let spans = if lazy {
+                let start = shadow.start() as usize;
+                let page = crate::watch::PAGE;
+                let mut kept: Vec<(usize, usize)> = Vec::new();
+                for (from, to) in merged {
+                    let mut at = from;
+                    while at < to {
+                        let va = start + at;
+                        let step = (page - va % page).min(to - at);
+                        let next = at + step;
+                        if crate::lazy_back::try_defer_page(shadow, at, step, 0) {
+                            shadow.mark_rebar_dirty_range(at, step);
+                        } else {
+                            match kept.last_mut() {
+                                Some(last) if last.1 == at => last.1 = next,
+                                _ => kept.push((at, next)),
+                            }
+                        }
+                        at = next;
+                    }
+                }
+                kept
+            } else {
+                merged
+            };
             if spans.is_empty() {
                 continue;
             }
@@ -5517,12 +5560,13 @@ impl Host {
 
         let completed_order = plans.iter().map(|p| p.order_after).max().unwrap_or(0);
         if !card_done_inflight && !has_card {
+            let safe_limit = crate::lazy_back::min_card_fetched_after();
             if inflight_fetch() {
                 // The next merge may be of a flight in the air now, with
                 // bytes from when it ran: only sends up to these plans' are
                 // older than it.
                 if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
-                    crate::shadow::relay_fetched(last);
+                    crate::shadow::relay_fetched(safe_limit.map_or(last, |m| last.min(m)));
                 }
             } else {
                 // Nothing to fetch for card copies: every send up to these flights is done.
@@ -5531,7 +5575,7 @@ impl Host {
                 } else {
                     *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
                 };
-                crate::shadow::relay_fetched(after);
+                crate::shadow::relay_fetched(safe_limit.map_or(after, |m| after.min(m)));
             }
         }
         if !has_card && !has_rebar {
@@ -5649,7 +5693,9 @@ impl Host {
             // Sends up to `after` are of no use to any later merge; with the
             // fetch inside flights only those up to these plans' are
             // (`fallback_fetched_mark`).
-            crate::shadow::relay_fetched(fallback_fetched_mark(inflight_fetch(), after, landed_max));
+            let mark = fallback_fetched_mark(inflight_fetch(), after, landed_max);
+            let safe_limit = crate::lazy_back::min_card_fetched_after();
+            crate::shadow::relay_fetched(safe_limit.map_or(mark, |m| mark.min(m)));
         }
         if has_rebar {
             RELAY_REBAR_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -9150,6 +9196,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    if crate::lazy_back::active() {
+        let addr = if title_dst { dst as usize } else { src as usize };
+        crate::lazy_back::materialize_range(addr, len);
+    }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
@@ -9540,6 +9590,7 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    crate::lazy_back::materialize_range(src as usize, dst.len());
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -9551,6 +9602,7 @@ pub(crate) fn read_into_fast(src: *const u8, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
     }
+    crate::lazy_back::materialize_range(src as usize, dst.len());
     if fast_fill() {
         // SAFETY: `dst` is mapped writable memory of `dst.len()` bytes; a
         // fault on `src` is caught by `fast_fill`'s vectored handler and
@@ -9558,6 +9610,7 @@ pub(crate) fn read_into_fast(src: *const u8, dst: &mut [u8]) -> bool {
         if unsafe { victory_copy_try(dst.as_mut_ptr(), src, dst.len()) } != 0 {
             return true;
         }
+        crate::lazy_back::materialize_range(src as usize, dst.len());
     }
     read(src, dst.as_mut_ptr(), dst.len())
 }
@@ -9649,6 +9702,10 @@ pub(crate) fn shader_written(at: usize, len: usize) -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    crate::lazy_back::materialize_range(dst as usize, len);
     shader_wrote(dst as usize, len);
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -11082,6 +11139,7 @@ impl Meter {
         let (card_passes, card_compares, texture_refresh_ms);
         crate::shadow::back_line(frames);
         crate::shadow::view_marks_line(frames);
+        crate::lazy_back::log_stats(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             (card_passes, card_compares) = (passes, compares);

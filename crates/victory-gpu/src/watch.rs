@@ -1065,6 +1065,43 @@ pub(crate) fn clean(page: usize) -> bool {
     GUARDS.read().unwrap_or_else(|e| e.into_inner()).clean.contains(&page)
 }
 
+pub(crate) fn ensure_handler() {
+    install();
+}
+
+pub(crate) fn is_pinned_block(block: usize) -> bool {
+    let g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+    if g.pins.is_empty() {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    g.pins
+        .range(..=block)
+        .next_back()
+        .is_some_and(|(_, &(end, until))| block < end && until > now)
+}
+
+pub(crate) fn disarm_for_lazy(block: usize) {
+    let mut g = guards();
+    let start = block * BLOCK;
+    let end = start.saturating_add(BLOCK);
+    open(&mut g, start, end, |_| {});
+    g.clean.remove(&block);
+    clean_bit(block, false);
+    g.absent.remove(&block);
+    if view_guard() {
+        for alias in crate::inplace::pages_of(start) {
+            let alias_block = alias / BLOCK;
+            if alias_block != block {
+                open_here(&mut g, alias, alias.saturating_add(BLOCK), |_| {});
+                g.clean.remove(&alias_block);
+                clean_bit(alias_block, false);
+                g.absent.remove(&alias_block);
+            }
+        }
+    }
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -1180,9 +1217,9 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.pinned(block) {
-                // The kernel may be writing it: left writable, reported
-                // written at every check until the pin ends.
+            if g.pinned(block) || (crate::lazy_back::active() && crate::lazy_back::has_block(block)) {
+                // The kernel may be writing it or lazy copy-back holds it as
+                // PAGE_NOACCESS: left as-is, reported written at every check.
             } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
@@ -1499,6 +1536,7 @@ pub fn kernel_writing(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    crate::lazy_back::materialize_range(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let end = at.saturating_add(len);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
@@ -1618,6 +1656,11 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     let ranges = crate::inplace::views_of_section(section, offset, len);
     if ranges.is_empty() {
         return;
+    }
+    if crate::lazy_back::active() {
+        for &(at, n) in &ranges {
+            crate::lazy_back::materialize_range(at, n);
+        }
     }
     let mut g = guards();
     for &(at, n) in &ranges {
@@ -1760,6 +1803,7 @@ impl Drop for Remapping {
 /// and the mapping again, over all the bytes whose mapping it changes.
 pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     use std::sync::atomic::Ordering::Relaxed;
+    crate::lazy_back::materialize_range(at, len);
     let started = std::time::Instant::now();
     let held = if by_range() {
         let end = at.saturating_add(len);
@@ -1829,6 +1873,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::lazy_back::discard_range(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1896,6 +1941,7 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    crate::lazy_back::materialize_range(at, len);
     crate::descriptor::host::remapped(at, len);
     wrote(at, len);
     let mut g = guards();
@@ -1937,14 +1983,19 @@ fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        const READ: usize = 0;
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        let access = r.ExceptionInformation[0];
         let at = r.ExceptionInformation[1];
+        if (access == READ || access == WRITE) && crate::lazy_back::handle_fault(at, access == WRITE) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if access != WRITE {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         // Held across both checks when `open` returns false: another thread may
         // have opened the block since this one faulted, and a copy may have
         // guarded it again since (then it is ours again, not read-only for
