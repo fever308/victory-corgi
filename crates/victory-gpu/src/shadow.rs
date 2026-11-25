@@ -903,6 +903,19 @@ pub(crate) fn relay_fetched(number: u64) {
 struct Flights(Vec<((usize, usize), u32, u64)>);
 
 impl Flights {
+    /// Pending ranges that can already have GPU writes from before this
+    /// submission. A range counted for both this submission and an older
+    /// one is still protected, even when its last declaration is current.
+    fn older_ranges(&self, preparing: u64, from: usize, to: usize) -> Vec<(usize, usize)> {
+        joined(
+            self.0
+                .iter()
+                .filter(|&&((a, b), count, last)| a < to && b > from && (last != preparing || count > 1))
+                .map(|&((a, b), _, _)| (a, b))
+                .collect(),
+        )
+    }
+
     /// Submission `number` declares `range`: counted once for it, however
     /// often it declares it.
     fn declare(&mut self, range: (usize, usize), number: u64) {
@@ -2329,6 +2342,18 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         runs.push((first, i - first));
     }
     runs
+}
+
+/// An older flight may have written bytes between title changes. Only
+/// send exact changes there; otherwise a changed page slice goes up as one
+/// range so adjacent slices can join into a single upload.
+fn card_busy_runs(title: &[u8], held: &[u8], exact: bool) -> impl Iterator<Item = (usize, usize)> + use<> {
+    let (whole, fragments) = if exact {
+        (None, changed_runs(title, held))
+    } else {
+        ((title != held).then_some((0, title.len())), Vec::new())
+    };
+    whole.into_iter().chain(fragments)
 }
 
 /// `VICTORY_LATE_MERGE_GAP` (experiment, 0): changed runs of a page of a
@@ -4266,14 +4291,14 @@ impl Shadow {
         plan
     }
 
-    /// [`Shadow::update`] of `[from, to)` where a list submitted earlier
-    /// declared that shaders write (`fcdefcfc`). Copies only the bytes the
-    /// title changed since they were taken (via [`changed_runs`] against the
-    /// copy's reference) and updates the reference (`rebar.mirror`, card CPU
-    /// staging, or PC `before` snapshot) with the same bytes, so copy-back
-    /// neither takes them for GPU writes nor overwrites a later title write,
-    /// and any in-flight GPU writes to other bytes on the same page stay
-    /// untouched.
+    /// [`Shadow::update`] of `[from, to)` where an earlier list declared
+    /// shader writes, whether it is in flight or still being prepared.
+    /// Copies title changes into the reference (`rebar.mirror`, card CPU
+    /// staging, or PC `before` snapshot) so copy-back does not mistake them
+    /// for GPU writes.
+    /// Where an earlier flight's shaders may have written, copy only the
+    /// changed bytes. A card-backed page slice named only by the submission
+    /// being prepared can be uploaded as a single range before its lists run.
     fn update_busy(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return 0;
@@ -4295,6 +4320,19 @@ impl Shadow {
         if self.rebar.is_none() && self.card.is_none() && wide_back() {
             take_snapshots();
         }
+        // Preparation is serialized, so previously submitted ranges can
+        // only disappear after this snapshot (the relay landed them).
+        // Without relay bookkeeping in late mode, assume every busy range
+        // might still have an earlier writer.
+        let protected = if !self.carded() || !crate::host::late() {
+            Vec::new()
+        } else if relay() {
+            let preparing = PREPARED.load(Ordering::Relaxed);
+            self.flights.lock().unwrap_or_else(|e| e.into_inner()).older_ranges(preparing, from, to)
+        } else {
+            vec![(from, to)]
+        };
+        let mut protected = protected.into_iter().peekable();
         let mut title = vec![0u8; PAGE];
         let mut copied_bytes = 0usize;
         for page in stale {
@@ -4344,7 +4382,11 @@ impl Shadow {
                 if self.card.is_some() {
                     // SAFETY: inside the copy's CPU-side staging mapping.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    for (r, m) in join_runs(changed_runs(title, held), merge_gap()) {
+                    while protected.peek().is_some_and(|&(_, b)| b <= lo) {
+                        protected.next();
+                    }
+                    let exact = protected.peek().is_some_and(|&(a, _)| a < hi);
+                    for (r, m) in card_busy_runs(title, held, exact) {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
                         copied_bytes += m;
@@ -7193,6 +7235,96 @@ mod tests {
             assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
             VirtualFree(p as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    /// Shaders only declared during preparation have not run when the card
+    /// uploads the refresh. Diffing individual bytes in this case produces
+    /// thousands of needless CopyBufferRegion calls for strided constants.
+    #[cfg(windows)]
+    #[test]
+    fn card_busy_refresh_coalesces_current_submission_constants() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let len = 16 * PAGE;
+        // SAFETY: fresh write-watched allocation, released below. Use high
+        // addresses so other tests' fresh allocations do not reuse the
+        // address of a page still recorded in the watch journal.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(p, 0);
+        let mut held = vec![0u8; len];
+        let Some(copy) =
+            Shadow::new_card_for_test(held.as_mut_ptr(), p as u64, len as u64, Vec::new(), Vec::new())
+        else {
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            return; // no host GPU here
+        };
+        let card = copy.card.as_ref().unwrap();
+        copy.update(p, len);
+        card.dirty.lock().unwrap().clear();
+        copy.writing(p, len, |_, _| None);
+
+        let (lo, hi) = (19, len - 23);
+        for i in (lo..hi).step_by(16) {
+            // SAFETY: inside the write-watched allocation.
+            unsafe { ((p + i) as *mut u8).write_volatile(0x55) };
+        }
+        // A write outside the refresh must not be uploaded.
+        unsafe { ((p + lo - 1) as *mut u8).write_volatile(0xaa) };
+        let copied = copy.update(p + lo, hi - lo);
+        let uploads = joined(std::mem::take(&mut *card.dirty.lock().unwrap()));
+        drop(copy);
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+
+        assert!(held[lo..hi].iter().step_by(16).all(|&byte| byte == 0x55));
+        assert_eq!(held[lo - 1], 0);
+        assert_eq!(uploads.len(), 1, "expected one contiguous upload, got {} fragments", uploads.len());
+        assert_eq!(uploads, [(lo, hi)]);
+        assert_eq!(copied, hi - lo);
+    }
+
+    #[test]
+    fn card_busy_refresh_preserves_bytes_from_older_flights() {
+        let mut flights = Flights::default();
+        let shared = (108, 120);
+        let older_only = (128, 133);
+        flights.declare(shared, 1);
+        flights.declare(older_only, 1);
+        flights.declare((140, 150), 1);
+        flights.declare(shared, 2);
+        flights.declare((100, 140), 2);
+        let protected = flights.older_ranges(2, 100, 140);
+        assert_eq!(protected, [(108, 120), (128, 133)]);
+
+        let held = [0u8; 40];
+        let mut title = held;
+        let mut device = held;
+        // Simulate two GPU writes since staging last matched the device,
+        // with new title bytes on either side of each write.
+        for at in [9, 30] {
+            device[at] = 0xaa;
+            title[at - 1] = 0x55;
+            title[at + 1] = 0x55;
+        }
+        for (at, len) in card_busy_runs(&title, &held, !protected.is_empty()) {
+            device[at..at + len].copy_from_slice(&title[at..at + len]);
+        }
+        assert_eq!(device[8..11], [0x55, 0xaa, 0x55]);
+        assert_eq!(device[29..32], [0x55, 0xaa, 0x55]);
+
+        // Landing the older flight frees both ranges for batching, even
+        // though the current submission still declares the shared range.
+        flights.done(&[shared, older_only]);
+        assert!(flights.older_ranges(2, 100, 140).is_empty());
     }
 
     /// ReBAR mirror counterpart to `title_writes_under_a_busy_range_are_copied`:
