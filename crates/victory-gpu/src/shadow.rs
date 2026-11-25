@@ -2816,6 +2816,192 @@ impl Shadow {
             .clear();
     }
 
+    /// [`relay`] counterpart to [`Shadow::copy_back_rebar`]: merges GPU bytes
+    /// DMAed by the relay thread (`gpu_slices`, for sorted disjoint buffer-offset
+    /// `spans`) into title memory and the cached RAM mirror under `rebar.mirror`'s
+    /// lock. Never writes back to WC VRAM (a later flight may be writing the GPU
+    /// buffer concurrently) and never clears `pending` (handled per-flight by
+    /// [`Shadow::copy_back_done`]).
+    pub(crate) fn relay_merge_rebar(&self, spans: &[(usize, usize)], gpu_slices: &[&[u8]]) -> usize {
+        const PARALLEL_THRESHOLD: usize = 4 << 20;
+        const PER_THREAD: usize = 4 << 20;
+
+        let Some(rebar) = &self.rebar else {
+            return 0;
+        };
+        let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mirror) = mirror_guard.as_mut() else {
+            return 0;
+        };
+        let mirror_len = mirror.len();
+        let total_bytes: usize = spans
+            .iter()
+            .zip(gpu_slices)
+            .filter(|&(&(from, to), &gpu_span)| {
+                from < to && to <= mirror_len && gpu_span.len() == to - from
+            })
+            .map(|(&(from, to), _)| to - from)
+            .sum();
+        if total_bytes == 0 {
+            return 0;
+        }
+
+        let start = self.start as usize;
+        let apply_subrange =
+            |sub_at: usize, gpu: &[u8], old: &mut [u8], title: &mut Vec<u8>| -> usize {
+                let sub_n = gpu.len();
+                title.clear();
+                title.resize(sub_n, 0);
+                if crate::host::read_into((start + sub_at) as *const u8, title) {
+                    let as_read = merge_race_on().then(|| title.clone());
+                    if merge_piece(gpu, old, title) {
+                        crate::watch::writing(start + sub_at, sub_n);
+                        merge_race(
+                            as_read.as_deref(),
+                            (self.start, self.len),
+                            start + sub_at,
+                            &title[..],
+                            "rebar relay",
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        back_note(start + sub_at, &title[..sub_n], self.start, self.len);
+                        crate::host::write_mapped(
+                            (start + sub_at) as *mut u8,
+                            title.as_ptr(),
+                            sub_n,
+                        );
+                        return sub_n;
+                    }
+                } else {
+                    old.copy_from_slice(gpu);
+                }
+                0
+            };
+
+        let mut written = 0;
+        let mut title = Vec::new();
+        if total_bytes < PARALLEL_THRESHOLD {
+            for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
+                if from >= to || to > mirror_len || gpu_span.len() != to - from {
+                    continue;
+                }
+                let mut at = from;
+                while at < to {
+                    let n = (PAGE - (start + at) % PAGE).min(to - at);
+                    let gpu = &gpu_span[at - from..at - from + n];
+                    let old = &mut mirror[at..at + n];
+                    if gpu != old
+                        && let Some(first) = first_difference(gpu, old)
+                    {
+                        let last = last_difference(gpu, old).unwrap_or(first);
+                        written += apply_subrange(
+                            at + first,
+                            &gpu[first..=last],
+                            &mut old[first..=last],
+                            &mut title,
+                        );
+                    }
+                    at += n;
+                }
+            }
+            return written;
+        }
+
+        let threads = total_bytes.div_ceil(PER_THREAD).clamp(2, 8);
+        let target = total_bytes.div_ceil(threads);
+        let mut buckets: Vec<Vec<(usize, usize, usize, usize)>> = Vec::with_capacity(threads);
+        let mut cur_bucket: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut cur_bytes = 0usize;
+        for (slice_idx, (&(from, to), &gpu_span)) in spans.iter().zip(gpu_slices).enumerate() {
+            if from >= to || to > mirror_len || gpu_span.len() != to - from {
+                continue;
+            }
+            let mut at = from;
+            while at < to {
+                if buckets.len() + 1 >= threads {
+                    cur_bucket.push((slice_idx, from, at, to));
+                    break;
+                }
+                let room = target.saturating_sub(cur_bytes).max(1);
+                let next = if to - at <= room {
+                    to
+                } else {
+                    let raw = at + room;
+                    let rem = (start + raw) % PAGE;
+                    if rem == 0 {
+                        raw
+                    } else {
+                        raw.saturating_add(PAGE - rem).min(to)
+                    }
+                };
+                cur_bucket.push((slice_idx, from, at, next));
+                cur_bytes += next - at;
+                at = next;
+                if cur_bytes >= target && buckets.len() + 1 < threads {
+                    buckets.push(std::mem::take(&mut cur_bucket));
+                    cur_bytes = 0;
+                }
+            }
+        }
+        if !cur_bucket.is_empty() {
+            buckets.push(cur_bucket);
+        }
+
+        let diffs = {
+            let mirror_ro: &[u8] = mirror;
+            let scan_bucket = |bucket: Vec<(usize, usize, usize, usize)>|
+             -> Vec<(usize, usize, usize, usize)> {
+                let mut found = Vec::new();
+                for (slice_idx, span_from, seg_from, seg_to) in bucket {
+                    let gpu_span = gpu_slices[slice_idx];
+                    let mut at = seg_from;
+                    while at < seg_to {
+                        let n = (PAGE - (start + at) % PAGE).min(seg_to - at);
+                        let span_off = at - span_from;
+                        let gpu = &gpu_span[span_off..span_off + n];
+                        let old = &mirror_ro[at..at + n];
+                        if gpu != old
+                            && let Some(first) = first_difference(gpu, old)
+                        {
+                            let last = last_difference(gpu, old).unwrap_or(first);
+                            found.push((
+                                at + first,
+                                last + 1 - first,
+                                slice_idx,
+                                span_off + first,
+                            ));
+                        }
+                        at += n;
+                    }
+                }
+                found
+            };
+            std::thread::scope(|s| {
+                let mut iter = buckets.into_iter();
+                let first = iter.next().unwrap_or_default();
+                let scan_bucket = &scan_bucket;
+                let handles: Vec<_> = iter
+                    .map(|bucket| s.spawn(move || scan_bucket(bucket)))
+                    .collect();
+                let mut out = scan_bucket(first);
+                for handle in handles {
+                    match handle.join() {
+                        Ok(part) => out.extend(part),
+                        Err(panic) => std::panic::resume_unwind(panic),
+                    }
+                }
+                out
+            })
+        };
+
+        for (sub_at, sub_n, slice_idx, slice_off) in diffs {
+            let gpu = &gpu_slices[slice_idx][slice_off..slice_off + sub_n];
+            let old = &mut mirror[sub_at..sub_at + sub_n];
+            written += apply_subrange(sub_at, gpu, old, &mut title);
+        }
+        written
+    }
+
     /// ReBAR counterpart to [`Shadow::copy_back`]: merges post-submission GPU
     /// bytes (`gpu_slices`, already DMAed into cached `READBACK` RAM) for
     /// sorted disjoint buffer-offset `spans` against the cached RAM mirror,
@@ -3312,56 +3498,96 @@ impl Shadow {
                 }
                 let n = hi - lo;
                 let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
-                }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = join_runs(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
-                        return true;
+                if let Some(rebar) = &self.rebar {
+                    let mut dirty_runs = Vec::new();
+                    {
+                        let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
+                        if !crate::host::read_into(lo as *const u8, title) {
+                            continue;
+                        }
+                        MERGED[0].fetch_add(1, Ordering::Relaxed);
+                        let Some(held_all) = mirror.as_mut() else {
+                            return true;
+                        };
+                        if at + n > held_all.len() {
+                            return true;
+                        }
+                        let held = &mut held_all[at..at + n];
+                        let runs = changed_runs(title, held);
+                        if runs.len() > *runs_left {
+                            return true;
+                        }
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            // SAFETY: inside the ReBAR WC VRAM mapping (`at + r + m <= self.len`).
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    title.as_ptr().add(r),
+                                    self.data.add(at + r),
+                                    m,
+                                );
+                            }
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            dirty_runs.push((at + r, m));
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
                     }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    for (off, len) in dirty_runs {
+                        rebar.mark_dirty_range(off, len);
                     }
                 } else {
-                    let Some(snapshot) = before.as_mut() else {
-                        return true;
-                    };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    // The lock of the copy's reference (the snapshot, or the
+                    // CPU's side of a copy in the card's memory), from before
+                    // title memory is read until the title's bytes are in: with
+                    // the copy-back on its own thread ([`relay`]) that thread
+                    // puts what the card wrote into title memory and into the
+                    // reference under the same lock, and a page read before
+                    // such a merge and compared after it would take the card's
+                    // bytes for the title's.
+                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    // A page that is not there is left as it is, and looked at
+                    // again next time.
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
                     }
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    if self.card.is_some() {
+                        // SAFETY: inside the mapping of the copy's CPU side,
+                        // which only the submitting thread writes.
+                        let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        let runs = join_runs(changed_runs(title, held), merge_gap());
+                        if runs.len() > *runs_left {
+                            return true;
+                        }
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                    } else {
+                        let Some(snapshot) = before.as_mut() else {
+                            return true;
+                        };
+                        // SAFETY: the snapshot's allocation holds the copy's
+                        // bytes at the copy's offsets (`writing`), and these
+                        // are in a declared range.
+                        let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+                        for (r, m) in changed_runs(title, held) {
+                            // SAFETY: inside the copy's mapping. The card may be
+                            // writing the copy beside these bytes; they are
+                            // written here and nothing around them.
+                            unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                    }
+                    drop(before);
                 }
-                drop(before);
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
@@ -3920,14 +4146,12 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// [`Host::shared_buffer`] when ReBAR is unavailable, disabled, or full.
 fn alloc_shadow_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8, Option<u64>)> {
     let h = host()?;
-    if !crate::host::relay() {
-        let budget = h.rebar_shadow_budget();
-        if try_reserve_rebar(&REBAR_SHADOW_BYTES, size, budget) {
-            if let Some((buffer, data)) = h.try_rebar_shadow_buffer(size) {
-                return Some((buffer, data, Some(size)));
-            }
-            REBAR_SHADOW_BYTES.fetch_sub(size, Ordering::Relaxed);
+    let budget = h.rebar_shadow_budget();
+    if try_reserve_rebar(&REBAR_SHADOW_BYTES, size, budget) {
+        if let Some((buffer, data)) = h.try_rebar_shadow_buffer(size) {
+            return Some((buffer, data, Some(size)));
         }
+        REBAR_SHADOW_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
     let (buffer, data) = h.shared_buffer(size)?;
     Some((buffer, data, None))
@@ -5294,5 +5518,125 @@ mod tests {
             assert!(guard.entries.contains_key(&(win(1), WINDOW)));
             assert!(guard.entries.contains_key(&(win(6), WINDOW)));
         }
+    }
+
+    #[test]
+    fn relay_merge_rebar_merges_gpu_writes_without_touching_concurrent_cpu_writes() {
+        let Some(host) = host() else {
+            return;
+        };
+        let mut title = vec![0x11u8; 4096];
+        let start = title.as_mut_ptr() as u64;
+        let Some((buffer, data)) = host.shared_buffer(4096) else {
+            return;
+        };
+        // SAFETY: live buffer.
+        let gpu_va = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu_va, start, 4096, Some(0));
+        // Seed mirror with initial bytes [0x11; 4096] and a pending range.
+        {
+            let rebar = shadow.rebar.as_ref().expect("rebar state");
+            *rebar.mirror.lock().unwrap() = Some(vec![0x11u8; 4096]);
+            shadow
+                .pending
+                .lock()
+                .unwrap()
+                .push((start as usize, start as usize + 4096));
+        }
+        // Concurrent CPU write at byte 200; GPU write at byte 100.
+        title[200] = 0x77;
+        let mut gpu_slice = vec![0x11u8; 4096];
+        gpu_slice[100] = 0xAA;
+
+        let written = shadow.relay_merge_rebar(&[(0, 4096)], &[&gpu_slice]);
+        assert!(written > 0);
+        assert_eq!(title[100], 0xAA, "GPU write must land in title memory");
+        assert_eq!(title[200], 0x77, "concurrent CPU write must be preserved");
+        assert_eq!(
+            shadow.pending.lock().unwrap().len(),
+            1,
+            "relay_merge_rebar must leave pending cleanup to copy_back_done"
+        );
+        // Mirror now holds 0xAA at byte 100, so a repeat merge with the same
+        // GPU bytes writes nothing.
+        assert_eq!(shadow.relay_merge_rebar(&[(0, 4096)], &[&gpu_slice]), 0);
+    }
+
+    #[test]
+    fn relay_merge_rebar_parallel_scan_merges_large_buffer_across_chunks() {
+        let Some(host) = host() else {
+            return;
+        };
+        const LEN: usize = 8 << 20;
+        let mut title = vec![0x11u8; LEN];
+        let start = title.as_mut_ptr() as u64;
+        let Some((buffer, data)) = host.shared_buffer(LEN as u64) else {
+            return;
+        };
+        // SAFETY: live buffer.
+        let gpu_va = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu_va, start, LEN as u64, Some(0));
+        {
+            let rebar = shadow.rebar.as_ref().expect("rebar state");
+            *rebar.mirror.lock().unwrap() = Some(vec![0x11u8; LEN]);
+            shadow
+                .pending
+                .lock()
+                .unwrap()
+                .push((start as usize, start as usize + LEN));
+        }
+
+        // Concurrent CPU writes: two in GPU-written pages and one in an untouched page.
+        let mid = 4 << 20;
+        title[200] = 0x77;
+        title[mid + 32] = 0x88;
+        title[(2 << 20) + 500] = 0x99;
+
+        // GPU writes across multiple PAGE chunks and straddling the 4 MiB worker cut.
+        let mut gpu_slice = vec![0x11u8; LEN];
+        gpu_slice[100..108].fill(0xAA);
+        gpu_slice[PAGE - 4..PAGE + 4].fill(0xBB);
+        gpu_slice[mid - 8..mid + 8].fill(0xCC);
+        gpu_slice[LEN - 16..LEN].fill(0xDD);
+
+        let written = shadow.relay_merge_rebar(&[(0, LEN)], &[&gpu_slice]);
+        assert!(written > 0);
+        assert!(title[100..108].iter().all(|&b| b == 0xAA));
+        assert!(title[PAGE - 4..PAGE + 4].iter().all(|&b| b == 0xBB));
+        assert!(title[mid - 8..mid + 8].iter().all(|&b| b == 0xCC));
+        assert!(title[LEN - 16..LEN].iter().all(|&b| b == 0xDD));
+        assert_eq!(title[200], 0x77, "concurrent CPU write in chunk 0 must be preserved");
+        assert_eq!(title[mid + 32], 0x88, "concurrent CPU write in chunk 1 must be preserved");
+        assert_eq!(
+            title[(2 << 20) + 500],
+            0x99,
+            "concurrent CPU write in untouched page must be preserved"
+        );
+        assert_eq!(title[0], 0x11);
+        assert_eq!(title[108], 0x11);
+        assert_eq!(title[mid + 8], 0x11);
+        assert_eq!(title[LEN - 17], 0x11);
+        assert_eq!(
+            shadow.pending.lock().unwrap().len(),
+            1,
+            "relay_merge_rebar must leave pending cleanup to copy_back_done"
+        );
+        // Repeat merge with identical GPU bytes finds nothing to write.
+        assert_eq!(shadow.relay_merge_rebar(&[(0, LEN)], &[&gpu_slice]), 0);
+
+        // Multi-span parallel path (>= 4 MiB across disjoint spans).
+        let span0 = (0usize, mid);
+        let span1 = (mid + PAGE, LEN);
+        gpu_slice[3 * PAGE + 16] = 0xEE;
+        gpu_slice[(6 << 20) + 42] = 0xEF;
+        let spans = [span0, span1];
+        let slices = [&gpu_slice[span0.0..span0.1], &gpu_slice[span1.0..span1.1]];
+        let written2 = shadow.relay_merge_rebar(&spans, &slices);
+        assert!(written2 > 0);
+        assert_eq!(title[3 * PAGE + 16], 0xEE);
+        assert_eq!(title[(6 << 20) + 42], 0xEF);
+        assert_eq!(title[200], 0x77);
+        assert_eq!(title[(2 << 20) + 500], 0x99);
+        assert_eq!(shadow.relay_merge_rebar(&spans, &slices), 0);
     }
 }

@@ -129,9 +129,9 @@ pub(crate) struct Host {
     rebar_readback: Mutex<RebarReadback>,
     queue: ID3D12CommandQueue,
     /// Dedicated DMA copy queue (`D3D12_COMMAND_LIST_TYPE_COPY`) for
-    /// [`Host::relay_card_back`], so readbacks of completed flights do not
-    /// queue behind in-flight graphics work on `queue` (`VICTORY_RELAY_COPY_QUEUE=0`
-    /// disables it).
+    /// [`Host::relay_fetch_back`] (card-copy and ReBAR fetches), so readbacks
+    /// of completed flights do not queue behind in-flight graphics work on
+    /// `queue` (`VICTORY_RELAY_COPY_QUEUE=0` disables it).
     copy_queue: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -1008,15 +1008,21 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
-        let copy_queue = if std::env::var_os("VICTORY_RELAY_COPY_QUEUE").is_some_and(|v| v == "0") {
-            None
-        } else {
+        let copy_queue = if relay_copy_queue() {
             device
                 .CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_COPY,
                     ..Default::default()
                 })
+                .map_err(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        "no copy queue for the relay's fetches: they go on the host's queue"
+                    )
+                })
                 .ok()
+        } else {
+            None
         };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
@@ -2117,7 +2123,7 @@ unsafe fn dispatch_card_compare(
 /// is reached its bytes are there, and the landing merges them
 /// (`Shadow::card_merge_relay`) with no list, signal or wait of its own.
 /// The merge's "fetched after" is the flight's own send number
-/// (`CardPlan::sent_as`): see [`Host::relay_card_back`] for why that is
+/// (`CardPlan::sent_as`): see [`Host::relay_fetch_back`] for why that is
 /// exact and when a landing falls back to the old fetch.
 fn inflight_fetch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -2292,7 +2298,7 @@ struct CardPlan {
     ranges: Vec<CardRange>,
     /// With [`relay`]: the number its sends were taken under
     /// ([`QUEUE_ORDER`]). Once its submission has run, every send up to it
-    /// has run (`Host::relay_card_back` on a copy queue).
+    /// has run (`Host::relay_fetch_back` on a copy queue).
     sent_as: u64,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
@@ -3404,9 +3410,16 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
 }
 
-/// What the thread that lands flights fetches card copies' pieces with
+/// Since the last frame-rate line: ReBAR relay fetches, bytes DMAed, and wait
+/// microseconds on the relay thread's copy path.
+static RELAY_REBAR_STATS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// What the thread that lands flights fetches card-copy and ReBAR pieces with
 /// ([`relay`]): a list, a fence and an event of its own (the host's are
-/// behind the submission lock), and the memory the pieces come down to.
+/// behind the submission lock), an optional shared `COPY` queue
+/// (`Host::copy_queue`, [`relay_copy_queue`]), and the memory the pieces come
+/// down to.
 struct RelayFetch {
     list: Prelude,
     /// A copy queue of the fetch's own ([`relay_copy_queue`]); without one
@@ -3497,7 +3510,7 @@ fn relay_worker() {
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.is_rebar() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -3605,6 +3618,21 @@ fn late_line(frames: f64) {
                 i[1] / (1 << 20) as f64,
                 i[3],
                 i[2],
+            );
+        }
+        let rr: [f64; 3] =
+            [0, 1, 2].map(|i| RELAY_REBAR_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if rr[0] > 0.0 {
+            tracing::info!(
+                "relay ReBAR fetches per frame ({}): {:.1} fetches, {:.1} MB, {:.1} ms waiting",
+                if host().is_some_and(|h| h.copy_queue.is_some()) {
+                    "COPY queue"
+                } else {
+                    "direct queue"
+                },
+                rr[0],
+                rr[1] / (1 << 20) as f64,
+                rr[2] / 1000.0,
             );
         }
     }
@@ -4497,30 +4525,27 @@ impl Host {
         }
     }
 
-    /// The relay's own list, fence, event for [`Host::relay_card_back`].
-    /// Prefers a `D3D12_COMMAND_LIST_TYPE_COPY` list when `self.copy_queue`
-    /// is available so readbacks run on the hardware DMA engine without
-    /// waiting behind in-flight graphics work on `self.queue`.
+    /// The relay's own list, fence, event for [`Host::relay_fetch_back`].
+    /// Reuses `self.copy_queue` with a `D3D12_COMMAND_LIST_TYPE_COPY` list when
+    /// available so card-copy and ReBAR readbacks run on the hardware DMA
+    /// engine without waiting behind in-flight graphics work on `self.queue`.
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
         // SAFETY: plain objects of our own.
         let copy: Option<(ID3D12CommandQueue, Prelude)> = relay_copy_queue()
-            .then(|| unsafe {
+            .then_some(self.copy_queue.as_ref())
+            .flatten()
+            .and_then(|queue| unsafe {
                 (|| -> windows::core::Result<(ID3D12CommandQueue, Prelude)> {
-                    let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                        Type: D3D12_COMMAND_LIST_TYPE_COPY,
-                        ..Default::default()
-                    })?;
                     let allocator: ID3D12CommandAllocator =
                         self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
                     let list: ID3D12GraphicsCommandList =
                         self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
                     list.Close()?;
-                    Ok((queue, (allocator, list)))
+                    Ok((queue.clone(), (allocator, list)))
                 })()
-                .map_err(|e| tracing::warn!(error = %e, "no copy queue for the relay's fetches: they go on the host's queue"))
+                .map_err(|e| tracing::warn!(error = %e, "no copy queue list for the relay's fetches: they go on the host's queue"))
                 .ok()
-            })
-            .flatten();
+            });
         let (copy, list) = match copy {
             Some((queue, list)) => (Some(queue), list),
             None => (None, self.make_prelude()?),
@@ -4540,70 +4565,106 @@ impl Host {
         }
     }
 
-    /// [`relay`], on the thread that lands flights: for the plans of the
-    /// flights being landed (the card has run them), the pieces their
-    /// compares flagged are fetched, once each, with a list and a wait of
-    /// this thread's own, and what shaders wrote in them goes into title
-    /// memory (`Shadow::card_merge_relay`). As [`Host::card_back`], but:
-    /// no submission lock; a piece flagged under one range of a plan is
-    /// fetched under all ([`flagged_pieces`]); the fetch runs behind
-    /// whatever was sent meanwhile, so it may bring a later flight's
-    /// bytes, which that flight's landing then finds merged already; and
-    /// nothing is sent back up.
+    /// [`relay`], on the thread that lands flights: fetches both card-copy
+    /// pieces flagged by `plans` and ReBAR UAV spans in `back` in a single
+    /// DMA submission on `self.copy_queue` (falling back to `self.queue` when
+    /// `VICTORY_RELAY_COPY_QUEUE=0` or no `COPY` queue is available), then
+    /// merges GPU writes into title memory (`Shadow::card_merge_relay` /
+    /// `Shadow::relay_merge_rebar`).
     ///
-    /// With [`inflight_fetch`] the pieces are first looked for where the
+    /// With [`inflight_fetch`], card-copy pieces are first looked for where the
     /// flights' own compare lists put them ([`Host::relay_card_inflight`]);
-    /// only a landing that cannot take them from there fetches, as here.
-    fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+    /// when that succeeds only ReBAR spans (if any) are DMAed here.
+    fn relay_fetch_back(&self, plans: &[&CardPlan], back: &[Declared], fetch: &mut Option<RelayFetch>) {
+        struct RebarEntry {
+            shadow: std::sync::Arc<crate::shadow::Shadow>,
+            spans: Vec<(usize, usize)>,
+            offsets: Vec<u64>,
+        }
+
+        let mut card_done_inflight = false;
         if inflight_fetch() {
             let landed = self.relay_card_inflight(plans);
             inflight_tickets_landed(plans);
             if landed {
-                return;
+                card_done_inflight = true;
             }
         }
-        let differs = {
-            let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-            work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
-        };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
-        if let Some((differs, dwords)) = differs {
-            // SAFETY: the mapping of the results. The compares of these
-            // plans have run, and their dwords are given to no other plan
-            // before these are done with (`card_done`).
-            let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
-            for plan in plans {
-                let flags: Vec<(usize, u32, bool)> = plan
-                    .ranges
-                    .iter()
-                    .flat_map(|r| {
-                        (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
+        let mut card_total = 0u64;
+        if !card_done_inflight {
+            let differs = {
+                let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+                work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
+            };
+            if let Some((differs, dwords)) = differs {
+                // SAFETY: the mapping of the results. The compares of these
+                // plans have run, and their dwords are given to no other plan
+                // before these are done with (`card_done`).
+                let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
+                let mut seen = std::collections::HashSet::new();
+                for plan in plans {
+                    let flags: Vec<(usize, u32, bool)> = plan
+                        .ranges
+                        .iter()
+                        .flat_map(|r| {
+                            (0..r.span.pieces).map(move |p| {
+                                let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
+                                (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
+                            })
                         })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
-                for r in &plan.ranges {
-                    let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
-                    for p in 0..r.span.pieces {
-                        if !fetched.contains(&(copy, r.span.first + p)) {
-                            continue;
+                        .collect();
+                    let fetched = flagged_pieces(&flags);
+                    for r in &plan.ranges {
+                        let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                        for p in 0..r.span.pieces {
+                            if !fetched.contains(&(copy, r.span.first + p)) {
+                                continue;
+                            }
+                            let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                            if lo < hi && seen.insert((copy, lo, hi)) {
+                                pieces.push((r.shadow.clone(), lo, hi, card_total));
+                                card_total += (hi - lo) as u64;
+                            }
                         }
-                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
-                        }
+                        crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                     }
-                    crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
         }
+
+        let mut rebar_entries: Vec<RebarEntry> = Vec::new();
+        let mut total = card_total;
+        for (shadow, declared) in back {
+            if !shadow.is_rebar() {
+                continue;
+            }
+            let ranges: Vec<(usize, usize)> = declared
+                .iter()
+                .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
+                .filter(|&(from, to)| from < to)
+                .collect();
+            let spans = merge_ranges(ranges);
+            if spans.is_empty() {
+                continue;
+            }
+            let mut offsets = Vec::with_capacity(spans.len());
+            for &(from, to) in &spans {
+                offsets.push(total);
+                total += (to - from) as u64;
+            }
+            rebar_entries.push(RebarEntry {
+                shadow: shadow.clone(),
+                spans,
+                offsets,
+            });
+        }
+        let rebar_total = total - card_total;
+        let has_card = !pieces.is_empty();
+        let has_rebar = !rebar_entries.is_empty();
+
         let completed_order = plans.iter().map(|p| p.order_after).max().unwrap_or(0);
-        if pieces.is_empty() {
+        if !card_done_inflight && !has_card {
             if inflight_fetch() {
                 // The next merge may be of a flight in the air now, with
                 // bytes from when it ran: only sends up to these plans' are
@@ -4611,32 +4672,34 @@ impl Host {
                 if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
                     crate::shadow::relay_fetched(last);
                 }
-                return;
-            }
-            // Nothing to fetch: every send up to these flights is done.
-            let after = if self.copy_queue.is_some() {
-                completed_order
             } else {
-                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
-            };
-            crate::shadow::relay_fetched(after);
+                // Nothing to fetch for card copies: every send up to these flights is done.
+                let after = if self.copy_queue.is_some() {
+                    completed_order
+                } else {
+                    *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+                };
+                crate::shadow::relay_fetched(after);
+            }
+        }
+        if !has_card && !has_rebar {
             return;
         }
-        if inflight_fetch() {
+        if has_card && inflight_fetch() {
             INFLIGHT_STATS[3].fetch_add(1, Ordering::Relaxed);
         }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
         let Some(f) = fetch.as_mut() else {
-            fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
+            fail(format_args!("no list, fence or event to fetch what shaders wrote (VICTORY_RELAY=1)"));
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
-            fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
+            fail(format_args!("no memory to fetch what shaders wrote ({total} bytes, VICTORY_RELAY=1)"));
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
@@ -4648,14 +4711,27 @@ impl Host {
         let landed = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
-        // buffers (the copies are held by the plans); the fence and the
-        // event are this thread's.
+        // buffers (held by `pieces` and `rebar_entries`) are in COMMON state
+        // (implicit promotion to COPY_SOURCE/COPY_DEST and decay back to
+        // COMMON at ExecuteCommandLists boundaries); the fence and the event
+        // are this thread's.
         let ran = unsafe {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                }
+                for entry in &rebar_entries {
+                    for (&(from, to), &at) in entry.spans.iter().zip(&entry.offsets) {
+                        list.CopyBufferRegion(
+                            &buffer,
+                            at,
+                            &entry.shadow.buffer,
+                            from as u64,
+                            (to - from) as u64,
+                        );
+                    }
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -4681,47 +4757,76 @@ impl Host {
         };
         let after = match ran {
             Ok(after) => after,
-            Err(e) => fail(format_args!("what shaders wrote to the card's memory could not be fetched ({e}, VICTORY_RELAY=1)")),
+            Err(e) => fail(format_args!("what shaders wrote could not be fetched ({e}, VICTORY_RELAY=1)")),
         };
-        // This fetch may bring bytes of flights in the air now: their own
-        // slots are older than what it puts in the CPU's side there
-        // (`relay_card_inflight`). Sends up to `after` are numbered, and the
-        // submission numbered `after` may not have its lists on the queue
-        // yet; every one before it has (the submission lock).
-        if inflight_fetch()
-            && after > 1
-            && let Some(inflight) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|w| w.inflight.as_mut())
-        {
-            inflight.brought.extend(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.clone(), *lo, *hi, after - 1)));
-        }
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
-        {
-            use crate::shadow::CARD_STATS;
-            CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
-            CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
-            CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
-            CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+        if has_card {
+            // This fetch may bring bytes of flights in the air now: their own
+            // slots are older than what it puts in the CPU's side there
+            // (`relay_card_inflight`). Sends up to `after` are numbered, and the
+            // submission numbered `after` may not have its lists on the queue
+            // yet; every one before it has (the submission lock).
+            if inflight_fetch()
+                && after > 1
+                && let Some(inflight) = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|w| w.inflight.as_mut())
+            {
+                inflight.brought.extend(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.clone(), *lo, *hi, after - 1)));
+            }
+            {
+                use crate::shadow::CARD_STATS;
+                CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+                CARD_STATS[4].fetch_add(card_total, Ordering::Relaxed);
+                CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+                CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            }
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+                shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            // Sends up to `after` are of no use to any later merge; with the
+            // fetch inside flights only those up to these plans' are
+            // (`fallback_fetched_mark`).
+            let landed = plans.iter().map(|p| p.sent_as).max();
+            crate::shadow::relay_fetched(fallback_fetched_mark(inflight_fetch(), after, landed));
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
+        if has_rebar {
+            RELAY_REBAR_STATS[0].fetch_add(1, Ordering::Relaxed);
+            RELAY_REBAR_STATS[1].fetch_add(rebar_total, Ordering::Relaxed);
+            RELAY_REBAR_STATS[2].fetch_add(us, Ordering::Relaxed);
+            let mut written = 0usize;
+            for entry in &rebar_entries {
+                let slices: Vec<&[u8]> = entry
+                    .spans
+                    .iter()
+                    .zip(&entry.offsets)
+                    .map(|(&(from, to), &at)| {
+                        // SAFETY: `f.buffer` holds `total` bytes and the DMA fence has completed.
+                        unsafe {
+                            std::slice::from_raw_parts((data + at as usize) as *const u8, to - from)
+                        }
+                    })
+                    .collect();
+                written += entry.shadow.relay_merge_rebar(&entry.spans, &slices);
+                entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+            }
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
-        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        // Sends up to `after` are of no use to any later merge; with the
-        // fetch inside flights only those up to these plans' are
-        // (`fallback_fetched_mark`).
-        let landed = plans.iter().map(|p| p.sent_as).max();
-        crate::shadow::relay_fetched(fallback_fetched_mark(inflight_fetch(), after, landed));
     }
 
-    /// [`Host::relay_card_back`] with [`inflight_fetch`]: the pieces these
+    #[cfg(test)]
+    fn relay_rebar_back(&self, back: &[Declared], fetch: &mut Option<RelayFetch>) {
+        self.relay_fetch_back(&[], back, fetch);
+    }
+
+    /// [`Host::relay_fetch_back`] with [`inflight_fetch`]: the pieces these
     /// plans' compares flagged are taken from the slots their own compare
     /// lists copied them to ([`CARD_FETCH`]) and merged, plan by plan in the
     /// line's order, with no list or wait of ours. `false` (nothing merged)
@@ -4902,7 +5007,6 @@ impl Host {
                     ));
                 }
                 let plans: Vec<&CardPlan> = flights.iter().filter_map(|f| f.card.as_ref()).collect();
-                self.relay_card_back(&plans, fetch);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -4918,6 +5022,7 @@ impl Host {
                         }
                     }
                 }
+                self.relay_fetch_back(&plans, &back, fetch);
                 relay_hand_back(&back);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
@@ -10432,5 +10537,88 @@ mod rebar_tests {
             errors_before,
             "unexpected D3D12 debug layer error during rebar_hash test"
         );
+    }
+
+    #[test]
+    fn relay_rebar_back_uses_dedicated_copy_queue_cleanly() {
+        let Some(h) = host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let mut title = vec![0x22u8; 4096];
+        let start = title.as_mut_ptr() as u64;
+        let len = title.len() as u64;
+        crate::shadow::register(start as usize, start, len);
+        let shadow = crate::shadow::find(start, len).expect("registered shadow");
+        if !shadow.is_rebar() {
+            // Non-ReBAR hardware / WARP: still verify make_relay_fetch wires up
+            // the host's COPY queue cleanly when enabled.
+            let fetch = h.make_relay_fetch().expect("relay fetch");
+            if super::relay_copy_queue() {
+                assert!(
+                    fetch.copy.is_some(),
+                    "expected dedicated D3D12 COPY queue on host device"
+                );
+            }
+            drop(shadow);
+            crate::shadow::unregister(start as usize, start);
+            h.log_messages();
+            assert_eq!(h.d3d12_errors(), errors_before);
+            return;
+        }
+        // Seed initial title bytes into shadow + mirror via a sync upload.
+        let list = h.new_list().expect("host list");
+        shadow.refresh(&list, start, len);
+        list.close();
+        h.execute(&[&list]);
+        list.reset();
+
+        // Populate ReBAR mirror and simulate a GPU write at offset 64..68 (via
+        // a Direct-queue CopyBufferRegion from an upload buffer) plus a
+        // concurrent CPU write at offset 256.
+        shadow.writing(start as usize, len as usize, |_, size| {
+            Some(vec![0x22u8; size as usize])
+        });
+        let (src_buf, src_ptr) = h.upload_buffer(256).expect("upload buffer");
+        // SAFETY: mapped 256-byte upload buffer.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0xCC, 4);
+            let l = &list.list;
+            l.CopyBufferRegion(&shadow.buffer, 64, &src_buf, 0, 4);
+        }
+        list.close();
+        h.execute(&[&list]);
+        list.reset();
+
+        title[256] = 0x55;
+        let mut fetch = None;
+        h.relay_rebar_back(
+            &[(
+                shadow.clone(),
+                vec![(start as usize, start as usize + len as usize)],
+            )],
+            &mut fetch,
+        );
+        h.log_messages();
+        if super::relay_copy_queue() {
+            assert!(
+                fetch.as_ref().and_then(|f| f.copy.as_ref()).is_some(),
+                "relay_rebar_back must use the dedicated D3D12 COPY queue"
+            );
+        }
+        assert_eq!(
+            &title[64..68],
+            &[0xCC; 4],
+            "GPU bytes must land via COPY queue"
+        );
+        assert_eq!(title[256], 0x55, "concurrent CPU write must be preserved");
+        assert_eq!(
+            h.d3d12_errors(),
+            errors_before,
+            "unexpected D3D12 debug layer error during COPY-queue relay ReBAR fetch"
+        );
+        shadow.copy_back_done(&[(start as usize, start as usize + len as usize)]);
+        drop(shadow);
+        crate::shadow::unregister(start as usize, start);
     }
 }
