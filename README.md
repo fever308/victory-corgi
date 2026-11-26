@@ -1,4 +1,131 @@
-# victory-gta6
+# victory-corgi (fever308 fork)
+
+A performance, memory-lifetime, and water-rendering fork of
+[Corgansm/victory-corgi](https://github.com/Corgansm/victory-corgi) (which itself
+builds on [Marvisak/VIctory](https://github.com/Marvisak/VIctory)), running the
+Xbox Series build of Grand Theft Auto VI natively on Windows from files the user
+supplies.
+
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by Rockstar Games or
+Take-Two Interactive. Licensed **GPL-3.0-or-later**, matching upstream
+[VIctory](https://github.com/Marvisak/VIctory).
+
+## Credits & Upstream Attribution
+
+This branch is built directly on top of
+**[Corgansm/victory-corgi](https://github.com/Corgansm/victory-corgi)** (`4102a03`)
+with full upstream git history intact, and incorporates patches, ideas, and ports
+from across the VIctory community:
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** — **Marvisak** and all
+  upstream contributors: the core loader, HLE runtime services, Direct3D 12
+  backend, texture detiler, and RDNA2→DXIL shader recompiler (GPL-3.0-or-later).
+- **[Corgansm/victory-corgi](https://github.com/Corgansm/victory-corgi)** —
+  **Corgan**: base fork (`4102a03`) including black-lighting fixes, shader
+  translation & host pipeline fixes, list/scratch pools, `VICTORY_INDIRECT_AMPLIFY`,
+  `VICTORY_ASYNC_SUBMIT`, and tiled texture support.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** —
+  **fxceless** and contributors: water texture readback subresource union
+  (`#1152`), post-readback D3D12 resource state restore (`#1170`), Wave32
+  volumetrics allowlist (`#1248`), mesh/sampler/wave64 shader fixes (`#1112`),
+  descriptor fixes (`#923`, `#802`), `VICTORY_REFLECTION`, `VICTORY_TEXTURE_BACK`,
+  `VICTORY_INDIRECT_GATHER`, `VICTORY_JOIN_PARTS`, `VICTORY_BACK_OWN_VIEW`,
+  `VICTORY_STRETCH`, `drvwatch`, `cardmeter`, and upstream syncs.
+- **[JMAN730/project-flamingo](https://github.com/JMAN730/project-flamingo)** —
+  **JMAN730** and contributors: ReBAR GPU upload heaps (`#574`), birth-sequence
+  per-epoch resource retirement (`#597`), `HostList` scratch trim (`#598`),
+  RAM-scaled loose shadow & texture staging LRU caches (`#599`, `#600`), and
+  GPU coherency / sync work.
+- **[myokex/victory-amd](https://github.com/myokex/victory-amd)** &
+  **Joshua Odom**: aliased-page write guard (`c6dc4d8`, adapting PR `#115` by
+  **Spexivus**, **joroyt**, and VIctory `#1122` by **tightfall**), kernel
+  read-beside fix (`10ea38e`), partial-mip detiling, and post-upload indexed
+  texture rechecks.
+- **Community contributors ported/adapted across this branch:**
+  - **romainhedouin** — CPU draw-path CBV dedup, PSO cache, table comparison,
+    and clamp-list optimizations.
+  - **Chezzuss** — 64 KiB cross-page raw memory access splitting and
+    watch/host/shader fixes.
+  - **JoshuuDev** & **Belobug** — HLE, XMA/audio, PC keyboard+mouse input, and
+    GPU/shader ports.
+  - **7900XTX fork** — DirectStorage per-worker file handles, split `xmem`
+    locks, lean page mapping, 128-bit texture digest, 4 KiB sub-page dirty
+    tracking, `VICTORY_WIDE_FILLS` / `VICTORY_REFRESH_AHEAD`,
+    `VICTORY_BIND_CACHE`, and parallel `sync_heaps` / `heap_buffers`.
+  - **Flyander** (`#305` raw-byte descriptor heap mirroring), **AscilCH**
+    (`#747` levels-on-demand fixes), and **Jonirulah** (`#670` guarded-view
+    watch skip, `#648` in-flight card fetch).
+- **[XCL](https://github.com/ivall/xcl)** — **ivall** and contributors
+  (GPL-2.0-only reference for console runtime behavior).
+
+## What This Fork Adds (79 Commits Ahead of `Corgansm/victory-corgi`)
+
+- **Memory & Lifetime Management:**
+  - Birth-sequence per-epoch retirement (`retire.rs`) with `exec_epochs` fast
+    path and batched retirement; lock-free-bitmap 2-level paged `KeptTable` for
+    `HostHeap::kept`; async `land()` list recycling on `victory-late-wait`.
+  - RAM-scaled LRU budgets for loose shadows and texture staging, plus a
+    bounded 19-class D3D12 `UPLOAD` buffer pool (`VICTORY_UPLOAD_POOL_MB=192`,
+    `0` disables).
+  - VRAM-first ReBAR placement (`VICTORY_REBAR=1`, scaled budgets up to 3 GiB
+    buffers + 6 GiB `LOOSE` on 28–32 GiB GPUs) with GPU piece hash-compare and
+    unified `COPY`-queue relay readback.
+- **CPU & Synchronization Scaling:**
+  - Lock-free 3-level radix `PageDir`, flat cold-page `PAGE_READONLY`
+    promotion (`VICTORY_WATCH_COLD=6`), adaptive `VirtualProtect` coalescing,
+    and 128 cache-line-aligned `GUARDS` shards (`GUARD_SHARDS_TABLE`).
+  - Opt-in demand-paged lazy GPU→CPU readback via VEH `PAGE_NOACCESS`
+    (`VICTORY_LAZY_BACK=1`) with batched `COPY`-queue `LazyFetcher`, own-view
+    section merges, adaptive hot promotion, and non-materializing
+    `fill_ahead::wrote` deadlock protection (`1728ee18`).
+  - Default AVX2/SSE2 vectorized in-process copy (`VICTORY_FAST_COPY=0`
+    disables), two-phase parallel `refresh_batch` / `VICTORY_WIDE_FILLS` /
+    `VICTORY_REFRESH_AHEAD`, batched `K32QueryWorkingSetEx`, and byte-range
+    mapping waits (`VICTORY_MAPPING_RANGES=0` disables).
+  - Binary-searched per-send `CardSent` index, coalesced `Shadow::update_busy`
+    uploads with `settle_card_busy` fallback, default `VICTORY_CARD_REHASH_RUNS`,
+    and range-scoped `WHY_STALE` / `WHY_READ` settles (`VICTORY_RANGE_SETTLE=0`
+    disables).
+  - Default `VICTORY_INDIRECT_AMPLIFY` & `VICTORY_INDIRECT_GATHER` (`=0`
+    disables) with conservative per-buffer `GatherGate` invalidation, plus
+    `State::heap_buffers` incremental spans and parallel descriptor sync.
+- **Rendering, Water, Input & Streaming:**
+  - Water readback subresource union (`#1152`), post-readback state restore
+    (`#1170`), Wave32 volumetrics allowlist (`#1248`), `VICTORY_REFLECTION`
+    stand-in, `VICTORY_BVH_NO_HIT`, `VICTORY_NAN_GUARD`, and Wave 1/2 shader
+    translator fixes.
+  - DirectStorage per-worker handles, split `xmem` locks, coalesced page
+    unmaps, XMA audio fixes, playable PC keyboard+mouse controls (`[controls]`),
+    and live on-screen FPS overlay (`VICTORY_FPS_COUNTER=0` disables).
+
+## Building & Running
+
+```powershell
+cargo build --release -p victory --locked
+```
+
+Example PowerShell launch configuration (discrete GPU with ReBAR + lazy
+readback + water reflection fallback):
+
+```powershell
+$env:VICTORY_LAZY_BACK = '1'
+$env:VICTORY_DRIVER_WATCH = '1'
+$env:VICTORY_INDIRECT_WINDOW = '1'
+$env:VICTORY_JOIN_PARTS = '1'
+$env:VICTORY_BACK_OWN_VIEW = '1'
+$env:VICTORY_REBAR = '1'
+$env:VICTORY_RELAY = '2'
+$env:VICTORY_REFLECTION = '0.05,water'
+.\target\release\victory.exe run '<game dir>\game_scarlett_master.exe' --execute
+```
+
+All new optimizations preserve `=0` opt-out environment variables documented at
+their read sites.
+
+---
+
+# victory-gta6 (upstream fork notes)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
 compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
@@ -315,4 +442,3 @@ title's data folder.
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
-"# Corgi-victoryGTA6" 
