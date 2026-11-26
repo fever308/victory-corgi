@@ -29,7 +29,7 @@
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
 //!   address the title sets is the buffer's.
-//! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
+//! * **Vertex fetch** (added 2026-11-23). the title's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
 //!   2_10_10_10 unorm, 8_8_8_8 and 16_16_16_16 uint...) is in the
@@ -799,7 +799,7 @@ pub fn emit_with_hash(
         // above unless asked for (`VICTORY_WAVE_WIDE=1`), since moving programs that did
         // translate to it lost the card (runs 121-124); here only programs that would
         // otherwise not run at all take it. `VICTORY_WAVE_WIDE=0` turns this off too.
-        // (Grand Theft Auto VI's a53a7977fe762268, dispatched twice a frame: its light
+        // (the title's a53a7977fe762268, dispatched twice a frame: its light
         // loops, wave ORs over the lanes' cluster masks, sit in lane branches and needed the
         // two host waves to exchange there; 8 branches taken wave-wide.)
         let wide_last = !wide_on && wide.as_deref().is_none_or(|v| v != "0");
@@ -1029,7 +1029,7 @@ fn emit_program(
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
     // shortcut: older containers fall back to the group's lane count, right
-    // when the HLSL group fills its waves (Grand Theft Auto VI's do).
+    // when the HLSL group fills its waves (the title's do).
     let mesh_stride = match &native.io {
         crate::native::StageIo::Ms(ms) => {
             let psv = c.part(FourCC::PSV0).map(|p| p.data);

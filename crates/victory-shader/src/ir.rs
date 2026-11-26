@@ -399,7 +399,7 @@ fn unspill(
             // M0-relative access names every VGPR from its base up (`effects`), but it
             // reads the register array the compiler indexes, which never holds its
             // SGPR spill VGPR (allocated apart, at the top): only its own operands
-            // count here. (GTA VI's 7f05ddab771799a9: `v_movrels_b32 v36, v67` kept
+            // count here. (the title's 7f05ddab771799a9: `v_movrels_b32 v36, v67` kept
             // v144, its spill VGPR, from being taken apart, and the lane masks parked
             // there then stopped the program as "a lane mask holding lanes elsewhere
             // read as data".)

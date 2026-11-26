@@ -1,7 +1,7 @@
 //! Keyboard and mouse played the way PC games are: keys to pad buttons and
 //! sticks, the mouse to the right stick, mouse buttons to the triggers.
 //!
-//! Grand Theft Auto VI reads gamepads and keyboards only (it registers no
+//! the title reads gamepads and keyboards only (it registers no
 //! mouse), and turns its right stick into a turn rate. Mouse counts are a
 //! distance, so they become a rate when the title reads the pad: the counts
 //! since its last read over the time since then. The camera then turns the
@@ -33,7 +33,7 @@ const FULL_RATE: f64 = 2000.0;
 /// Title reads closer together than this see the same mouse stick.
 const MIN_TAKE_US: u64 = 2_000;
 /// The first read's time span, and the longest one (a title that paused;
-/// Grand Theft Auto VI's world frames take 1-2 s here for now, measured).
+/// the title's world frames take 1-2 s here for now, measured).
 const FIRST_TAKE_US: u64 = 16_667;
 const MAX_TAKE_US: u64 = 1_000_000;
 /// Counts past a full stick wait at most this long (seconds of full stick).
@@ -233,8 +233,8 @@ impl Layout {
     }
 }
 
-/// On foot: GTA's usual PC keys, each on the pad button that does the same
-/// on a console (Grand Theft Auto V's console layout; VI's is unverified).
+/// On foot: standard PC third-person keys, each on the pad button that does the same
+/// on a console (the predecessor's console layout; the current title's is unverified).
 const ON_FOOT: &[(&str, &[&str])] = &[
     ("W", &["LeftUp"]),
     ("S", &["LeftDown"]),

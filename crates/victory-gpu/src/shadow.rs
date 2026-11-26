@@ -6562,8 +6562,8 @@ fn stretch_find_in(
     Some(s.clone())
 }
 
-/// A window on title memory the title shows page by page: Grand Theft Auto
-/// VI maps its streaming heaps one 64 KiB view at a time, every view its
+/// A window on title memory the title shows page by page: the title
+///  maps its streaming heaps one 64 KiB view at a time, every view its
 /// own allocation, which the host cannot open as one heap, though the pages
 /// follow one another in their section (1,200 views for 75 MiB, one stretch
 /// of one section). The stretch is mapped once more, whole, at an address of

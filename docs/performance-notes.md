@@ -1,11 +1,11 @@
-# GTA VI frame rate under VIctory: findings so far (2026-11-25)
+# the title frame rate under VIctory: findings so far (2026-11-25)
 
 Notes from dkdknight's test series, branch `feature/watch-batch` of
 `dkdknight/victory-fork`. Written with the help of an AI assistant (Claude
 Code); every number is from our own runs. No game data is in this
 repository: shader hashes below are only the names the logs print.
 
-Setup: GTA VI (Series X build 1.0.2.1), RTX 5080 (16 GB), Windows 11,
+Setup: the title (Series X title build), RTX 5080 (16 GB), Windows 11,
 display mode 1920x1080, `VICTORY_RELAY=2 VICTORY_LATE_WAIT=3
 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1`. Reference scene: one
 passage of the opening cutscene with about 4,950 draws a frame.

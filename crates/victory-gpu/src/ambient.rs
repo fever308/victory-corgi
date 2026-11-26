@@ -1,6 +1,6 @@
 //! Optional depth-shaded ambient indirect diffuse light fallback.
 //!
-//! Grand Theft Auto VI's indirect diffuse light comes from probes it fills
+//! the title's indirect diffuse light comes from probes it fills
 //! by tracing rays, which do not run here yet: its program that resolves
 //! them (`CS_ScreenProbes_TemporalResolve_*`) leaves next to nothing or
 //! uninitialized memory, and whatever the sun does not reach directly is dark.

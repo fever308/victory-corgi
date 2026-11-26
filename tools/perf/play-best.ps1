@@ -1,15 +1,15 @@
-# Launch GTA VI with the best settings found so far (2026-11-25, branch
+# Launch the title with the best settings found so far (2026-11-25, branch
 # feature/watch-batch of dkdknight/victory-fork): about 6.5 fps with the full
 # picture in the opening cutscene on an RTX 5080, against about 3.5 before.
-#   powershell -ExecutionPolicy Bypass -File "G:\GTA VI\tools\play-best.ps1"
-# The log goes to G:\GTA VI\profiles\best-run.log.
+#   powershell -ExecutionPolicy Bypass -File "<work>\tools\play-best.ps1"
+# The log goes to <work>\profiles\best-run.log.
 
-$out = 'G:\GTA VI\profiles'
+$out = '<work>\profiles'
 New-Item -ItemType Directory -Force $out | Out-Null
-Set-Location 'G:\GTA VI\victory-gta6'
+Set-Location '<repo>'
 
 # As before this series.
-$env:VICTORY_CONFIG = 'G:\GTA VI\victory-gta6\victory.toml'
+$env:VICTORY_CONFIG = '<repo>\victory.toml'
 $env:VICTORY_DISPLAY_MODE = '1920x1080'
 $env:VICTORY_RELAY = '2'
 $env:VICTORY_LATE_WAIT = '3'
@@ -40,4 +40,4 @@ $env:VICTORY_CLAMP_WAIT = 'auto'
 $env:VICTORY_CARD_REHASH_RUNS = '1'
 $env:VICTORY_JOIN_COPIES = '1'
 
-& '.\target\release\victory-best.exe' run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> "$out\best-run.log"
+& '.\target\release\victory-best.exe' run '<title dir>\title.exe' --execute --console series-x *> "$out\best-run.log"

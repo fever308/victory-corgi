@@ -296,7 +296,7 @@ struct Views {
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
     /// The same views by what they show: (section, offset, address) to
-    /// bytes. Pages can show at two addresses at once (Grand Theft Auto VI
+    /// bytes. Pages can show at two addresses at once (the title
     /// fills pages through a pool view, then has the GPU map them into its
     /// tiled heap, `map_alias`), and a write through one address does not
     /// fault in a guard on the other ([`aliases`]).

@@ -3,12 +3,12 @@
 A performance, memory-lifetime, and water-rendering fork of
 [Corgansm/victory-corgi](https://github.com/Corgansm/victory-corgi) (which itself
 builds on [Marvisak/VIctory](https://github.com/Marvisak/VIctory)), running the
-Xbox Series build of Grand Theft Auto VI natively on Windows from files the user
+Xbox Series build of the title natively on Windows from files the user
 supplies.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive. Licensed **GPL-3.0-or-later**, matching upstream
+copy of the game. It is not affiliated with or endorsed by any game publisher or
+rights holder. Licensed **GPL-3.0-or-later**, matching upstream
 [VIctory](https://github.com/Marvisak/VIctory).
 
 ## Credits & Upstream Attribution
@@ -117,7 +117,7 @@ $env:VICTORY_BACK_OWN_VIEW = '1'
 $env:VICTORY_REBAR = '1'
 $env:VICTORY_RELAY = '2'
 $env:VICTORY_REFLECTION = '0.05,water'
-.\target\release\victory.exe run '<game dir>\game_scarlett_master.exe' --execute
+.\target\release\victory.exe run '<game dir>\title.exe' --execute
 ```
 
 All new optimizations preserve `=0` opt-out environment variables documented at
@@ -125,17 +125,17 @@ their read sites.
 
 ---
 
-# victory-gta6 (upstream fork notes)
+# victory-fork (upstream fork notes)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
+compatibility layer that runs Xbox Series title binaries
 natively on Windows from files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive.
+copy of the game. It is not affiliated with or endorsed by any game publisher or
+rights holder.
 
 ## Credits
 
@@ -296,7 +296,7 @@ status section describes upstream, not this fork.
 
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+Runs Xbox Series X|S titles natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies

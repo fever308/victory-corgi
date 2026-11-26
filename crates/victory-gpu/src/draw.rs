@@ -173,7 +173,7 @@ const WINDOW_MOST: u64 = 64;
 ///
 /// The step is the one the title is seen to take, not the stride its
 /// command signature names: it draws one record a call, for which the
-/// stride means nothing, and Grand Theft Auto VI names 12 bytes (the three
+/// stride means nothing, and the title names 12 bytes (the three
 /// words of a mesh dispatch) for records it keeps 32 bytes apart (2,173 of
 /// a frame's 3,349 mesh records in run 87's listed frame; 283 are 16
 /// apart, which ends a window). Walked by the named stride the window
@@ -630,7 +630,7 @@ fn heap_buffers_full() -> bool {
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
-/// they are all widened to the whole target. Grand Theft Auto VI's room at
+/// they are all widened to the whole target. the title's room at
 /// the start of the prologue lost its walls in five runs of seven, and in
 /// those runs the player's body and the world outside were cut by one
 /// rectangle around the window (run 85, frame 2046): one run with this on
@@ -3462,7 +3462,7 @@ impl State {
             let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
             let _ = write!(text, " targets {targets:?} depth {:?} state [{}]", described(self.depth), p.state);
             // The title's scissor and viewport at this draw (the first of
-            // each): Grand Theft Auto VI draws what it sees through a
+            // each): the title draws what it sees through a
             // portal (a window, from inside a room) under the portal's
             // rectangle, and the listing did not say which draws those are.
             if self.scissors.len() > 1 {
@@ -4448,7 +4448,7 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
-        // Indirect rectangles (Grand Theft Auto VI's tiled lighting, 256
+        // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
         // arguments stay the title's, three vertices a rectangle. They

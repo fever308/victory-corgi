@@ -1276,8 +1276,8 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 /// second row. An element that shares a register behind another one (the
 /// signature packs a short element into the free columns of an earlier
 /// register) is NOT in that row's halves: it follows in the first
-/// parameter, in row order, that has whole dwords left. Grand Theft Auto
-/// VI's packed pedestrian shaders show both cases: TEXCOORD7 (register 1,
+/// parameter, in row order, that has whole dwords left. the title's
+///  packed pedestrian shaders show both cases: TEXCOORD7 (register 1,
 /// columns 2-3, behind the two columns of TEXCOORD0) is exported in dword 3
 /// of parameter 0, after TEXCOORD1's two dwords; TEXCOORD6 (register 4,
 /// column 3, behind the three columns of TEXCOORD4) in dword 3 of
@@ -6400,8 +6400,8 @@ impl<'a> Lower<'a> {
         // heap holds a buffer view there, not a constant buffer: read as
         // raw bytes, as a table's SRV is below. Read as a constant buffer
         // (the host's validation: "Descriptor Type in Heap: SRV, Register
-        // Type: CBV", heap index 17) the loads gave nothing: Grand Theft
-        // Auto VI's meshlet culling (BatchCullMeshlets,
+        // Type: CBV", heap index 17) the loads gave nothing: the title's
+        //  meshlet culling (BatchCullMeshlets,
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
@@ -8407,7 +8407,7 @@ impl<'a> Lower<'a> {
                 let old = match inst.read(Reg::V(reg)) {
                     // A register last written by the first half of an interpolation, which
                     // has no value of its own (its second half takes the pair): the half
-                    // kept is one no program reads (GTA VI's 38bf0814e721a1b3 and
+                    // kept is one no program reads (the title's 38bf0814e721a1b3 and
                     // 78f3f2fc53a69531: `v_fma_mixlo_f16 v8, ...` over a `v_interp_p1ll_f16 v8`).
                     Some(o) if self.first_half_result(o) => match self.i32_of(o) {
                         Ok(x) => x,
@@ -11219,8 +11219,8 @@ impl<'a> Lower<'a> {
                         // are read at the level instead, in the gather's
                         // order: (u0,v1) (u1,v1) (u1,v0) (u0,v0).
                         // With an offset too (`image_gather4_l_o`): the
-                        // offset is in texels of that level. Grand Theft
-                        // Auto VI's meshlet culling takes a 4x4 block of
+                        // offset is in texels of that level. the title's
+                        //  meshlet culling takes a 4x4 block of
                         // the pyramid as one gather and three offset ones
                         // ((2,0), (0,2), (2,2)); the three read level 0,
                         // two texels beside the first one's place, so a
@@ -12711,7 +12711,7 @@ mod tests {
         assert_eq!(p.get(&5), None);
     }
 
-    /// The packed pedestrian layouts of Grand Theft Auto VI: an element
+    /// The packed pedestrian layouts of the title: an element
     /// behind another one in its register follows in the first parameter
     /// with a dword left, and is not a half of its register's row.
     #[test]

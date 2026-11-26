@@ -150,7 +150,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             budget.InterlockedMax(20, g.x, seen);
         }
         // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (Grand Theft Auto VI leaves all
+        // slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
         // (As rows, a record runs up to the 2^22 groups of a host dispatch:
         // past that it is such a slot.)

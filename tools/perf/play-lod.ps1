@@ -1,11 +1,11 @@
-# Launch GTA VI on branch feature/levels-on-demand (feature/watch-batch with
+# Launch the title on branch feature/levels-on-demand (feature/watch-batch with
 # origin/main merged in, plus fxceless/victory-fork PR #795): the same settings
 # as play-best.ps1, plus levels on demand (only the mip levels the title has
 # loaded take card memory).
-#   powershell -ExecutionPolicy Bypass -File "G:\GTA VI\tools\play-lod.ps1"
+#   powershell -ExecutionPolicy Bypass -File "<work>\tools\play-lod.ps1"
 #   ... -NoLod       same build, levels on demand off (A/B against it)
 #   ... -Diag        diagnostics build: memory lines every few seconds
-# Log: G:\GTA VI\profiles\lod-run.log (lod-off-run.log with -NoLod).
+# Log: <work>\profiles\lod-run.log (lod-off-run.log with -NoLod).
 #
 # First launch: the shader cache is now keyed on the translator itself
 # (upstream), not on VICTORY_SHADER_CACHE_KEY: every shader is translated
@@ -15,14 +15,14 @@
 # they held 4.3 GB of the card's 16 GB.
 param([switch]$NoLod, [switch]$Diag)
 
-$out = 'G:\GTA VI\profiles'
+$out = '<work>\profiles'
 New-Item -ItemType Directory -Force $out | Out-Null
-Set-Location 'G:\GTA VI\victory-gta6'
+Set-Location '<repo>'
 
 # Own cache directory (victory-lod-data): the pipeline library of the older
 # builds held pipelines under the same names without the depth bounds test,
 # and runs that read it lost textures and lighting.
-$env:VICTORY_CONFIG = 'G:\GTA VI\victory-gta6\victory-lod.toml'
+$env:VICTORY_CONFIG = '<repo>\victory-lod.toml'
 $env:VICTORY_DISPLAY_MODE = '1920x1080'
 $env:VICTORY_RELAY = '2'
 $env:VICTORY_LATE_WAIT = '3'
@@ -57,9 +57,9 @@ if ($NoLod) {
 }
 
 if ($Diag) {
-    $exe = 'G:\GTA VI\victory-gta6\target\diag\release\victory-lod-diag.exe'
+    $exe = '<repo>\target\diag\release\victory-lod-diag.exe'
 } else {
-    $exe = 'G:\GTA VI\victory-gta6\target\release\victory-lod.exe'
+    $exe = '<repo>\target\release\victory-lod.exe'
 }
 
-& $exe run 'G:\GTA VI\GTA61.0.2.1\game_scarlett_master.exe' --execute --console series-x *> $log
+& $exe run '<title dir>\title.exe' --execute --console series-x *> $log

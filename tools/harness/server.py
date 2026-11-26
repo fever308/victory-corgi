@@ -33,7 +33,7 @@ parser = argparse.ArgumentParser(description="victory-harness MCP server")
 parser.add_argument("--repo", default=r"C:\Users\Corgan\Desktop\victory-corgi", help="VIctory source tree")
 parser.add_argument(
     "--game-exe",
-    default=r"D:\GTA 6 Xbox Build\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe",
+    default=r"C:\path\to\title\title.exe",
     help="title executable passed to 'victory run'",
 )
 parser.add_argument("--work", default=str(Path(__file__).resolve().parent), help="folder for run logs and captures")

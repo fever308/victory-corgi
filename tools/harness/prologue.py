@@ -7,7 +7,7 @@ Used two ways:
 * on its own, from a console:
 
       python prologue.py --repo C:\\Users\\Corgan\\Desktop\\victory-corgi ^
-          --game-exe "D:\\...\\game_scarlett_master.exe" --work C:\\Users\\Corgan\\victory-mcp --preset lod
+          --game-exe "D:\\...\\title.exe" --work C:\\Users\\Corgan\\victory-mcp --preset lod
 
     python prologue.py --game-exe "<exe>" --attach     (follow the run the harness launched)
 
@@ -81,7 +81,7 @@ PRESET_CACHE = {"lod": "cache-lod"}
 #   cutscene_wait    seconds of frames at or above cutscene_draws with no loading screen after a hold
 #                    before they are taken for the world (a launch that has no cutscene to skip)
 #
-# "first-run" (recorded 2026-11-25, build 1.0.2.1): start screen (A) -> opening video (A skips) ->
+# "first-run" (recorded 2026-11-25, tested build): start screen (A) -> opening video (A skips) ->
 # Subtitles (A) -> Brightness (A) -> Finish Setup (A) -> Legal Notices (each notice read for a few
 # seconds: Down, Down, Down, A on Next) -> Legal Terms & Policies (A on each box, Down, A on Confirm;
 # the user said to accept them) -> loading -> cutscene (hold A) -> loading -> the world.

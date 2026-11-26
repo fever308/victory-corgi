@@ -8,16 +8,16 @@ for i in $(seq 1 400); do
   [ $((i % 10)) -eq 0 ] && echo "$(date +%H:%M:%S) $(echo "$last" | tail -1)"
   if [ "$ok" -ge 4 ]; then
     echo "TRIGGER at $(date +%H:%M:%S)"
-    : > "G:/GTA VI/profiles/pix-trigger.txt"
+    : > "<work>/profiles/pix-trigger.txt"
     for k in $(seq 1 100); do
       sleep 5
       if ! tasklist //FI "IMAGENAME eq $exe.exe" 2>/dev/null | grep -qi "$exe"; then echo "GAME EXITED after $((k*5)) s"; break; fi
-      f=$(ls -t "G:/GTA VI/profiles/"capture-*.wpix 2>/dev/null | head -1)
+      f=$(ls -t "<work>/profiles/"capture-*.wpix 2>/dev/null | head -1)
       if [ -n "$f" ] && [ $k -ge 8 ]; then age=$(( $(date +%s) - $(stat -c %Y "$f") )); if [ $age -ge 40 ]; then echo "FILE QUIET after $((k*5)) s: $(stat -c %s "$f") bytes"; break; fi; fi
     done
     python -I joinlog.py $log $j 2>/dev/null
     grep -a -i "PIX capture\|first-chance\|parked" $j | tail -4 | cut -c1-200
-    ls -la "G:/GTA VI/profiles/" | grep wpix
+    ls -la "<work>/profiles/" | grep wpix
     exit 0
   fi
 done

@@ -74,7 +74,7 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// dispatch of more than 65,535 groups the host runs as rows of that many
 /// (`x` by `y`), and the last group the console asked for. The console's
 /// mesh dispatches are one-dimensional and may ask for more groups than a
-/// host dimension holds (Grand Theft Auto VI's meshlet lists: up to 112,665).
+/// host dimension holds (the title's meshlet lists: up to 112,665).
 /// A row width of 0: the dispatch is the console's, one row. The groups of
 /// the last row past the count run as the last group (the same meshlet drawn
 /// again: no new pixels).
