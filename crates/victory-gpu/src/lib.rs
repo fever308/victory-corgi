@@ -61,6 +61,8 @@ pub mod query;
 pub mod queue;
 #[cfg(windows)]
 mod reflection;
+#[cfg(windows)]
+pub(crate) mod retire;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -80,6 +82,8 @@ mod texback;
 mod texdebug;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
+mod upload_pool;
 #[cfg(windows)]
 mod watch;
 

@@ -179,174 +179,12 @@ unsafe impl Sync for Host {}
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Warn once when pinned epochs hold back this many retired host objects
-/// (for example, an unreset command list or a submission stalled behind an
-/// unsignalled fence).
-const RETIRED_WARN_THRESHOLD: usize = 4096;
-
-/// Monotonic sequence bumped whenever a tracked host resource (`HostTexture`,
-/// `Shadow`, `Staging`) is created. Starts at 1 so `0` means "unbounded /
-/// existed before any sequence" (used by legacy [`retire`]).
-static RESOURCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Returns a strictly increasing birth sequence for a newly allocated host
-/// resource. Active command lists whose last recorded command occurred before
-/// this sequence cannot reference the resource and do not block its release.
-pub(crate) fn birth_seq() -> u64 {
-    RESOURCE_SEQ.fetch_add(1, Ordering::SeqCst) + 1
-}
-
-/// Sentinel work sequence shared by active [`Host::execute`] submissions so
-/// any object retired while the GPU is executing stays alive until execution
-/// finishes.
-fn exec_work_seq() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-    static SEQ: OnceLock<std::sync::Arc<std::sync::atomic::AtomicU64>> = OnceLock::new();
-    SEQ.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)))
-        .clone()
-}
-
-struct ActiveEpoch {
-    /// Highest [`RESOURCE_SEQ`] observed when this epoch's owner recorded work
-    /// (or `u64::MAX` for an active [`Host::execute`] submission).
-    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Slab indices in [`RetireState::retired`] waiting on this epoch.
-    waiting: Vec<usize>,
-}
-
-struct RetiredEntry {
-    remaining: usize,
-    object: Option<Retired>,
-}
-
-/// Host objects the title let go of while an open list or a queued/running
-/// submission may still use them (a texture its descriptors name, a descriptor
-/// slot's old resource, a buffer shadow, or texture staging). The title's
-/// descriptor writes and releases reach the host at once, from its own threads,
-/// while lists are recorded or submissions run for most of a second in the
-/// world: freeing there was a GPU page fault on the freed texture
-/// (DXGI_ERROR_DEVICE_HUNG, 2026-11-24, RX 7600).
-///
-/// Each retired object tracks only the specific active epochs whose recorded
-/// `work_seq` is at or after the object's `born_seq` (or all active epochs when
-/// `born_seq == 0`). When an epoch finishes, only the objects waiting on it
-/// decrement their blocker count and drop when it hits zero — avoiding global
-/// head-of-line blocking when an older unreset list or stalled wait stays
-/// pinned while newer resources are created and freed.
-///
-/// Lock invariant: `RETIRE_STATE` is a strict leaf lock — never lock anything
-/// else while holding it, and ALWAYS drop retired objects AFTER releasing it.
-struct RetireState {
-    next_epoch: u64,
-    active_epochs: std::collections::BTreeMap<u64, ActiveEpoch>,
-    retired: Vec<Option<RetiredEntry>>,
-    free_slots: Vec<usize>,
-    pending_count: usize,
-    warned: bool,
-}
-
-impl RetireState {
-    const fn new() -> Self {
-        Self {
-            next_epoch: 1,
-            active_epochs: std::collections::BTreeMap::new(),
-            retired: Vec::new(),
-            free_slots: Vec::new(),
-            pending_count: 0,
-            warned: false,
-        }
-    }
-}
-
-static RETIRE_STATE: Mutex<RetireState> = Mutex::new(RetireState::new());
-
-/// Live retirement telemetry: `(pending_objects, active_epochs, oldest_epoch)`.
-fn retire_stats() -> (usize, usize, u64) {
-    let state = RETIRE_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let oldest = state.active_epochs.keys().next().copied().unwrap_or(0);
-    (state.pending_count, state.active_epochs.len(), oldest)
-}
-
-/// RAII guard pinning an active GPU execution epoch until the submission
-/// finishes (or lands, for `late` flights).
-struct ExecEpochGuard {
-    #[cfg(test)]
-    scope: Option<std::sync::Arc<Mutex<RetireState>>>,
-    epoch: u64,
-}
-
-impl Drop for ExecEpochGuard {
-    fn drop(&mut self) {
-        #[cfg(test)]
-        if let Some(scope) = self.scope.as_deref() {
-            release_epoch_in(scope, self.epoch);
-            return;
-        }
-        release_epoch_in(&RETIRE_STATE, self.epoch);
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static RETIRE_SCOPE: std::cell::RefCell<Option<std::sync::Arc<Mutex<RetireState>>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct RetireTestScope {
-    prev: Option<std::sync::Arc<Mutex<RetireState>>>,
-}
-
-#[cfg(test)]
-impl Drop for RetireTestScope {
-    fn drop(&mut self) {
-        RETIRE_SCOPE.with(|cell| *cell.borrow_mut() = self.prev.take());
-    }
-}
-
-#[cfg(test)]
-fn current_retire_scope() -> Option<std::sync::Arc<Mutex<RetireState>>> {
-    RETIRE_SCOPE.with(|cell| cell.borrow().clone())
-}
-
-/// Isolates retirement epochs and queued drops on the current test thread (and
-/// any `HostList` created or acquired on it) from concurrent GPU tests.
-#[cfg(test)]
-pub(crate) fn isolated_retire_scope() -> RetireTestScope {
-    let fresh = std::sync::Arc::new(Mutex::new(RetireState::new()));
-    let prev = RETIRE_SCOPE.with(|cell| cell.borrow_mut().replace(fresh));
-    RetireTestScope { prev }
-}
-
-/// A retired object, dropped on whatever thread finishes its last blocking
-/// epoch.
-struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
-// SAFETY: what is retired is D3D12 objects (free-threaded) and the
-// reference-counted wrappers holding them, dropped once.
-unsafe impl Send for Retired {}
+pub(crate) use crate::retire::*;
 
 /// Milliseconds since the first call.
 pub(crate) fn now_ms() -> u64 {
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
-}
-
-/// Acquires a monotonically increasing epoch (never 0) that keeps retired
-/// objects alive until [`release_epoch_in`] is called with it.
-fn acquire_epoch_in(
-    retire_state: &Mutex<RetireState>,
-    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
-) -> u64 {
-    let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-    let e = state.next_epoch;
-    state.next_epoch += 1;
-    state.active_epochs.insert(
-        e,
-        ActiveEpoch {
-            work_seq,
-            waiting: Vec::new(),
-        },
-    );
-    e
 }
 
 /// This moment, for telling later how long ago it was ([`long_ago`]): the
@@ -464,139 +302,6 @@ fn sweep() {
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
     crate::tiles::give_back_let_go();
-}
-
-/// Releases `epoch` and drops every retired object whose last blocking epoch
-/// was `epoch` (outside `retire_state`).
-fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
-    let done: Vec<Retired> = {
-        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(active) = state.active_epochs.remove(&epoch) else {
-            return;
-        };
-        let mut done = Vec::new();
-        for idx in active.waiting {
-            if let Some(entry) = state.retired.get_mut(idx).and_then(Option::as_mut) {
-                entry.remaining -= 1;
-                if entry.remaining == 0 {
-                    if let Some(obj) = entry.object.take() {
-                        done.push(obj);
-                    }
-                    state.retired[idx] = None;
-                    state.free_slots.push(idx);
-                    state.pending_count = state.pending_count.saturating_sub(1);
-                }
-            }
-        }
-        done
-    };
-    drop(done);
-}
-
-/// Objects [`retire_born`] dropped at once (no blocking epoch was active) and
-/// kept until their blocking epochs finished, since the start.
-static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
-
-fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T, born_seq: u64) {
-    // Pair with `work_seq` `SeqCst` stores/RMWs in `HostList::mark_work` and
-    // `RESOURCE_SEQ` `SeqCst` increments in `birth_seq`.
-    std::sync::atomic::fence(Ordering::SeqCst);
-    let warn = {
-        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = state.free_slots.pop().unwrap_or(state.retired.len());
-        let mut blockers = 0usize;
-        for entry in state.active_epochs.values_mut() {
-            if born_seq == 0 || entry.work_seq.load(Ordering::SeqCst) >= born_seq {
-                entry.waiting.push(slot);
-                blockers += 1;
-            }
-        }
-        if blockers == 0 {
-            if slot < state.retired.len() {
-                state.free_slots.push(slot);
-            }
-            drop(state);
-            RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-            drop(object);
-            return;
-        }
-        let item = Some(RetiredEntry {
-            remaining: blockers,
-            object: Some(Retired(Box::new(object))),
-        });
-        if slot == state.retired.len() {
-            state.retired.push(item);
-        } else {
-            state.retired[slot] = item;
-        }
-        state.pending_count += 1;
-        RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-        if !state.warned && state.pending_count >= RETIRED_WARN_THRESHOLD {
-            state.warned = true;
-            let (oldest_epoch, oldest_work_seq) = state
-                .active_epochs
-                .iter()
-                .next()
-                .map_or((0, 0), |(&e, entry)| {
-                    (e, entry.work_seq.load(Ordering::Relaxed))
-                });
-            Some((
-                state.pending_count,
-                oldest_epoch,
-                oldest_work_seq,
-                RESOURCE_SEQ.load(Ordering::Relaxed),
-                state.active_epochs.len(),
-                state.next_epoch.saturating_sub(1),
-            ))
-        } else {
-            None
-        }
-    };
-    if let Some((
-        pending,
-        oldest_epoch,
-        oldest_work_seq,
-        current_seq,
-        active_epochs,
-        latest_epoch,
-    )) = warn
-    {
-        tracing::warn!(
-            pending,
-            oldest_epoch,
-            oldest_work_seq,
-            current_seq,
-            active_epochs,
-            latest_epoch,
-            "retired host resource queue grew past threshold; an unreset command list or stalled wait may be pinning epochs"
-        );
-    }
-}
-
-/// Drops `object` once every active epoch that could have observed a resource
-/// born at `born_seq` (`work_seq >= born_seq`, or all active epochs when
-/// `born_seq == 0`) has finished: at once if none matches.
-pub(crate) fn retire_born<T: 'static>(object: T, born_seq: u64) {
-    #[cfg(test)]
-    if let Some(scope) = current_retire_scope() {
-        retire_in(&scope, object, born_seq);
-        return;
-    }
-    retire_in(&RETIRE_STATE, object, born_seq);
-}
-
-/// Drops `object` once every currently executing [`Host::execute`] submission
-/// (`work_seq == u64::MAX`) has finished: at once if none is executing.
-/// Avoids bumping global [`RESOURCE_SEQ`] when retiring overwritten or released
-/// descriptor-heap references that newly recorded lists cannot observe.
-pub(crate) fn retire_executing<T: 'static>(object: T) {
-    retire_born(object, u64::MAX);
-}
-
-/// Drops `object` once every epoch active now has finished: at once if none is.
-#[cfg(test)]
-pub(crate) fn retire<T: 'static>(object: T) {
-    retire_born(object, 0);
 }
 
 /// What the layer did to the host's objects lately, newest last (sweeps
@@ -4009,6 +3714,10 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether the `victory-late-wait` helper thread is running and draining `land()`.
+static LATE_HELPER_ALIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -4025,11 +3734,13 @@ fn land() {
 /// see it.
 fn late_helper() {
     let Some(host) = host() else {
+        LATE_HELPER_ALIVE.store(false, Ordering::Release);
         return;
     };
     keep_on_fast_cores("victory-late-wait");
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+        LATE_HELPER_ALIVE.store(false, Ordering::Release);
         tracing::warn!("no event for the thread that settles submissions sent ahead");
         return;
     };
@@ -4037,7 +3748,7 @@ fn late_helper() {
         let target = {
             let mut line = line();
             loop {
-                if line.poke {
+                if line.poke || !line.landed.is_empty() {
                     line.poke = false;
                     break None;
                 }
@@ -4081,8 +3792,9 @@ fn late_helper() {
 fn late_threads() {
     static HELPER: std::sync::Once = std::sync::Once::new();
     HELPER.call_once(|| {
-        if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
-            tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
+        match std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
+            Ok(_) => LATE_HELPER_ALIVE.store(true, Ordering::Release),
+            Err(e) => tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow"),
         }
         tracing::info!(
             most = late_most(),
@@ -6284,7 +5996,23 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        land();
+        if !LATE_HELPER_ALIVE.load(Ordering::Acquire) {
+            land();
+        } else {
+            let pending = {
+                let mut l = line();
+                let n = l.landed.len();
+                if n > 0 && !l.poke {
+                    l.poke = true;
+                    LINE_MOVED.notify_one();
+                }
+                n
+            };
+            // Backpressure safety valve if `victory-late-wait` ever falls far behind.
+            if pending >= 32 {
+                land();
+            }
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a

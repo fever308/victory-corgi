@@ -409,7 +409,7 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
 /// Host resource kept alive by a descriptor heap slot. Shadows are held via
 /// `Arc<Shadow>` so loose-shadow LRU eviction never evicts a window still
 /// referenced by a live descriptor slot.
-enum KeptObject {
+pub(crate) enum KeptObject {
     Resource(#[allow(dead_code)] ID3D12Resource),
     Shadow(#[allow(dead_code)] Arc<Shadow>),
 }
@@ -431,6 +431,154 @@ impl KeptObject {
             Self::Resource(r) => r,
             Self::Shadow(s) => &s.buffer,
         }
+    }
+}
+
+const KEPT_PAGE_SHIFT: usize = 6;
+const KEPT_PAGE_SIZE: usize = 1 << KEPT_PAGE_SHIFT;
+const KEPT_PAGE_MASK: usize = KEPT_PAGE_SIZE - 1;
+
+struct KeptPageSlot {
+    /// Bit `i` is set iff slot `i` in this 64-slot page currently holds a
+    /// [`KeptObject`]. Mutated under `page` lock (`Release`) and queried
+    /// lock-free (`Acquire`) to skip empty slots and empty ranges.
+    occupied: std::sync::atomic::AtomicU64,
+    page: Mutex<Option<Box<[Option<KeptObject>; KEPT_PAGE_SIZE]>>>,
+}
+
+impl KeptPageSlot {
+    fn new() -> Self {
+        Self {
+            occupied: std::sync::atomic::AtomicU64::new(0),
+            page: Mutex::new(None),
+        }
+    }
+}
+
+/// Two-level, lock-free-bitmask paged table mapping heap slot indices
+/// `0..total_slots` to their retained [`KeptObject`]s.
+///
+/// Replaces `HashMap<u32, KeptObject, RandomState>` with O(1) array indexing,
+/// zero SipHash overhead, zero steady-state reallocations, per-64-slot-page
+/// fine-grained locks, and lock-free skipping of empty slots and ranges.
+struct KeptTable {
+    pages: Vec<KeptPageSlot>,
+}
+
+impl KeptTable {
+    fn new(total_slots: usize) -> Self {
+        let count = total_slots.div_ceil(KEPT_PAGE_SIZE);
+        Self {
+            pages: (0..count).map(|_| KeptPageSlot::new()).collect(),
+        }
+    }
+
+    fn contains(&self, index: u32) -> bool {
+        let idx = index as usize;
+        let Some(slot) = self.pages.get(idx >> KEPT_PAGE_SHIFT) else {
+            return false;
+        };
+        let bit = 1u64 << (idx & KEPT_PAGE_MASK);
+        slot.occupied.load(std::sync::atomic::Ordering::Acquire) & bit != 0
+    }
+
+    /// Replaces slot `index` with `entry` (returning any displaced
+    /// [`KeptObject`]). Returns `None` without touching the slot if both old
+    /// and new are identical (`same_as`) or if clearing an already-empty slot.
+    fn swap(&self, index: u32, entry: Option<KeptObject>) -> Option<KeptObject> {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        let idx = index as usize;
+        let slot = self.pages.get(idx >> KEPT_PAGE_SHIFT)?;
+        let local = idx & KEPT_PAGE_MASK;
+        let bit = 1u64 << local;
+        if entry.is_none() && slot.occupied.load(Acquire) & bit == 0 {
+            return None;
+        }
+        let mut guard = slot.page.lock().unwrap_or_else(|e| e.into_inner());
+        match entry {
+            Some(new) => {
+                let page = guard.get_or_insert_with(|| Box::new([const { None }; KEPT_PAGE_SIZE]));
+                if let Some(old) = page[local].as_ref()
+                    && new.same_as(old)
+                {
+                    return None;
+                }
+                let old = page[local].replace(new);
+                let occ = slot.occupied.load(Relaxed);
+                if occ & bit == 0 {
+                    slot.occupied.store(occ | bit, Release);
+                }
+                old
+            }
+            None => {
+                let occ = slot.occupied.load(Relaxed);
+                if occ & bit == 0 {
+                    return None;
+                }
+                let old = guard.as_mut().and_then(|page| page[local].take());
+                slot.occupied.store(occ & !bit, Release);
+                old
+            }
+        }
+    }
+
+    /// Removes and appends to `out` every [`KeptObject`] in `[start, end)`.
+    fn take_range(&self, start: u32, end: u32, out: &mut Vec<KeptObject>) {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        if start >= end || self.pages.is_empty() {
+            return;
+        }
+        let start = start as usize;
+        let end = end as usize;
+        let first_page = start >> KEPT_PAGE_SHIFT;
+        let last_page = ((end - 1) >> KEPT_PAGE_SHIFT).min(self.pages.len() - 1);
+        for page_idx in first_page..=last_page {
+            let slot = &self.pages[page_idx];
+            let page_base = page_idx << KEPT_PAGE_SHIFT;
+            let lo = start.saturating_sub(page_base);
+            let hi = (end - page_base).min(KEPT_PAGE_SIZE);
+            let width = hi - lo;
+            let mask = if width == KEPT_PAGE_SIZE {
+                u64::MAX
+            } else {
+                ((1u64 << width) - 1) << lo
+            };
+            if slot.occupied.load(Acquire) & mask == 0 {
+                continue;
+            }
+            let mut guard = slot.page.lock().unwrap_or_else(|e| e.into_inner());
+            let occ = slot.occupied.load(Relaxed);
+            let mut bits = occ & mask;
+            if bits == 0 {
+                continue;
+            }
+            if let Some(page) = guard.as_mut() {
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if let Some(old) = page[b].take() {
+                        out.push(old);
+                    }
+                }
+            }
+            slot.occupied.store(occ & !mask, Release);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
+        let idx = index as usize;
+        let slot = self.pages.get(idx >> KEPT_PAGE_SHIFT)?;
+        let local = idx & KEPT_PAGE_MASK;
+        if slot.occupied.load(std::sync::atomic::Ordering::Acquire) & (1u64 << local) == 0 {
+            return None;
+        }
+        let guard = slot.page.lock().unwrap_or_else(|e| e.into_inner());
+        let shown = guard.as_ref()?[local].as_ref()?;
+        Some(
+            windows::core::Interface::as_raw(shown.as_resource())
+                == windows::core::Interface::as_raw(buffer),
+        )
     }
 }
 
@@ -463,9 +611,9 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    /// (In `KEPT_SHARDS` parts by slot number, each under a lock of its
-    /// own: five recording threads make slots at once.)
-    kept: Vec<Mutex<std::collections::HashMap<u32, KeptObject>>>,
+    /// Stored in a 2-level 64-slot paged table with per-page lock-free
+    /// occupancy bitmasks.
+    kept: KeptTable,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -538,7 +686,6 @@ pub(crate) struct HostHeap {
 
 const NOTED_PLACED: u8 = 1 << 1;
 const NOTED_TEXTURE: u8 = 1 << 2;
-const NOTED_KEPT: u8 = 1 << 3;
 const NOTED_MARK: u8 = 1 << 4;
 
 /// Mode flags for [`HostHeap::mirror_resolved_in`].
@@ -1658,7 +1805,7 @@ impl HostHeap {
             made: Made::new(count as usize),
             fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(CopiedState::default()),
-            kept: (0..KEPT_SHARDS).map(|_| Mutex::new(std::collections::HashMap::new())).collect(),
+            kept: KeptTable::new(size as usize),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2175,11 +2322,7 @@ impl HostHeap {
             return false;
         }
         let _made = self.made.lock(index);
-        self.made.get(index) == Some(key)
-            && self.kept[index as usize % KEPT_SHARDS]
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains_key(&index)
+        self.made.get(index) == Some(key) && self.kept.contains(index)
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -2261,6 +2404,7 @@ impl HostHeap {
             starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
         };
         let mut remade = 0;
+        let mut retired = Vec::new();
         for slot in slots {
             let _made = self.made.lock(slot);
             let Some(key) = self.made.get(slot).filter(|&key| key != 0) else {
@@ -2271,10 +2415,11 @@ impl HostHeap {
             };
             if let Some(kept) = make(&view, self.at(slot)) {
                 self.put(slot);
-                self.keep(slot, kept);
+                self.keep_into(slot, kept, &mut retired);
                 remade += 1;
             }
         }
+        crate::host::retire_executing_batch(retired);
         remade
     }
 
@@ -2295,6 +2440,12 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held. Under its shard lock ([`Made`]).
     fn unmake(&self, index: u32) {
+        let mut retired = Vec::new();
+        self.unmake_into(index, &mut retired);
+        crate::host::retire_executing_batch(retired);
+    }
+
+    fn unmake_into(&self, index: u32, retired: &mut Vec<KeptObject>) {
         let Some(key) = self.made.get(index) else {
             return;
         };
@@ -2315,23 +2466,34 @@ impl HostHeap {
         };
         self.put(index);
         self.made.set_null_kind(index, kind);
-        self.keep(index, Kept::Empty);
+        self.keep_into(index, Kept::Empty, retired);
         self.set_mark(index, None);
     }
 
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
     /// what they were made from then, become null. Called after releasing slot
     /// `index`'s shard lock so no two shard locks are ever held together.
-    fn unmake_stale(&self, index: u32, stale: Vec<(u32, u64)>) {
+    fn unmake_stale_into(
+        &self,
+        index: u32,
+        stale: Vec<(u32, u64)>,
+        retired: Option<&mut Vec<KeptObject>>,
+    ) {
+        if stale.is_empty() {
+            return;
+        }
+        let mut local = Vec::new();
+        let out = retired.unwrap_or(&mut local);
         for (slot, key) in stale {
             if slot == index || key == 0 {
                 continue;
             }
             let _made = self.made.lock(slot);
             if self.made.get(slot) == Some(key) {
-                self.unmake(slot);
+                self.unmake_into(slot, out);
             }
         }
+        crate::host::retire_executing_batch(local);
     }
 
     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
@@ -2586,70 +2748,57 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned), clearing and retiring any resources kept in those slots
-    /// before making the slots reusable.
+    /// returned), clearing and batch-retiring any resources kept in those
+    /// slots before making the slots reusable.
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
-        let end_rel = at.saturating_add(n).min(self.dynamic);
-        let start_abs = first;
-        let end_abs = self.count + end_rel;
-        // Clear retained resources BEFORE marking the dynamic range free, so a
-        // concurrent `dynamic()` caller cannot race on the same slots.
         let mut retired = Vec::new();
-        if end_abs > start_abs {
+        self.release_many(&[(first, n)], &mut retired);
+        crate::host::retire_executing_batch(retired);
+    }
+
+    /// Gives back multiple dynamic slot ranges `(first, n)` on this heap:
+    /// clears retained resources and marks for all ranges BEFORE marking them
+    /// free under a single `self.next` lock, appending displaced objects to
+    /// `retired` so the caller retires them in one batch.
+    pub(crate) fn release_many(&self, ranges: &[(u32, u32)], retired: &mut Vec<KeptObject>) {
+        let mut to_free = Vec::with_capacity(ranges.len());
+        for &(first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end_rel = at.saturating_add(n).min(self.dynamic);
+            if end_rel <= at {
+                continue;
+            }
+            let start_abs = first;
+            let end_abs = self.count + end_rel;
             if self.marks.is_some() {
                 for idx in start_abs..end_abs {
                     self.set_mark(idx, None);
                 }
             }
-            let count = (end_abs - start_abs) as usize;
-            if count <= KEPT_SHARDS {
-                for idx in start_abs..end_abs {
-                    let mut shard = self.kept[idx as usize % KEPT_SHARDS]
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some(old) = shard.remove(&idx) {
-                        retired.push(old);
-                    }
-                }
-            } else {
-                for shard_lock in &self.kept {
-                    let mut shard = shard_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    if shard.is_empty() {
-                        continue;
-                    }
-                    let mut remove_keys = Vec::new();
-                    for &k in shard.keys() {
-                        if k >= start_abs && k < end_abs {
-                            remove_keys.push(k);
-                        }
-                    }
-                    for k in remove_keys {
-                        if let Some(old) = shard.remove(&k) {
-                            retired.push(old);
-                        }
-                    }
-                }
-            }
+            self.kept.take_range(start_abs, end_abs, retired);
+            to_free.push((at, end_rel));
         }
-        {
-            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        if to_free.is_empty() {
+            return;
+        }
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut given = 0u32;
+        for (at, end_rel) in to_free {
             if let Some(slots) = guard.1.get_mut(at as usize..end_rel as usize) {
-                let given = slots.iter().filter(|taken| **taken).count() as u32;
-                self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
-                self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+                given += slots.iter().filter(|taken| **taken).count() as u32;
                 slots.fill(false);
             }
         }
-        if !retired.is_empty() {
-            for old in retired {
-                crate::host::retire_executing(old);
-            }
+        if given > 0 {
+            self.free
+                .fetch_add(given, std::sync::atomic::Ordering::Relaxed);
         }
+        self.too_long
+            .store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2740,60 +2889,43 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.make_null_opt(index, None);
+    }
+
+    fn make_null_opt(&self, index: u32, retired: Option<&mut Vec<KeptObject>>) {
         if self.sampler {
             self.null_sampler(index);
         } else {
             null_view(self.at(index));
             self.put(index);
         }
-        self.keep(index, Kept::Empty);
+        self.keep_opt(index, Kept::Empty, retired);
         self.set_stride(index, None);
         self.set_mark(index, None);
     }
 
     /// Slot `index` now views `kept` (or nothing of the host's).
     fn keep(&self, index: u32, kept: Kept) {
+        self.keep_opt(index, kept, None);
+    }
+
+    fn keep_into(&self, index: u32, kept: Kept, retired: &mut Vec<KeptObject>) {
+        self.keep_opt(index, kept, Some(retired));
+    }
+
+    fn keep_opt(&self, index: u32, kept: Kept, retired: Option<&mut Vec<KeptObject>>) {
         let slot_entry = match kept {
             Kept::Empty => None,
             Kept::Resource(resource) => Some(KeptObject::Resource(resource)),
             Kept::Shadow(shadow) => Some(KeptObject::Shadow(shadow)),
         };
-        if slot_entry.is_none()
-            && let Some(noted) = self.noted.get(index as usize)
-            && noted.load(std::sync::atomic::Ordering::Acquire) & NOTED_KEPT == 0
-        {
-            return;
-        }
-        let old = {
-            let mut shard = self.kept[index as usize % KEPT_SHARDS]
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // The resource the slot keeps already (a slot made again from
-            // another view of it, at every draw for some): nothing to let go.
-            if let (Some(new), Some(old)) = (&slot_entry, shard.get(&index))
-                && new.same_as(old)
-            {
-                return;
+        if let Some(old) = self.kept.swap(index, slot_entry) {
+            // A running submission may still read the old resource through
+            // this slot.
+            match retired {
+                Some(batch) => batch.push(old),
+                None => crate::host::retire_executing(old),
             }
-            match slot_entry {
-                Some(entry) => {
-                    if let Some(noted) = self.noted.get(index as usize) {
-                        noted.fetch_or(NOTED_KEPT, std::sync::atomic::Ordering::Release);
-                    }
-                    shard.insert(index, entry)
-                }
-                None => {
-                    if let Some(noted) = self.noted.get(index as usize) {
-                        noted.fetch_and(!NOTED_KEPT, std::sync::atomic::Ordering::Release);
-                    }
-                    shard.remove(&index)
-                }
-            }
-        };
-        // A running submission may still read the old resource through
-        // this slot.
-        if let Some(old) = old {
-            crate::host::retire_executing(old);
         }
     }
 
@@ -3381,6 +3513,7 @@ impl HostHeap {
             fast_null_skip: true,
         };
         let mut view_iter = views.drain(..);
+        let mut retired = Vec::new();
         for &(slot, key, is_view) in todo.iter() {
             let view = if is_view {
                 view_iter.next().flatten()
@@ -3395,8 +3528,10 @@ impl HostHeap {
                 },
                 view,
                 DEFERRED_OPTS,
+                Some(&mut retired),
             );
         }
+        crate::host::retire_executing_batch(retired);
     }
 
     /// Mirrors `count` contiguous title slots starting at `first` (`dst` with
@@ -3473,6 +3608,7 @@ impl HostHeap {
             }
             super::resolve_views(&records, &mut views);
             let mut view_iter = views.drain(..);
+            let mut retired = Vec::new();
             for (pos, index, handle, words, hit) in slot_words.drain(..) {
                 if index >= limit {
                     on_slot(pos, index, None);
@@ -3503,9 +3639,11 @@ impl HostHeap {
                     },
                     view,
                     BUFFER_SLOT_OPTS,
+                    Some(&mut retired),
                 );
                 on_slot(pos, index, view_out.map(|v| (v, copy_hint)));
             }
+            crate::host::retire_executing_batch(retired);
         }
     }
 
@@ -3568,6 +3706,7 @@ impl HostHeap {
                 want_copy_hint: false,
                 fast_null_skip: descriptor_fast(),
             },
+            None,
         )
         .0
     }
@@ -3582,6 +3721,7 @@ impl HostHeap {
         slot: SlotRecord,
         view: Option<View>,
         opts: MirrorOpts,
+        mut retired: Option<&mut Vec<KeptObject>>,
     ) -> (Option<View>, Option<(Arc<Shadow>, u64, u64)>) {
         let SlotRecord { index, handle, key } = slot;
         let held = self.made.lock(index);
@@ -3595,7 +3735,7 @@ impl HostHeap {
                 if !self.sampler {
                     self.made.set_null_kind(index, NullKind::Tex2dSrv);
                 }
-                self.make_null(index);
+                self.make_null_opt(index, retired);
                 let _ = self.note_buffer(index, None, false);
             } else if opts.for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
@@ -3639,7 +3779,7 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 drop(held);
-                self.unmake_stale(index, stale);
+                self.unmake_stale_into(index, stale, retired);
                 if let Some(texture) = waiting {
                     super::wait_for(texture, handle);
                 }
@@ -3659,9 +3799,9 @@ impl HostHeap {
                 && self.made.null_kind(index) == target_null
             {
                 self.set_mark(index, None);
-                self.keep(index, Kept::Empty);
+                self.keep_opt(index, Kept::Empty, retired.as_deref_mut());
                 drop(held);
-                self.unmake_stale(index, stale);
+                self.unmake_stale_into(index, stale, retired);
                 return (opts.return_view.then_some(view), None);
             }
             if replaced_made {
@@ -3684,10 +3824,10 @@ impl HostHeap {
                 self.made.set(index, 0);
                 self.made.set_null_kind(index, NullKind::None);
                 self.set_mark(index, None);
-                self.keep(index, Kept::Empty);
+                self.keep_opt(index, Kept::Empty, retired.as_deref_mut());
                 EMPTY_AT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 drop(held);
-                self.unmake_stale(index, stale);
+                self.unmake_stale_into(index, stale, retired);
                 return (opts.return_view.then_some(view), None);
             }
             if later {
@@ -3698,9 +3838,9 @@ impl HostHeap {
                     null_for(&view, self.at(index));
                     self.put(index);
                 }
-                self.keep(index, Kept::Empty);
+                self.keep_opt(index, Kept::Empty, retired.as_deref_mut());
                 drop(held);
-                self.unmake_stale(index, stale);
+                self.unmake_stale_into(index, stale, retired);
                 if let Some(texture) = waiting {
                     super::wait_for(texture, handle);
                 }
@@ -3721,11 +3861,11 @@ impl HostHeap {
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }
-            self.keep(index, kept.unwrap_or(Kept::Empty));
+            self.keep_opt(index, kept.unwrap_or(Kept::Empty), retired.as_deref_mut());
             // Made: from here on without the lock.
             self.fast[index as usize].store(key, std::sync::atomic::Ordering::Release);
             drop(held);
-            self.unmake_stale(index, stale);
+            self.unmake_stale_into(index, stale, retired);
             return (opts.return_view.then_some(view), copy_hint);
         }
         (opts.return_view.then_some(view), None)
@@ -3748,12 +3888,7 @@ impl HostHeap {
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let kept = self.kept[index as usize % KEPT_SHARDS].lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(&index)?;
-        Some(
-            windows::core::Interface::as_raw(shown.as_resource())
-                == windows::core::Interface::as_raw(buffer),
-        )
+        self.kept.shows(index, buffer)
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -7026,6 +7161,51 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     }
 
     #[test]
+    fn kept_table_straddling_pages_and_batched_release_many_pin_exec_epoch() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+
+        let backing = vec![0xA5u8; 4096];
+        let base = backing.as_ptr() as u64;
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+        let shadow = crate::shadow::find(base, 256).expect("registered shadow");
+        let base_count = Arc::strong_count(&shadow);
+
+        // Allocate 130 dynamic slots so the range straddles at least 3 64-slot pages.
+        let first = heap.dynamic(130).expect("dynamic range");
+        for offset in [0u32, 1, 63, 64, 65, 127, 128, 129] {
+            heap.raw_shadow_at(first + offset, &shadow, 0, 256);
+            assert!(heap.kept.contains(first + offset));
+        }
+        // Unwritten interior slots remain empty without locking/allocating.
+        assert!(!heap.kept.contains(first + 32));
+        // Re-keeping the exact same shadow in a slot is a no-op (no duplicate pin).
+        heap.raw_shadow_at(first + 64, &shadow, 0, 256);
+        assert_eq!(Arc::strong_count(&shadow), base_count + 8);
+
+        // Split the release across two ranges via `release_many` while an exec epoch is active.
+        let exec = crate::retire::acquire_exec_guard();
+        let mut retired = Vec::new();
+        heap.release_many(&[(first, 65), (first + 65, 65)], &mut retired);
+        assert_eq!(retired.len(), 8);
+        for offset in [0u32, 1, 63, 64, 65, 127, 128, 129] {
+            assert!(!heap.kept.contains(first + offset));
+        }
+        crate::host::retire_executing_batch(retired);
+
+        // All 8 shadows stay pinned by the single batched retirement while exec epoch is active.
+        assert_eq!(Arc::strong_count(&shadow), base_count + 8);
+        drop(exec);
+        // Dropping the exec epoch drops all 8 shadows at once.
+        assert_eq!(Arc::strong_count(&shadow), base_count);
+
+        drop(shadow);
+        crate::shadow::unregister(base as usize, base);
+    }
+
+    #[test]
     fn page_slot_range_matches_whole_records_within_page() {
         let start = 0x1000usize;
         let step = 32u64;
@@ -7793,6 +7973,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
                     want_copy_hint: false,
                     fast_null_skip: false,
                 },
+                None,
             );
         }
 
@@ -7933,6 +8114,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
                             want_copy_hint: false,
                             fast_null_skip: true,
                         },
+                        None,
                     );
                 }
             });
@@ -7956,6 +8138,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
                             want_copy_hint: false,
                             fast_null_skip: true,
                         },
+                        None,
                     );
                 }
             });
@@ -7973,7 +8156,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             "fast={fast_now:#x} diverged from made.keys[1]={key_now:#x}"
         );
         if key_now == 0 {
-            assert!(!heap.kept[1].lock().unwrap().contains_key(&1));
+            assert!(!heap.kept.contains(1));
             assert_eq!(heap.made.null_kind(1), NullKind::BufferSrv);
         }
         drop(_made);

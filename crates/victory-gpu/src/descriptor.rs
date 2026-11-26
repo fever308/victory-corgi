@@ -269,6 +269,7 @@ fn changed_slots(
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
@@ -277,6 +278,37 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     {
         host.release(first, n);
     }
+}
+
+/// Gives back a batch of dynamic slot ranges `(heap, first, n)` under one
+/// `SHADER_HEAPS` read lock, one `HostHeap::next` lock per contiguous heap run,
+/// and a single `retire_executing_batch` call for all displaced resources.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_batch(ranges: &[(usize, u32, u32)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut retired = Vec::new();
+    {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        let mut run = Vec::new();
+        while i < ranges.len() {
+            let heap = ranges[i].0;
+            run.clear();
+            while i < ranges.len() && ranges[i].0 == heap {
+                run.push((ranges[i].1, ranges[i].2));
+                i += 1;
+            }
+            if heaps.iter().any(|&(_, _, h)| h == heap)
+                // SAFETY: registered heaps are live (removed when dropped).
+                && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+            {
+                host.release_many(&run, &mut retired);
+            }
+        }
+    }
+    crate::host::retire_executing_batch(retired);
 }
 
 #[cfg(windows)]

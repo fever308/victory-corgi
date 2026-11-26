@@ -81,8 +81,7 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
-    data: *mut u8,
+    upload: crate::upload_pool::PooledUpload,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -661,15 +660,19 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let (dropped, went, bytes) = {
-        let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(cache) = cache.as_mut() else {
+        let mut cache_guard = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cache) = cache_guard.as_mut() else {
+            drop(cache_guard);
+            crate::upload_pool::trim_idle(idle_ms);
             return;
         };
         if cache.entries.is_empty() {
+            drop(cache_guard);
+            crate::upload_pool::trim_idle(idle_ms);
             return;
         }
-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         // A list that recorded an upload or a check holds the staging until it
         // is reset: one only the table holds is named by no list, recorded or
         // running.
@@ -696,6 +699,7 @@ pub(crate) fn let_go_idle() {
         (dropped, went, bytes)
     };
     drop(dropped);
+    crate::upload_pool::trim_idle(idle_ms);
     if went > 0 {
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
@@ -1048,7 +1052,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe {
+                (
+                    staging.upload.buffer().GetGPUVirtualAddress(),
+                    texture.GetDesc(),
+                )
+            };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -1081,7 +1090,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(staging.upload.buffer()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -1335,7 +1344,7 @@ impl Staging {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(self.upload.buffer()) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                     PlacedFootprint: *footprint,
@@ -1643,7 +1652,7 @@ impl Staging {
             let len = pitch * rows as usize * f.Depth as usize;
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(self.upload.data().add(footprint.Offset as usize), len)
             };
             if mip < 32 && held & (1 << mip) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
@@ -2070,8 +2079,8 @@ fn create_staging(
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
+    let upload = crate::upload_pool::acquire(host, total)?;
+    crate::host::name(upload.buffer(), || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
@@ -2081,8 +2090,7 @@ fn create_staging(
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
-        buffer,
-        data,
+        upload,
         footprints,
         rows,
         layout,
@@ -2526,9 +2534,10 @@ mod tests {
             }
             let span = (rows - 1) * pitch + row_bytes;
             assert!(fp.Offset as usize + span <= s.bytes as usize);
-            // SAFETY: `s.data` is a mapped upload buffer covering `fp.Offset..fp.Offset + span`.
-            let mapped =
-                unsafe { std::slice::from_raw_parts(s.data.add(fp.Offset as usize), span) };
+            // SAFETY: `s.upload.data()` is a mapped upload buffer covering `fp.Offset..fp.Offset + span`.
+            let mapped = unsafe {
+                std::slice::from_raw_parts(s.upload.data().add(fp.Offset as usize), span)
+            };
             for row in 0..rows {
                 out.extend_from_slice(&mapped[row * pitch..row * pitch + row_bytes]);
             }
