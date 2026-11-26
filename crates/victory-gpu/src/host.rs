@@ -3109,7 +3109,16 @@ fn flying() -> bool {
 /// CPU (the title's buffer copies, fills of upload memory, textures) and
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
-fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+/// Result of checking `runs` against in-flight shader writes ([`late_blocked`]).
+enum LateBlock {
+    /// A `Step::Run` step may read or write arbitrary title memory (`WHY_RUN`).
+    Run,
+    /// Joined title-memory ranges where copies/fills/textures conflict with
+    /// in-flight shader writes (`WHY_READ`).
+    Read(Vec<(usize, usize)>),
+}
+
+fn late_blocked(runs: &[&HostList]) -> Option<LateBlock> {
     let written = {
         let line = line();
         if line.written.is_empty() {
@@ -3117,30 +3126,32 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         line.written.clone()
     };
-    blocked_by(&written, runs, true)
+    blocked_ranges(&written, runs, true)
 }
 
-/// Diagnostics (experiment): which read of title memory a flight's shaders
+/// Diagnostics (experiment): which read/write of title memory a flight's shaders
 /// may write makes a submission wait, and the written range it meets.
-fn why_read_say(kind: &str, src: usize, len: usize, written: &[(usize, usize)]) {
+fn why_read_say(kind: &str, addr: usize, len: usize, written: &[(usize, usize)]) {
     static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SAID.fetch_add(1, Ordering::Relaxed);
     if n >= 40 && !n.is_multiple_of(50) {
         return;
     }
-    let at = written.partition_point(|r| r.1 <= src);
+    let at = written.partition_point(|r| r.1 <= addr);
     let hit = written.get(at).copied().unwrap_or((0, 0));
     let line = line();
     let flights = line.line.iter().filter(|l| matches!(l, Late::Run(_))).count();
     let mut first = None;
     for (i, item) in line.line.iter().filter_map(|l| if let Late::Run(f) = l { Some(f) } else { None }).enumerate() {
-        if item.back.iter().any(|(_, r, _)| r.iter().any(|&(a, b)| a < src + len && src < b)) {
+        if item.back.iter().any(|(_, r, _)| r.iter().any(|&(a, b)| a < addr + len && addr < b))
+            || item.texture_back_ranges.iter().any(|&(a, b)| a < addr + len && addr < b)
+        {
             first.get_or_insert(i);
         }
     }
     drop(line);
     tracing::info!(
-        "why-read #{n}: {kind} of {len} bytes at {src:#x} meets a written range {:#x}..{:#x} ({} KB) of {} ranges; flights in the air {flights}, the first that declared it #{first:?}",
+        "why-read #{n}: {kind} of {len} bytes at {addr:#x} meets a written range {:#x}..{:#x} ({} KB) of {} ranges; flights in the air {flights}, the first that declared it #{first:?}",
         hit.0,
         hit.1,
         (hit.1 - hit.0) / 1024,
@@ -3151,67 +3162,78 @@ fn why_read_say(kind: &str, src: usize, len: usize, written: &[(usize, usize)]) 
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
-fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+fn blocked_ranges(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<LateBlock> {
     if written.is_empty() {
         return None;
     }
+    let mut ranges = Vec::new();
+    let mut first_stat: Option<(usize, &str, usize, usize)> = None;
     for list in runs {
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    let hit_dst = touches(written, dst, dst + len);
+                    let hit_src = touches(written, src, src + len);
+                    if hit_dst || hit_src {
                         // A copy that only READS where flights may write is
-                        // not waited for either, and checked like a fill
-                        // (`fill_ahead`): run 210 looked at 197 such waits
-                        // (20,480 bytes out of the 174 MB buffer into a small
-                        // buffer of its own, four a frame, 43 to 60 ms a
-                        // frame) and neither side had other bytes after
-                        // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on(src, len) {
+                        // checked like a fill (`fill_ahead`). A copy INTO such
+                        // a range still waits on overlapping flights.
+                        if !hit_dst && fill_ahead::on(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
                             continue;
                         }
-                        if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
-                            why_read_say("copy", src, len, written);
+                        if hit_dst {
+                            ranges.push((dst, dst + len));
+                            first_stat.get_or_insert((
+                                15,
+                                if hit_src { "copy-dst+src" } else { "copy-dst" },
+                                dst,
+                                len,
+                            ));
                         }
-                        return Some(WHY_READ);
+                        if hit_src {
+                            ranges.push((src, src + len));
+                            first_stat.get_or_insert((15, "copy-src", src, len));
+                        }
                     }
                 }
                 &Step::Fill(_, src, len) => {
                     if touches(written, src, src + len) {
-                        // Not waited for, and checked when the flights land
-                        // (`fill_ahead`).
                         if fill_ahead::on(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
                             continue;
                         }
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                            why_read_say("fill", src, len, written);
-                        }
-                        return Some(WHY_READ);
+                        ranges.push((src, src + len));
+                        first_stat.get_or_insert((16, "fill", src, len));
                     }
                 }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
+                        ranges.push((at, at + len));
+                        first_stat.get_or_insert((17, "texture", at, len));
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => return Some(LateBlock::Run),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
-    None
+    if ranges.is_empty() {
+        return None;
+    }
+    if count && let Some((slot, kind, addr, len)) = first_stat {
+        LATE_STATS[slot].fetch_add(1, Ordering::Relaxed);
+        if slot != 17 {
+            why_read_say(kind, addr, len, written);
+        }
+    }
+    join_ranges(&mut ranges, std::iter::empty());
+    Some(LateBlock::Read(ranges))
 }
 
 /// Fills of upload memory (a constant buffer a table names, copied into
@@ -3516,6 +3538,35 @@ fn line_overlaps_stale(line: &Line, stale: &[(usize, usize, usize)]) -> bool {
     false
 }
 
+/// Whether any queued flight in `line.line` or currently landing flight in
+/// `line.in_hand_back` declares a `back` or `texture_back_ranges` range
+/// overlapping any `(from, to)` in `ranges` (for range-scoped `WHY_READ`).
+fn line_overlaps_read(line: &Line, ranges: &[(usize, usize)]) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    for &(_, a, b) in &line.in_hand_back {
+        if ranges.iter().any(|&(from, to)| a < to && from < b) {
+            return true;
+        }
+    }
+    for item in &line.line {
+        let Late::Run(flight) = item else {
+            continue;
+        };
+        if flight
+            .back
+            .iter()
+            .flat_map(|(_, r, _)| r.iter())
+            .chain(flight.texture_back_ranges.iter())
+            .any(|&(a, b)| ranges.iter().any(|&(from, to)| a < to && from < b))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// collects `(shadow_ptr, from, to)` ranges where `runs` refresh a range of
 /// a host copy that a flight's shaders may write and that the title wrote
@@ -3524,24 +3575,23 @@ fn line_overlaps_stale(line: &Line, stale: &[(usize, usize, usize)]) -> bool {
 /// a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
     use std::sync::Arc;
-    // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
-    let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    // Per copy, the joined refreshed intervals (not a bounding box, so
+    // disjoint refreshes do not pull in unrelated pending shader writes).
     let mut by_shadow: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut spans: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
+                && *len > 0
                 && shadow.writes_pending()
             {
                 let key = Arc::as_ptr(shadow) as usize;
+                let range = (*address, *address + *len);
                 match by_shadow.get(&key) {
-                    Some(&i) => {
-                        let s = &mut spans[i];
-                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
-                    }
+                    Some(&i) => spans[i].1.push(range),
                     None => {
                         by_shadow.insert(key, spans.len());
-                        spans.push((shadow.clone(), *address, *address + *len));
+                        spans.push((shadow.clone(), vec![range]));
                     }
                 }
             }
@@ -3552,24 +3602,27 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
     }
     let mut out = Vec::new();
     let mut per_shadow = Vec::new();
-    // (`VICTORY_LATE_MERGE_RUNS`, experiment: 512 ran out once a frame
-    // in gameplay, run 26, for constants the title writes all over a
-    // 174 MB buffer its compute shaders also write.)
+    // `VICTORY_LATE_MERGE_RUNS`: card `CopyBufferRegion` run budget per
+    // submission (4096 avoids stalling on scattered constant writes while
+    // keeping command-list recording negligible; ReBAR is uncapped).
     static RUNS: OnceLock<usize> = OnceLock::new();
     let mut runs_left = late_exact().then(|| {
         *RUNS.get_or_init(|| {
             std::env::var("VICTORY_LATE_MERGE_RUNS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(512)
+                .unwrap_or(4096)
         })
     });
-    for (shadow, from, to) in &spans {
+    for (shadow, ranges) in &mut spans {
+        join_ranges(ranges, std::iter::empty());
         per_shadow.clear();
-        if let Some(left) = runs_left.as_mut() {
-            shadow.merge_ranges_under_writes(*from, *to - *from, left, &mut per_shadow);
-        } else {
-            shadow.stale_ranges_under_writes(*from, *to - *from, &mut per_shadow);
+        for &(from, to) in ranges.iter() {
+            if let Some(left) = runs_left.as_mut() {
+                shadow.merge_ranges_under_writes(from, to - from, left, &mut per_shadow);
+            } else {
+                shadow.stale_ranges_under_writes(from, to - from, &mut per_shadow);
+            }
         }
         if !per_shadow.is_empty() {
             join_ranges(&mut per_shadow, std::iter::empty());
@@ -3975,6 +4028,11 @@ fn relay_worker() {
                                 }
                             }
                         }
+                        for &(from, to) in &flight.texture_back_ranges {
+                            if from < to {
+                                line.in_hand_back.push((0, from, to));
+                            }
+                        }
                     }
                 }
                 break Ok(items);
@@ -4142,10 +4200,11 @@ fn late_line(frames: f64) {
         }
     }
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, unwatched, no_watch, runs_cap, no_ref] =
+            crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB (fallbacks: unwatched {unwatched:.1}, no_watch {no_watch:.1}, runs_cap {runs_cap:.1}, no_ref {no_ref:.1})",
             bytes / (1 << 20) as f64
         );
     }
@@ -6347,13 +6406,15 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
-        } else if let Some(why) = late_blocked(runs) {
-            if relay_exact() && why == WHY_READ {
-                // Only until the flights that may write what is read have
-                // landed: their copy-back's end, not the card's other work.
-                relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
-            } else {
-                self.settle(&mut submitted, why);
+        } else if let Some(block) = late_blocked(runs) {
+            match block {
+                LateBlock::Read(ranges) if range_settle() && relay_exact() => {
+                    // Only until flights whose `back` / `texture_back_ranges`
+                    // overlap the conflicting copy/fill/texture ranges have landed.
+                    relay_wait(WHY_READ, |line| !line_overlaps_read(line, &ranges));
+                }
+                LateBlock::Read(_) => self.settle(&mut submitted, WHY_READ),
+                LateBlock::Run => self.settle(&mut submitted, WHY_RUN),
             }
         }
         // Descriptors the title copied into placed heaps directly, before

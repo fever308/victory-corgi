@@ -351,6 +351,226 @@ mod late_tests {
         assert_eq!(line.lock().unwrap().line.len(), 1, "unrelated flight 2 remains in LINE");
         handle.join().unwrap();
     }
+
+    #[test]
+    fn range_scoped_why_read_unblocks_without_draining_unrelated_flights() {
+        use super::{
+            ExecEpochGuard, Flight, Late, Line, WHY_READ, line_overlaps_read,
+            line_overlaps_stale, wait_on_line,
+        };
+        use crate::shadow::Shadow;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let mut side = vec![0u8; 4 * crate::watch::PAGE];
+        let Some(shadow_a) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            0x3000_0000,
+            (4 * crate::watch::PAGE) as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            return;
+        };
+        let Some(shadow_b) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            0x3000_0000,
+            (4 * crate::watch::PAGE) as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            return;
+        };
+        let ptr_a = Arc::as_ptr(&shadow_a) as usize;
+        let make_flight =
+            |number: u64, back: Vec<super::Declared>, tex: Vec<(usize, usize)>| Flight {
+                number,
+                fence: number,
+                lists: Vec::new(),
+                order: Vec::new(),
+                card: None,
+                back,
+                texture_back_ranges: tex,
+                marks: None,
+                _exec_epoch: ExecEpochGuard {
+                    scope: None,
+                    epoch: 0,
+                },
+            };
+
+        let line = Arc::new(Mutex::new(Line {
+            line: vec![
+                Late::Run(make_flight(
+                    1,
+                    vec![(shadow_a.clone(), vec![(0x3000_0000, 0x3001_0000)], Vec::new())],
+                    vec![(0x3100_0000, 0x3100_4000)],
+                )),
+                Late::Run(make_flight(
+                    2,
+                    vec![(shadow_b.clone(), vec![(0x3002_0000, 0x3003_0000)], Vec::new())],
+                    Vec::new(),
+                )),
+            ],
+            written: vec![
+                (0x3000_0000, 0x3001_0000),
+                (0x3002_0000, 0x3003_0000),
+                (0x3100_0000, 0x3100_4000),
+            ],
+            lists: 2,
+            target: 2,
+            settling: false,
+            poke: false,
+            landed: Vec::new(),
+            in_hand: Vec::new(),
+            in_hand_back: Vec::new(),
+        }));
+        let cv = Arc::new(Condvar::new());
+
+        // Disjoint copy/fill/texture ranges never block.
+        assert_eq!(
+            wait_on_line(&line, &cv, WHY_READ, false, |l| {
+                !line_overlaps_read(l, &[(0x3003_0000, 0x3004_0000)])
+            }),
+            None
+        );
+        // Texture back range on flight 1 overlaps `line_overlaps_read`.
+        assert!(line_overlaps_read(
+            &line.lock().unwrap(),
+            &[(0x3100_1000, 0x3100_2000)]
+        ));
+
+        // Copy overlapping flight 1 waits until flight 1 lands (including its
+        // `in_hand_back` phase), but unblocks while unrelated flight 2 remains.
+        let stage = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let line_w = line.clone();
+        let cv_w = cv.clone();
+        let stage_w = stage.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            {
+                let mut l = line_w.lock().unwrap();
+                l.line.remove(0);
+                l.settling = true;
+                l.in_hand_back.push((ptr_a, 0x3000_0000, 0x3001_0000));
+                l.in_hand_back.push((0, 0x3100_0000, 0x3100_4000));
+                // Texture `s_ptr == 0` entry must not match `line_overlaps_stale`.
+                assert!(!line_overlaps_stale(&l, &[(ptr_a, 0x3100_0000, 0x3100_4000)]));
+                assert!(line_overlaps_read(&l, &[(0x3100_0000, 0x3100_1000)]));
+                stage_w.store(1, std::sync::atomic::Ordering::Release);
+            }
+            cv_w.notify_all();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            {
+                let mut l = line_w.lock().unwrap();
+                l.in_hand_back.clear();
+                l.settling = false;
+                l.written = vec![(0x3002_0000, 0x3003_0000)];
+                stage_w.store(2, std::sync::atomic::Ordering::Release);
+            }
+            cv_w.notify_all();
+        });
+
+        let waited = wait_on_line(&line, &cv, WHY_READ, false, |l| {
+            !line_overlaps_read(l, &[(0x3000_0400, 0x3000_0800)])
+        });
+        assert!(waited.is_some());
+        assert_eq!(stage.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert_eq!(line.lock().unwrap().line.len(), 1, "unrelated flight 2 remains in LINE");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn blocked_ranges_scopes_copy_dst_and_prioritizes_run() {
+        use super::{LateBlock, blocked_ranges, host};
+
+        let Some(h) = host() else {
+            return;
+        };
+        let written = vec![(0x4000_0000usize, 0x4001_0000usize)];
+
+        // Copy reading from `written` into non-written dst is allowed ahead (`None`).
+        let list_read = h.new_list().expect("list_read");
+        list_read.defer_copy(0x5000_0000 as *mut u8, 0x4000_1000 as *const u8, 256);
+        assert!(blocked_ranges(&written, &[&list_read], false).is_none());
+
+        // Copy writing INTO `written` returns only the conflicting dst range.
+        let list_dst = h.new_list().expect("list_dst");
+        list_dst.defer_copy(0x4000_2000 as *mut u8, 0x5000_0000 as *const u8, 512);
+        match blocked_ranges(&written, &[&list_dst], false) {
+            Some(LateBlock::Read(ranges)) => {
+                assert_eq!(ranges, vec![(0x4000_2000, 0x4000_2200)]);
+            }
+            other => panic!("expected Read block, got {:?}", other.is_some()),
+        }
+
+        // `Step::Run` after a blocking copy returns `LateBlock::Run`.
+        list_dst.defer(|| {});
+        assert!(matches!(
+            blocked_ranges(&written, &[&list_dst], false),
+            Some(LateBlock::Run)
+        ));
+    }
+
+    #[test]
+    fn stale_under_flights_ignores_gaps_between_disjoint_refreshes() {
+        use super::{host, stale_under_flights};
+        use crate::shadow::Shadow;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let Some(h) = host() else {
+            return;
+        };
+        let page = crate::watch::PAGE;
+        let len = 4 * page;
+        // SAFETY: isolated write-watched test buffer freed at the end of the test.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>()
+        };
+        assert!(!title.is_null());
+        let va0 = title as usize;
+        let mut side = vec![0u8; len];
+        let Some(shadow) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            va0 as u64,
+            len as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        // Mark shadow unwatched so any pending overlap would report stale immediately.
+        shadow.mark_unwatched_for_test();
+        // Pending shader write ONLY in page 1..2 (middle gap).
+        shadow.writing(va0 + page, page, |_, _| None);
+
+        // Submission refreshes ONLY page 0 and page 3 (disjoint around page 1..2).
+        let list = h.new_list().expect("list");
+        list.defer_refresh(&shadow, va0, page);
+        list.defer_refresh(&shadow, va0 + 3 * page, page);
+        assert!(
+            stale_under_flights(&[&list]).is_empty(),
+            "disjoint refreshes must not pull in unrelated pending gap"
+        );
+
+        // Adding a refresh overlapping page 1 reports ONLY page 1.
+        list.defer_refresh(&shadow, va0 + page, 4096);
+        let stale = stale_under_flights(&[&list]);
+        assert_eq!(
+            stale,
+            vec![(std::sync::Arc::as_ptr(&shadow) as usize, va0 + page, va0 + page + 4096)]
+        );
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
 }
 #[cfg(test)]
 mod wide_refresh_tests {
