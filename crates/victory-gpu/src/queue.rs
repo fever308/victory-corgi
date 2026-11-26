@@ -736,7 +736,22 @@ pub(crate) fn release_held_now(all: bool) {
                             JOINED[4].fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(&Held::Value(wait)) if !all => {
+                        if !wait.met() {
+                            // Drop `Queue::held` before `late_met` -> `settle_now`
+                            // (`Host::submitted` + `LINE_LANDED`) so concurrent
+                            // queue operations never stall or invert lock order.
+                            drop(held);
+                            let met = crate::host::late() && crate::host::late_met(&wait);
+                            held = lock(line);
+                            if !met {
+                                break;
+                            }
+                            if !matches!(held.get(base), Some(Held::Value(_))) {
+                                continue;
+                            }
+                        }
+                    }
                     // The frame is shown behind the parts taken: they are
                     // sent first.
                     Some(Held::Present(..)) if !joined.is_empty() => break,

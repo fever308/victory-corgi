@@ -3278,6 +3278,11 @@ mod fill_ahead {
         crate::texture::fingerprint(src as u64, len as u64, &[])
     }
 
+    /// Non-materializing [`print`], safe under per-`Shadow` locks.
+    fn print_raw(src: usize, len: usize) -> Option<u64> {
+        crate::texture::fingerprint_raw(src as u64, len as u64, &[])
+    }
+
     #[derive(Default)]
     struct Piece {
         /// The frame its old fills were last dropped in.
@@ -3334,7 +3339,7 @@ mod fill_ahead {
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
     /// them.
-    pub(super) fn read(src: usize, len: usize) {
+    pub(crate) fn read(src: usize, len: usize) {
         if len == 0 {
             return;
         }
@@ -3384,7 +3389,14 @@ mod fill_ahead {
             // The title rewrote the bytes since the fill (or a landing before
             // this one did, and was compared then): what is there now is not
             // what the fill read, so it cannot tell a miss.
-            if print(from, to - from) != print_then {
+            // `wrote` runs while callers hold per-`Shadow` locks (`rebar.mirror`
+            // / `Shadow::before`), so reads must not invoke `lazy_back`
+            // materialization (which would re-enter the same `Shadow` lock or
+            // wait on `LAZY_CV` and deadlock `victory-relay`).
+            let Some(print_now) = print_raw(from, to - from) else {
+                continue;
+            };
+            if print_now != print_then {
                 COUNT[3].fetch_add(1, Relaxed);
                 continue;
             }
@@ -3393,7 +3405,7 @@ mod fill_ahead {
             now.resize(b - a, 0);
             // Title memory as it is: what the fill read. Not there: nothing
             // to say.
-            if !super::read_into(a as *const u8, &mut now) || now[..] == new[a - at..b - at] {
+            if !super::read_into_raw(a as *const u8, &mut now) || now[..] == new[a - at..b - at] {
                 continue;
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
@@ -3493,6 +3505,8 @@ mod fill_ahead {
 }
 
 pub(crate) use fill_ahead::wrote as shaders_write;
+#[cfg(test)]
+pub(crate) use fill_ahead::read as test_fill_ahead_read;
 
 /// Whether `WHY_STALE` waits only on flights whose `flight.back` overlaps the
 /// stale ranges (`VICTORY_RANGE_SETTLE=0` falls back to full `Host::settle`).

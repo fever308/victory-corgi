@@ -5928,6 +5928,20 @@ impl Shadow {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_rebar_for_test(title_start: u64, len: u64, fill: u8) -> Option<Arc<Shadow>> {
+        let h = host()?;
+        let alloc = len.max(64);
+        let (buffer, data) = h.shared_buffer(alloc)?;
+        // SAFETY: live buffer.
+        let gpu_va = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu_va, title_start, len, Some(0));
+        if let Some(rebar) = &shadow.rebar {
+            *rebar.mirror.lock().unwrap_or_else(|e| e.into_inner()) = vec![fill; len as usize].into();
+        }
+        Some(Arc::new(shadow))
+    }
+
+    #[cfg(test)]
     pub(crate) fn clear_card_dirty_for_test(&self) {
         if let Some(card) = &self.card {
             card.dirty.write().unwrap_or_else(|e| e.into_inner()).clear();

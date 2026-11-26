@@ -3247,7 +3247,8 @@ impl State {
                 };
                 let handle = table + u64::from(u.table_offset_dwords) * 4;
                 let Some(view) = crate::descriptor::view(handle) else {
-                    continue;
+                    list.gather_close();
+                    return;
                 };
                 let placed = crate::descriptor::host::placed_texture(&view);
                 let view = placed.as_ref().unwrap_or(&view);

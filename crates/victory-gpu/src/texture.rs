@@ -1716,7 +1716,7 @@ fn recheck_mips() -> bool {
 /// and only two slices of an array or cube map: a mip or slice that
 /// arrived after the upload elsewhere was not seen. Read through the
 /// kernel, so pages not there count as zeros.
-pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
+fn fingerprint_inner(at: u64, len: u64, mips: &[(u64, u64)], raw: bool) -> Option<u64> {
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1730,9 +1730,25 @@ pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
     });
     let longest = mips.iter().map(|&(_, n)| n as usize).max().unwrap_or(0);
     read.resize((3 * WINDOW).max(longest), 0);
+    let mut ok = true;
     let mut take = |from: usize, bytes: usize| {
+        if !ok {
+            return;
+        }
         read[..bytes].fill(0);
-        crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+        if raw {
+            if !crate::host::copy_mapped_raw_checked(
+                read.as_mut_ptr(),
+                (at as usize + from) as *const u8,
+                bytes,
+                false,
+            ) {
+                ok = false;
+                return;
+            }
+        } else {
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+        }
         print = print.rotate_left(37) ^ digest(&read[..bytes]).0;
     };
     if len <= 3 * WINDOW {
@@ -1755,8 +1771,22 @@ pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
             *saved = read;
         }
     });
+    if !ok {
+        return None;
+    }
     let first = (print as u64 ^ (print >> 64) as u64).to_le_bytes();
-    u64::from_le_bytes(first) | 1
+    Some(u64::from_le_bytes(first) | 1)
+}
+
+pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
+    fingerprint_inner(at, len, mips, false).unwrap_or(1)
+}
+
+/// Non-materializing [`fingerprint`]: returns `None` instead of invoking
+/// `lazy_back::materialize_range` if any sampled window hits a deferred
+/// `PAGE_NOACCESS` block. Safe to call while holding per-`Shadow` locks.
+pub(crate) fn fingerprint_raw(at: u64, len: u64, mips: &[(u64, u64)]) -> Option<u64> {
+    fingerprint_inner(at, len, mips, true)
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its

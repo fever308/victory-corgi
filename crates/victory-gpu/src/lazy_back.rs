@@ -2587,4 +2587,62 @@ mod tests {
         h.log_messages();
         assert_eq!(h.d3d12_errors(), errors_before);
     }
+
+    #[test]
+    fn fill_ahead_wrote_under_rebar_mirror_lock_does_not_deadlock_on_lazy_sibling_page() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let ptr = alloc_watch_pages(2);
+        // SAFETY: `ptr` owns `2 * PAGE` committed RW bytes.
+        unsafe { ptr::write_bytes(ptr, 0x11, 2 * PAGE) };
+        let va0 = ptr as usize;
+        let va1 = va0 + PAGE;
+        clear_hot_for_test(va0 / PAGE);
+        clear_hot_for_test(va1 / PAGE);
+
+        let Some(shadow) = Shadow::new_rebar_for_test(va0 as u64, (2 * PAGE) as u64, 0x11) else {
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+
+        // Record a multi-page fill spanning both page 0 and page 1, then defer
+        // page 1 in `lazy_back` (`PAGE_NOACCESS`) on the SAME ReBAR shadow.
+        crate::host::test_fill_ahead_read(va0, 2 * PAGE);
+        gpu_write_shadow(&shadow, PAGE, &[0xCC; 16]);
+        assert!(try_defer_page_inner(&shadow, PAGE, PAGE, 0));
+        assert!(has_block(va1 / PAGE));
+
+        // Merging GPU writes into page 0 holds `shadow.rebar.mirror` and calls
+        // `fill_ahead::wrote`, which checks the `[va0, va0 + 2*PAGE)` fill.
+        // Without raw non-materializing reads in `fill_ahead::wrote`, sampling
+        // page 1 would invoke `lazy_back::materialize_range` ->
+        // `shadow.relay_merge_rebar` -> `rebar.mirror.lock()` on the same
+        // thread and permanently self-deadlock.
+        let mut gpu_page0 = vec![0x11u8; PAGE];
+        gpu_page0[0] = 0xAA;
+        let written = shadow.relay_merge_rebar(&[(0, PAGE)], &[&gpu_page0]);
+        assert!(written > 0);
+        // SAFETY: page 0 is readable and now contains the merged GPU byte.
+        assert_eq!(unsafe { ptr.read() }, 0xAA);
+        assert!(
+            has_block(va1 / PAGE),
+            "fill_ahead::wrote must not materialize sibling lazy_back blocks under Shadow locks"
+        );
+
+        // Accessing page 1 afterward still materializes its deferred GPU write cleanly.
+        // SAFETY: volatile read triggers VEH materialization of page 1.
+        assert_eq!(unsafe { ptr.add(PAGE).read_volatile() }, 0xCC);
+        assert!(!has_block(va1 / PAGE));
+
+        clear_hot_for_test(va0 / PAGE);
+        clear_hot_for_test(va1 / PAGE);
+        drop(shadow);
+        // SAFETY: cleanup.
+        unsafe { free_watch_pages(ptr) };
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
 }
