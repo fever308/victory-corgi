@@ -318,6 +318,108 @@ pub(crate) struct Shadow {
     stretch_view: Option<StretchView>,
 }
 
+/// Per-send sorted index of ranges uploaded to a card copy (`Card::sent`),
+/// so [`Shadow::card_merge_relay`] queries overlapping ranges in
+/// `O(in_flight_sends * log(ranges) + k)` instead of `O(pieces * sent.len())`
+/// and [`card_dirty`] prunes landed sends in `O(1)`.
+#[derive(Default)]
+struct CardSent {
+    /// Strictly ascending by `sent_as`; each inner `Vec` is non-empty, sorted,
+    /// and disjoint (`a < b`, `ranges[i].1 < ranges[i + 1].0`).
+    sends: Vec<(u64, Vec<(usize, usize)>)>,
+    /// Total range entries across `sends` (for [`card_sent_max`] telemetry).
+    total: usize,
+}
+
+impl CardSent {
+    #[cfg(test)]
+    fn from_triples(entries: Vec<(usize, usize, u64)>) -> Self {
+        let mut by_send: BTreeMap<u64, Vec<(usize, usize)>> = BTreeMap::new();
+        for (a, b, sent_as) in entries {
+            if a < b {
+                by_send.entry(sent_as).or_default().push((a, b));
+            }
+        }
+        let mut out = Self::default();
+        for (sent_as, ranges) in by_send {
+            out.push_sorted(sent_as, joined(ranges));
+        }
+        out
+    }
+
+    fn len(&self) -> usize {
+        self.total
+    }
+
+    fn has_after(&self, fetched: u64) -> bool {
+        self.sends.last().is_some_and(|s| s.0 > fetched)
+    }
+
+    fn needs_prune(&self, fetched: u64) -> bool {
+        self.sends.first().is_some_and(|s| s.0 <= fetched)
+    }
+
+    fn prune(&mut self, fetched: u64) {
+        if !self.needs_prune(fetched) {
+            return;
+        }
+        let keep = self.sends.partition_point(|s| s.0 <= fetched);
+        let dropped: usize = self.sends[..keep].iter().map(|s| s.1.len()).sum();
+        self.total -= dropped;
+        self.sends.drain(..keep);
+    }
+
+    fn push_sorted(&mut self, sent_as: u64, ranges: Vec<(usize, usize)>) {
+        if ranges.is_empty() {
+            return;
+        }
+        match self.sends.last_mut() {
+            Some(last) if last.0 < sent_as => {
+                self.total += ranges.len();
+                self.sends.push((sent_as, ranges));
+            }
+            Some(last) if last.0 == sent_as => {
+                let prev = last.1.len();
+                last.1.extend(ranges);
+                last.1 = joined(std::mem::take(&mut last.1));
+                self.total = self.total - prev + last.1.len();
+            }
+            None => {
+                self.total += ranges.len();
+                self.sends.push((sent_as, ranges));
+            }
+            Some(_) => match self.sends.binary_search_by_key(&sent_as, |s| s.0) {
+                Ok(i) => {
+                    let prev = self.sends[i].1.len();
+                    self.sends[i].1.extend(ranges);
+                    self.sends[i].1 = joined(std::mem::take(&mut self.sends[i].1));
+                    self.total = self.total - prev + self.sends[i].1.len();
+                }
+                Err(i) => {
+                    self.total += ranges.len();
+                    self.sends.insert(i, (sent_as, ranges));
+                }
+            },
+        }
+    }
+
+    fn collect_skip(&self, lo: usize, hi: usize, fetched_after: u64, out: &mut Vec<(usize, usize)>) {
+        if lo >= hi || !self.has_after(fetched_after) {
+            return;
+        }
+        let start = self.sends.partition_point(|s| s.0 <= fetched_after);
+        for (_, ranges) in &self.sends[start..] {
+            let first = ranges.partition_point(|&(_, b)| b <= lo);
+            for &(a, b) in &ranges[first..] {
+                if a >= hi {
+                    break;
+                }
+                out.push((a.max(lo), b.min(hi)));
+            }
+        }
+    }
+}
+
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
@@ -332,12 +434,12 @@ struct Card {
     before: Mutex<Option<ID3D12Resource>>,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
-    dirty: Mutex<Vec<(usize, usize)>>,
+    dirty: RwLock<Vec<(usize, usize)>>,
     /// With [`relay`]: the offsets that went from `dirty` to the card's
-    /// side, each with the number of the send that took it
-    /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
+    /// side, indexed by the number of the send that took them
+    /// ([`card_dirty`]), kept until a fetch sent after them has been merged.
     /// Locked inside `dirty`'s lock.
-    sent: Mutex<Vec<(usize, usize, u64)>>,
+    sent: RwLock<CardSent>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -639,6 +741,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+    let use_relay = relay();
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
@@ -647,12 +750,27 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .card
             .as_ref()
             .map(|c| {
-                let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
-                if relay() {
-                    let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                // Fast path for untouched shadows: avoid taking a write lock
+                // while parallel `card_merge_relay` workers hold read locks.
+                if c.dirty.read().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                    if use_relay && c.sent.read().unwrap_or_else(|e| e.into_inner()).needs_prune(fetched) {
+                        c.sent.write().unwrap_or_else(|e| e.into_inner()).prune(fetched);
+                    }
+                    return Vec::new();
+                }
+                let mut dirty = c.dirty.write().unwrap_or_else(|e| e.into_inner());
+                let taken = std::mem::take(&mut *dirty);
+                let ranges = if taken.is_empty() {
+                    Vec::new()
+                } else {
+                    joined(taken)
+                };
+                if use_relay {
+                    let mut sent = c.sent.write().unwrap_or_else(|e| e.into_inner());
+                    sent.prune(fetched);
+                    if !ranges.is_empty() {
+                        sent.push_sorted(sent_as, ranges.clone());
+                    }
                 }
                 ranges
             })
@@ -1023,7 +1141,7 @@ pub(crate) fn card_sent_max() -> usize {
     carded
         .iter()
         .filter_map(|w| w.upgrade())
-        .filter_map(|s| s.card.as_ref().map(|c| c.sent.lock().unwrap_or_else(|e| e.into_inner()).len()))
+        .filter_map(|s| s.card.as_ref().map(|c| c.sent.read().unwrap_or_else(|e| e.into_inner()).len()))
         .max()
         .unwrap_or(0)
 }
@@ -2627,16 +2745,93 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Splits a card-backed page slice `[lo, lo + title.len())` against sorted,
+/// disjoint `protected` intervals where an older in-flight shader may have
+/// written on the card:
+/// - Sub-slices outside `protected` have no older writer and upload as one
+///   contiguous range if any byte differs from `held`.
+/// - Sub-slices inside `protected` upload only exact changed byte runs (joined
+///   by `gap`) so older GPU writes on equal bytes stay untouched.
+///
+/// Returns the number of exact byte-diff runs emitted inside `protected`.
+fn card_busy_page_runs(
+    lo: usize,
+    title: &[u8],
+    held: &[u8],
+    protected: &[(usize, usize)],
+    gap: usize,
+    out: &mut Vec<(usize, usize)>,
+) -> usize {
+    let hi = lo + title.len();
+    let mut at = lo;
+    let mut exact_runs = 0usize;
+    let push_run = |out: &mut Vec<(usize, usize)>, r: usize, m: usize| {
+        if m == 0 {
+            return;
+        }
+        match out.last_mut() {
+            Some(last) if r <= last.0 + last.1 => {
+                last.1 = (last.0 + last.1).max(r + m) - last.0;
+            }
+            _ => out.push((r, m)),
+        }
+    };
+    for &(pa, pb) in protected {
+        if pb <= at {
+            continue;
+        }
+        if pa >= hi {
+            break;
+        }
+        if pa > at {
+            let (s0, s1) = (at - lo, pa - lo);
+            if title[s0..s1] != held[s0..s1] {
+                push_run(out, s0, s1 - s0);
+            }
+            at = pa;
+        }
+        let p_end = pb.min(hi);
+        if p_end > at {
+            let (s0, s1) = (at - lo, p_end - lo);
+            let runs = join_runs(changed_runs(&title[s0..s1], &held[s0..s1]), gap);
+            exact_runs += runs.len();
+            for (r, m) in runs {
+                push_run(out, s0 + r, m);
+            }
+            at = p_end;
+        }
+    }
+    if at < hi {
+        let (s0, s1) = (at - lo, hi - lo);
+        if title[s0..s1] != held[s0..s1] {
+            push_run(out, s0, s1 - s0);
+        }
+    }
+    exact_runs
+}
+
+/// Maximum exact byte-diff fragments [`Shadow::update_busy`] emits under an
+/// older in-flight shader write before settling overlapping flight(s) so
+/// remaining pages upload as single contiguous ranges.
+fn busy_exact_run_budget() -> usize {
+    static RUNS: OnceLock<usize> = OnceLock::new();
+    *RUNS.get_or_init(|| {
+        std::env::var("VICTORY_LATE_MERGE_RUNS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(512)
+    })
+}
+
 /// An older flight may have written bytes between title changes. Only
 /// send exact changes there; otherwise a changed page slice goes up as one
 /// range so adjacent slices can join into a single upload.
-fn card_busy_runs(title: &[u8], held: &[u8], exact: bool) -> impl Iterator<Item = (usize, usize)> + use<> {
-    let (whole, fragments) = if exact {
-        (None, changed_runs(title, held))
-    } else {
-        ((title != held).then_some((0, title.len())), Vec::new())
-    };
-    whole.into_iter().chain(fragments)
+#[cfg(test)]
+fn card_busy_runs(title: &[u8], held: &[u8], exact: bool) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let protected = if exact { &[(0, title.len())][..] } else { &[] };
+    card_busy_page_runs(0, title, held, protected, 0, &mut out);
+    out
 }
 
 /// `VICTORY_LATE_MERGE_GAP` (experiment, 0): changed runs of a page of a
@@ -4830,15 +5025,18 @@ impl Shadow {
         // only disappear after this snapshot (the relay landed them).
         // Without relay bookkeeping in late mode, assume every busy range
         // might still have an earlier writer.
-        let protected = if !self.carded() || !crate::host::late() {
+        let preparing = PREPARED.load(Ordering::Relaxed);
+        let mut protected = if !self.carded() || !crate::host::late() {
             Vec::new()
         } else if relay() {
-            let preparing = PREPARED.load(Ordering::Relaxed);
             self.flights.lock().unwrap_or_else(|e| e.into_inner()).older_ranges(preparing, from, to)
         } else {
             vec![(from, to)]
         };
-        let mut protected = protected.into_iter().peekable();
+        let mut prot_idx = 0usize;
+        let mut exact_runs_left = busy_exact_run_budget();
+        let mut settled_once = false;
+        let mut page_runs: Vec<(usize, usize)> = Vec::new();
         let mut title = vec![0u8; PAGE];
         let mut copied_bytes = 0usize;
         for page in stale {
@@ -4897,17 +5095,69 @@ impl Shadow {
                     continue;
                 };
                 if self.card.is_some() {
-                    // SAFETY: inside the copy's CPU-side staging mapping.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    while protected.peek().is_some_and(|&(_, b)| b <= lo) {
-                        protected.next();
+                    while prot_idx < protected.len() && protected[prot_idx].1 <= lo {
+                        prot_idx += 1;
                     }
-                    let exact = protected.peek().is_some_and(|&(a, _)| a < hi);
-                    for (r, m) in card_busy_runs(title, held, exact) {
+                    // SAFETY: inside the copy's CPU-side staging mapping.
+                    let mut held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    page_runs.clear();
+                    let exact_count = card_busy_page_runs(
+                        lo,
+                        title,
+                        held,
+                        &protected[prot_idx..],
+                        merge_gap(),
+                        &mut page_runs,
+                    );
+                    if exact_count > exact_runs_left && !settled_once && relay() && !in_wide() {
+                        // Too many byte-level fragments under an older in-flight
+                        // shader write: release `before`, settle only the
+                        // overlapping older flight(s), re-read title memory (now
+                        // merged with landed GPU writes), and retry so remaining
+                        // pages upload as contiguous ranges.
+                        drop(before);
+                        settled_once = true;
+                        let settled = crate::host::settle_card_busy(
+                            self as *const Shadow as usize,
+                            lo,
+                            to,
+                        );
+                        if settled {
+                            protected = self
+                                .flights
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .older_ranges(preparing, lo, to);
+                            prot_idx = 0;
+                        }
+                        let Some(refreshed) = lock_and_read(
+                            || self.before.write().unwrap_or_else(|e| e.into_inner()),
+                            lo,
+                            title,
+                        ) else {
+                            continue;
+                        };
+                        before = refreshed;
+                        // SAFETY: inside the copy's CPU-side staging mapping.
+                        held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                        page_runs.clear();
+                        let _ = card_busy_page_runs(
+                            lo,
+                            title,
+                            held,
+                            &protected[prot_idx..],
+                            merge_gap(),
+                            &mut page_runs,
+                        );
+                    } else {
+                        exact_runs_left = exact_runs_left.saturating_sub(exact_count);
+                    }
+                    for &(r, m) in &page_runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
                         copied_bytes += m;
                     }
+                    self.card_changed_runs(page_runs.iter().map(|&(r, m)| (at + r, at + r + m)));
+                    drop(before);
                     page_ok = true;
                 } else if let Some(snapshot) = before.as_mut()
                     && at + n <= snapshot.capacity()
@@ -5285,10 +5535,9 @@ impl Shadow {
             let fetched = RELAY_FETCHED.load(Ordering::Acquire);
             if card
                 .sent
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .any(|s| s.2 > fetched)
+                .has_after(fetched)
             {
                 return true;
             }
@@ -5305,7 +5554,7 @@ impl Shadow {
         if from >= to {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dirty = card.dirty.write().unwrap_or_else(|e| e.into_inner());
         match dirty.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
@@ -5329,7 +5578,7 @@ impl Shadow {
         if iter.peek().is_none() {
             return;
         }
-        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dirty = card.dirty.write().unwrap_or_else(|e| e.into_inner());
         for (from, to) in iter {
             if from >= to {
                 continue;
@@ -5556,14 +5805,16 @@ impl Shadow {
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
         let skip: Vec<(usize, usize)> = {
-            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-            let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
-                .iter()
-                .copied()
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
+            let dirty = card.dirty.read().unwrap_or_else(|e| e.into_inner());
+            let sent = card.sent.read().unwrap_or_else(|e| e.into_inner());
+            let mut skip = Vec::new();
+            for &(a, b) in dirty.iter() {
+                if a < at + n && b > at {
+                    skip.push((a.max(at), b.min(at + n)));
+                }
+            }
+            sent.collect_skip(at, at + n, fetched_after, &mut skip);
+            skip
         };
         title.clear();
         title.resize(n, 0);
@@ -5632,8 +5883,8 @@ impl Shadow {
         shadow.card = Some(Card {
             staging,
             before: Mutex::new(None),
-            dirty: Mutex::new(dirty),
-            sent: Mutex::new(sent),
+            dirty: RwLock::new(dirty),
+            sent: RwLock::new(CardSent::from_triples(sent)),
             // 0: no card bytes counted (`Drop` subtracts `card.size`).
             size: 0,
         });
@@ -5654,8 +5905,8 @@ impl Shadow {
         shadow.card = Some(Card {
             staging,
             before: Mutex::new(None),
-            dirty: Mutex::new(Vec::new()),
-            sent: Mutex::new(Vec::new()),
+            dirty: RwLock::default(),
+            sent: RwLock::default(),
             size: 0,
         });
         Some(Arc::new(shadow))
@@ -5664,7 +5915,7 @@ impl Shadow {
     #[cfg(test)]
     pub(crate) fn clear_card_dirty_for_test(&self) {
         if let Some(card) = &self.card {
-            card.dirty.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            card.dirty.write().unwrap_or_else(|e| e.into_inner()).clear();
         }
     }
 }
@@ -5945,8 +6196,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 let card = Card {
                     staging,
                     before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
+                    dirty: RwLock::default(),
+                    sent: RwLock::default(),
                     size,
                 };
                 (on_card, data, Some(card), None)
@@ -6530,8 +6781,8 @@ fn loose_in(
                     let card = Card {
                         staging,
                         before: Mutex::default(),
-                        dirty: Mutex::default(),
-                        sent: Mutex::default(),
+                        dirty: RwLock::default(),
+                        sent: RwLock::default(),
                         size: len,
                     };
                     (on_card, data, Some(card), None)
@@ -7138,14 +7389,14 @@ mod card_merge_tests {
             shadow.card = Some(Card {
                 staging: staging.clone(),
                 before: Mutex::new(None),
-                dirty: Mutex::default(),
-                sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                dirty: std::sync::RwLock::default(),
+                sent: std::sync::RwLock::new(super::CardSent::from_triples(vec![(title_byte, title_byte + 1, 7)])),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
-                card.sent.lock().unwrap().retain(|s| s.2 > mark);
+                card.sent.write().unwrap().prune(mark);
             }
             // Flight 6's slot: the card's bytes behind its lists, before send 7.
             let mut slot = content.clone();
@@ -8077,8 +8328,8 @@ mod tests {
         shadow.card = Some(Card {
             staging,
             before: Mutex::default(),
-            dirty: Mutex::default(),
-            sent: Mutex::default(),
+            dirty: RwLock::default(),
+            sent: RwLock::default(),
             size: LEN as u64,
         });
         shadow
@@ -8116,7 +8367,7 @@ mod tests {
         assert_eq!(got[hole.1..pending.0], expected[hole.1..pending.0]);
         assert_eq!(got[pending.1..req_hi], expected[pending.1..req_hi]);
 
-        let dirty = shadow.card.as_ref().unwrap().dirty.lock().unwrap().clone();
+        let dirty = shadow.card.as_ref().unwrap().dirty.read().unwrap().clone();
         assert_eq!(dirty, vec![(req_lo, pending.0), (pending.1, req_hi)]);
 
         // SAFETY: freeing our test allocation.
@@ -8537,7 +8788,7 @@ mod tests {
         };
         let card = copy.card.as_ref().unwrap();
         copy.update(p, len);
-        card.dirty.lock().unwrap().clear();
+        card.dirty.write().unwrap().clear();
         copy.writing(p, len, |_, _| None);
 
         let (lo, hi) = (19, len - 23);
@@ -8548,7 +8799,7 @@ mod tests {
         // A write outside the refresh must not be uploaded.
         unsafe { ((p + lo - 1) as *mut u8).write_volatile(0xaa) };
         let copied = copy.update(p + lo, hi - lo);
-        let uploads = joined(std::mem::take(&mut *card.dirty.lock().unwrap()));
+        let uploads = joined(std::mem::take(&mut *card.dirty.write().unwrap()));
         drop(copy);
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
 
@@ -9032,5 +9283,143 @@ mod tests {
         drop(shadow_a);
         // SAFETY: free test allocation.
         unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// Strided writes on a 64 KiB page coalesce into a single upload where no
+    /// older flight overlaps, while a partial-page older flight keeps exact
+    /// byte diffs strictly inside its subrange and preserves GPU writes there.
+    #[test]
+    fn card_busy_page_runs_coalesces_unprotected_and_preserves_older_gpu_writes() {
+        let base = 0x10_0000usize;
+        let held = vec![0u8; PAGE];
+        let mut title = held.clone();
+        // Strided 4-byte writes every 16 bytes across the full 64 KiB page.
+        for i in (0..PAGE).step_by(16) {
+            title[i..i + 4].copy_from_slice(&[0x55, 0x66, 0x77, 0x88]);
+        }
+
+        // Case 1: no older flight -> 1 single contiguous range, 0 exact runs.
+        let mut runs = Vec::new();
+        let exact = card_busy_page_runs(base, &title, &held, &[], 0, &mut runs);
+        assert_eq!(exact, 0);
+        assert_eq!(runs, [(0, PAGE)]);
+
+        // Case 2: older flight covers only [2048, 2560) and wrote GPU bytes at
+        // offsets between the strided title writes inside that subrange.
+        let prot = [(base + 2048, base + 2560)];
+        let mut device = held.clone();
+        for at in (2056..2560).step_by(16) {
+            device[at] = 0xaa;
+        }
+        runs.clear();
+        let exact = card_busy_page_runs(base, &title, &held, &prot, 0, &mut runs);
+        assert_eq!(exact, (2560 - 2048) / 16);
+        // Unprotected prefix [0, 2048) + 32 exact runs in [2048, 2560) +
+        // unprotected suffix [2560, PAGE) (prefix touches first run at 2048).
+        assert!(
+            runs.len() <= exact + 2,
+            "expected unprotected regions to coalesce, got {} runs",
+            runs.len()
+        );
+        for &(r, m) in &runs {
+            device[r..r + m].copy_from_slice(&title[r..r + m]);
+        }
+        // Every title write landed.
+        for i in (0..PAGE).step_by(16) {
+            assert_eq!(&device[i..i + 4], &[0x55, 0x66, 0x77, 0x88]);
+        }
+        // Every older GPU write inside [2048, 2560) survived untouched.
+        for at in (2056..2560).step_by(16) {
+            assert_eq!(device[at], 0xaa, "older GPU write at {at} clobbered");
+        }
+    }
+
+    /// `CardSent` binary-searches per-send sorted ranges, skips only sends
+    /// strictly newer than `fetched_after`, tracks exact total count, and
+    /// prunes landed sends cleanly.
+    #[test]
+    fn card_sent_index_skips_only_newer_sends_and_prunes_in_order() {
+        let mut sent = CardSent::default();
+        sent.push_sorted(5, vec![(10, 20), (100, 120)]);
+        // 4,096 strided ranges in send 7 across 1 MiB.
+        let send7: Vec<(usize, usize)> = (0..4096).map(|i| (i * 256, i * 256 + 4)).collect();
+        sent.push_sorted(7, send7);
+        sent.push_sorted(9, vec![(65_536, 65_600)]);
+
+        assert_eq!(sent.len(), 2 + 4096 + 1);
+        assert!(sent.has_after(8));
+        assert!(!sent.has_after(9));
+
+        // Query [0, 1024) with fetched_after = 6: must include send 7's 4
+        // ranges in [0, 1024), exclude send 5 (<= 6) and send 9 (outside).
+        let mut skip = Vec::new();
+        sent.collect_skip(0, 1024, 6, &mut skip);
+        assert_eq!(skip, [(0, 4), (256, 260), (512, 516), (768, 772)]);
+
+        // Query with fetched_after = 7: send 7 is excluded too.
+        skip.clear();
+        sent.collect_skip(0, 1024, 7, &mut skip);
+        assert!(skip.is_empty());
+
+        // Query [65_500, 65_700) with fetched_after = 7: hits send 9 clamped.
+        sent.collect_skip(65_500, 65_700, 7, &mut skip);
+        assert_eq!(skip, [(65_536, 65_600)]);
+
+        // Prune up to 7: drops sends 5 and 7 in O(1), keeping only send 9.
+        assert!(sent.needs_prune(7));
+        sent.prune(7);
+        assert_eq!(sent.len(), 1);
+        assert!(!sent.needs_prune(7));
+        assert!(sent.has_after(8));
+        sent.prune(9);
+        assert_eq!(sent.len(), 0);
+        assert!(!sent.has_after(0));
+    }
+
+    /// End-to-end `Shadow::card_merge_relay` against indexed `CardSent` with
+    /// thousands of entries: skips only ranges with `sent_as > fetched_after`
+    /// while merging shader writes cleanly.
+    #[test]
+    fn card_merge_relay_indexed_sent_skips_only_ranges_after_fetched() {
+        const LEN: usize = 2 * PIECE;
+        let base: Vec<u8> = (0..LEN).map(|i| (i.wrapping_mul(17) ^ (i >> 8)) as u8).collect();
+        let mut title = base.clone();
+        let mut side = base.clone();
+        // Byte 100 sent in send 5 (<= fetched_after=6): must NOT be skipped.
+        // Byte 200 sent in send 7 (> fetched_after=6): MUST be skipped.
+        // Byte 300 sent in send 9 (> fetched_after=6): MUST be skipped.
+        // Byte 400 written only by shader: MUST land.
+        title[100] ^= 0x11;
+        side[100] = title[100];
+        title[200] ^= 0x22;
+        side[200] = title[200];
+        title[300] ^= 0x33;
+        side[300] = title[300];
+
+        let mut entries = vec![(100, 101, 5u64), (200, 201, 7u64), (300, 301, 9u64)];
+        // Add 4,096 unrelated ranges in piece 1 under send 8 to exercise indexing.
+        entries.extend((0..4096).map(|i| (PIECE + i * 16, PIECE + i * 16 + 4, 8u64)));
+
+        let Some(shadow) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            title.as_ptr() as u64,
+            LEN as u64,
+            Vec::new(),
+            entries,
+        ) else {
+            return; // no host GPU here
+        };
+
+        let mut gpu = base[..PIECE].to_vec();
+        gpu[100] = 0x99; // shader overwrote byte 100 after send 5
+        gpu[400] ^= 0x44; // shader wrote byte 400
+        let written = shadow.card_merge_relay(0, &gpu, 6, &mut Vec::new());
+        assert!(written > 0);
+        drop(shadow);
+
+        assert_eq!(title[100], 0x99, "send 5 (<= 6) should not block shader write");
+        assert_eq!(title[200], base[200] ^ 0x22, "send 7 (> 6) title byte must survive");
+        assert_eq!(title[300], base[300] ^ 0x33, "send 9 (> 6) title byte must survive");
+        assert_eq!(title[400], base[400] ^ 0x44, "shader write at 400 must land");
     }
 }

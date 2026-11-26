@@ -2156,8 +2156,8 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
-/// per range sent up.
+/// once (on by default; `VICTORY_CARD_REHASH_RUNS=0` disables), and not in
+/// a pass per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
 /// lists, and no timing so far names them: each walks its 64 KiB pieces
@@ -2166,9 +2166,21 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// ranges a frame: 514 such passes. The same pieces are hashed either way;
 /// a piece hashed when it need not be, or not hashed when it should, costs
 /// a fetch that finds nothing and loses no shader write.
+fn rehash_runs_enabled(setting: Option<&str>) -> bool {
+    setting.is_none_or(|v| v != "0")
+}
+
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| rehash_runs_enabled(std::env::var("VICTORY_CARD_REHASH_RUNS").ok().as_deref()))
+}
+
+#[cfg(test)]
+#[test]
+fn rehash_runs_defaults_on_and_honors_zero_override() {
+    assert!(rehash_runs_enabled(None));
+    assert!(rehash_runs_enabled(Some("1")));
+    assert!(!rehash_runs_enabled(Some("0")));
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -3856,6 +3868,31 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     wait_on_line(&LINE, &LINE_LANDED, why, true, done);
 }
 
+/// Settles in-flight relay submissions whose declared writes overlap
+/// `(shadow_ptr, from, to)` so `Shadow::update_busy` can upload a single
+/// contiguous range instead of hundreds of thousands of byte-diff fragments.
+pub(crate) fn settle_card_busy(shadow_ptr: usize, from: usize, to: usize) -> bool {
+    if !relay() || !late() {
+        return false;
+    }
+    let stale = [(shadow_ptr, from, to)];
+    let waited = if range_settle() && relay_exact() {
+        wait_on_line(&LINE, &LINE_LANDED, WHY_STALE, true, |line| {
+            !line_overlaps_stale(line, &stale)
+        })
+        .is_some()
+    } else {
+        wait_on_line(&LINE, &LINE_LANDED, WHY_STALE, true, |line| {
+            !line.settling && !line.line.iter().any(|l| matches!(l, Late::Run(_)))
+        })
+        .is_some()
+    };
+    if waited {
+        crate::watch::ask_once_void();
+    }
+    waited
+}
+
 /// Since the last frame-rate line: ReBAR relay fetches, bytes DMAed, and wait
 /// microseconds on the relay thread's copy path.
 static RELAY_REBAR_STATS: [std::sync::atomic::AtomicU64; 3] =
@@ -4852,6 +4889,8 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
+                    let mut compute_bound = false;
+                    let joins = rehash_runs();
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -4878,28 +4917,34 @@ impl Host {
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             )]);
                         }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
+                        if !compute_bound {
+                            list.SetComputeRootSignature(&work.root);
+                            list.SetPipelineState(&work.pso);
+                            list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(4, work.differs.0.GetGPUVirtualAddress());
+                            compute_bound = true;
+                        }
                         list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(4, work.differs.0.GetGPUVirtualAddress());
-                        let joins = rehash_runs();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
                             let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
                             for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
                                 match runs.last_mut() {
-                                    Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => {
+                                    Some(last) if joins && run.first <= last.first + last.pieces => {
+                                        last.pieces = last.pieces.max(run.first + run.pieces - last.first);
                                         last.to = last.to.max(run.to);
                                     }
                                     _ => runs.push(run),
                                 }
                             }
-                            runs
+                            if joins && runs.len() > 1 {
+                                crate::shadow::joined_piece_runs(runs)
+                            } else {
+                                runs
+                            }
                         };
-                        let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -5753,6 +5798,12 @@ impl Host {
         }
         self.log_messages();
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Release landed shadow write ranges before clearing `line` and waking
+        // `LINE_LANDED` waiters (`settle` / `settle_stale`), so woken submits
+        // do not still observe landed flights in `shadow.pending`/`flights`.
+        for (shadow, ranges) in &backs {
+            shadow.copy_back_done(ranges);
+        }
         {
             let mut line = line();
             let Line {
@@ -5788,9 +5839,6 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
-        for (shadow, ranges) in &backs {
-            shadow.copy_back_done(ranges);
-        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
@@ -10865,7 +10913,7 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=0 disables: now {}), {compares:.0} compare passes",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
