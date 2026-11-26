@@ -624,6 +624,53 @@ fn record_clamp_with(
     true
 }
 
+/// Tracks which argument buffers may still be gathered into a list's prelude.
+///
+/// A command that writes to a known host copy (`src_id`) blocks future gathers
+/// from that buffer alone, leaving unmodified argument buffers gatherable; an
+/// unbounded or unknown write closes gathering globally for the rest of the
+/// list. Records gathered before a write remain valid because the prelude runs
+/// before the list.
+#[derive(Default)]
+pub(crate) struct GatherGate {
+    closed: bool,
+    written: Vec<u64>,
+}
+
+impl GatherGate {
+    /// Maximum distinct per-buffer poisons tracked before promoting to a global close.
+    const MAX_WRITTEN: usize = 64;
+
+    /// Closes gathering globally for the rest of the list.
+    pub(crate) fn close_all(&mut self) {
+        self.closed = true;
+        self.written.clear();
+    }
+
+    /// Blocks future gathering from host copy `src_id`.
+    pub(crate) fn close_buffer(&mut self, src_id: u64) {
+        if self.closed || self.written.contains(&src_id) {
+            return;
+        }
+        if self.written.len() >= Self::MAX_WRITTEN {
+            self.close_all();
+        } else {
+            self.written.push(src_id);
+        }
+    }
+
+    /// Whether a draw at the current point in the list may gather from `src_id`.
+    pub(crate) fn allows(&self, src_id: u64) -> bool {
+        !self.closed && !self.written.contains(&src_id)
+    }
+
+    /// Re-opens gathering when the list is reset for a new recording.
+    pub(crate) fn reset(&mut self) {
+        self.closed = false;
+        self.written.clear();
+    }
+}
+
 /// The most records of one argument buffer gathered for a list
 /// ([`gather`]): a multiple of the clamp's 64 threads a group, so that the
 /// threads past the last record read inside the table.
@@ -885,7 +932,7 @@ pub(crate) fn record_gathers(
 
 /// How clamps of indirect draws are recorded (`VICTORY_HOIST_CLAMPS`, opt-in):
 /// - `0` (default): off — each clamp runs inline before its draw (or via
-///   `VICTORY_INDIRECT_AMPLIFY=1` / windowed clamping, 100% intact).
+///   `VICTORY_INDIRECT_AMPLIFY` / windowed clamping, 100% intact).
 /// - `1`: in a list of their own before the list that draws, so that a run of
 ///   draws is not interleaved with our dispatches.
 /// - `2`: as `1`, with a UAV barrier before each draw.
@@ -2061,6 +2108,79 @@ void main(uint3 g : SV_GroupID) {
         // Each record costs 2^26: the budget keeps BUDGET >> 26 of them.
         let fit = (BUDGET >> 26) as usize;
         assert_eq!((kept, zeroed), (fit, (RECORDS as usize) - fit));
+    }
+
+    #[test]
+    fn gather_gate_tracks_per_buffer_and_global_close() {
+        let mut gate = GatherGate::default();
+        assert!(gate.allows(10));
+        assert!(gate.allows(20));
+
+        // Writing buffer A blocks future gathers from A while allowing unmodified buffer B.
+        gate.close_buffer(10);
+        assert!(!gate.allows(10));
+        assert!(gate.allows(20));
+        assert!(gate.allows(30));
+
+        // Duplicate close_buffer is idempotent and does not consume extra slots.
+        gate.close_buffer(10);
+        assert!(!gate.allows(10));
+        assert!(gate.allows(20));
+
+        // Unbounded/unknown write closes gathering globally for every buffer.
+        gate.close_all();
+        assert!(!gate.allows(10));
+        assert!(!gate.allows(20));
+        assert!(!gate.allows(999));
+
+        // Reset re-opens gathering for the next recording.
+        gate.reset();
+        assert!(gate.allows(10));
+        assert!(gate.allows(20));
+
+        // Overflowing MAX_WRITTEN distinct buffers promotes cleanly to global close.
+        for id in 0..GatherGate::MAX_WRITTEN as u64 {
+            gate.close_buffer(id);
+            assert!(!gate.allows(id));
+        }
+        assert!(gate.allows(10_000));
+        gate.close_buffer(10_000);
+        assert!(!gate.allows(10_000));
+        assert!(!gate.allows(20_000));
+    }
+
+    #[test]
+    fn host_list_gather_slot_respects_per_buffer_and_global_close() {
+        let Some(h) = host() else {
+            return;
+        };
+        let Ok(list) = h.new_list() else {
+            return;
+        };
+        let Some(buf_a) = h.uav_buffer(4096) else {
+            return;
+        };
+        let Some(buf_b) = h.uav_buffer(4096) else {
+            return;
+        };
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 16;
+
+        // Before any write: both buffer A (id 1) and buffer B (id 2) gather cleanly.
+        assert!(gather(&list, (&buf_a, 1), 0, (KIND_DRAW, STRIDE)).is_some());
+        assert!(gather(&list, (&buf_b, 2), 0, (KIND_DRAW, STRIDE)).is_some());
+
+        // Write to buffer A: blocks A, while B continues to gather new slots.
+        list.gather_close_buffer(1);
+        assert!(gather(&list, (&buf_a, 1), 32, (KIND_DRAW, STRIDE)).is_none());
+        assert!(gather(&list, (&buf_b, 2), 32, (KIND_DRAW, STRIDE)).is_some());
+
+        // Unbounded write: closes globally for B as well.
+        list.gather_close();
+        assert!(gather(&list, (&buf_b, 2), 64, (KIND_DRAW, STRIDE)).is_none());
+
+        list.close();
+        h.execute(&[&list]);
     }
 
     #[test]

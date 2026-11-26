@@ -1140,9 +1140,9 @@ fn mesh_pipeline(
 /// The register space of our amplification stage's buffer and constant.
 const AMPLIFY_SPACE: u32 = 31245;
 
-/// `VICTORY_INDIRECT_AMPLIFY=1` (experiment): the amplification stage that
-/// stands for `ExecuteIndirect` on one-record indirect mesh draws. It
-/// reads the record (three group counts) from the title's argument buffer
+/// On by default (`VICTORY_INDIRECT_AMPLIFY=0` disables): the amplification
+/// stage that stands for `ExecuteIndirect` on one-record indirect mesh draws.
+/// It reads the record (three group counts) from the title's argument buffer
 /// at the byte offset a root constant gives, bounds it as the argument
 /// clamp does (65,535 groups by 1 by 1) and dispatches the mesh shader
 /// that many times. The draw is then a direct `DispatchMesh(1, 1, 1)`:
@@ -1150,7 +1150,7 @@ const AMPLIFY_SPACE: u32 = 31245;
 /// when it runs the draw, whoever wrote it.
 ///
 /// Compiled once with the PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest
-/// Windows SDK's); `None` without the switch or without a compiler.
+/// Windows SDK's); `None` when disabled or without a compiler.
 pub(crate) fn amplifier() -> Option<&'static [u8]> {
     const SOURCE: &str = "struct Nothing { uint none; };
 RWByteAddressBuffer records : register(u0, space31245);
@@ -1166,7 +1166,7 @@ void main() {
 ";
     static CODE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     CODE.get_or_init(|| {
-        if std::env::var_os("VICTORY_INDIRECT_AMPLIFY").is_none_or(|v| v != "1") {
+        if !victory_shader::emit::indirect_amplify_enabled() {
             return None;
         }
         let dxc = match std::env::var_os("VICTORY_PC_DXC") {
@@ -1193,7 +1193,7 @@ void main() {
         };
         let _ = (std::fs::remove_file(&hlsl), std::fs::remove_file(&out));
         if let Some(code) = &code {
-            tracing::info!(bytes = code.len(), "the amplification stage for one-record indirect mesh draws is compiled (VICTORY_INDIRECT_AMPLIFY=1)");
+            tracing::info!(bytes = code.len(), "the amplification stage for one-record indirect mesh draws is compiled (VICTORY_INDIRECT_AMPLIFY=0 disables)");
         }
         code
     })
@@ -1591,5 +1591,24 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+
+    #[test]
+    fn indirect_amplify_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        use victory_shader::emit::parse_indirect_amplify;
+
+        assert!(parse_indirect_amplify(None));
+        assert!(parse_indirect_amplify(Some(OsStr::new("1"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new("true"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new("on"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new(""))));
+
+        assert!(!parse_indirect_amplify(Some(OsStr::new("0"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new(" 0 "))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("false"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("FALSE"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("no"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("off"))));
     }
 }

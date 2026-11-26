@@ -191,15 +191,41 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
-/// The payload bytes mesh shaders declare: 4 with
-/// `VICTORY_INDIRECT_AMPLIFY=1` (experiment: `victory-gpu` puts an
-/// amplification stage of its own before them, whose payload is one word
-/// they do not read; the host wants the two sizes to agree), else 0.
-/// shortcut: not in the shader cache's key; a cache made with the other
-/// setting holds mesh shaders of the other size.
+/// Parses `VICTORY_INDIRECT_AMPLIFY`: enabled by default; explicit `"0"`,
+/// `"false"`, `"no"`, or `"off"` (ASCII case-insensitive) disables the
+/// amplification stage for one-record indirect mesh draws.
+pub fn parse_indirect_amplify(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let Some(text) = value.to_str() else {
+        return true;
+    };
+    let trimmed = text.trim();
+    !(trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off"))
+}
+
+/// Whether one-record indirect mesh draws use our amplification stage
+/// (`VICTORY_INDIRECT_AMPLIFY=0` disables).
+///
+/// Part of the translation: the shader cache keys on it (`translation_fingerprint`).
+pub fn indirect_amplify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_indirect_amplify(std::env::var_os("VICTORY_INDIRECT_AMPLIFY").as_deref())
+    })
+}
+
+/// The payload bytes mesh shaders declare: 4 when
+/// [`indirect_amplify_enabled`] (`VICTORY_INDIRECT_AMPLIFY=0` disables;
+/// `victory-gpu` puts an amplification stage of its own before them, whose
+/// payload is one word they do not read; the host wants the two sizes to
+/// agree), else 0.
 pub(crate) fn mesh_payload() -> u32 {
-    static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| if std::env::var_os("VICTORY_INDIRECT_AMPLIFY").is_some_and(|v| v == "1") { 4 } else { 0 })
+    if indirect_amplify_enabled() { 4 } else { 0 }
 }
 
 /// Whether translated shaders emit 64 KiB page write marks into the host's
@@ -238,6 +264,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(u8::from(view_marks_enabled()));
+    out.push(u8::from(indirect_amplify_enabled()));
     out
 }
 

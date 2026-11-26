@@ -1143,10 +1143,8 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// What a list gathers for its prelude to clamp (`crate::indirect::gather`).
 #[derive(Default)]
 struct Gather {
-    /// Something recorded in the list may write arguments: no record is
-    /// gathered from here on (the ones gathered before are read before
-    /// the list runs, which is before that).
-    closed: bool,
+    /// Which argument buffers may still be gathered (per-buffer or global close).
+    gate: crate::indirect::GatherGate,
     /// One set per argument buffer, kind and stride.
     sets: Vec<crate::indirect::GatherSet>,
     /// The budget words the gathered records are charged to.
@@ -7274,12 +7272,12 @@ impl HostList {
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
             let Gather {
-                closed,
+                gate,
                 sets,
                 spare,
                 ..
             } = &mut *gather;
-            *closed = false;
+            gate.reset();
             for set in sets.drain(..) {
                 if spare.len() < GATHER_SETS {
                     spare.push(set.into_scratch());
@@ -7936,9 +7934,15 @@ impl HostList {
     }
 
     /// From here on the list gathers no records (`crate::indirect::gather`):
-    /// what is about to be recorded may write arguments.
+    /// what is about to be recorded may write arbitrary arguments.
     pub(crate) fn gather_close(&self) {
-        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        self.gather.lock().unwrap_or_else(|e| e.into_inner()).gate.close_all();
+    }
+
+    /// From here on the list gathers no records from host copy `src_id`:
+    /// unmodified argument buffers may still gather.
+    pub(crate) fn gather_close_buffer(&self, src_id: u64) {
+        self.gather.lock().unwrap_or_else(|e| e.into_inner()).gate.close_buffer(src_id);
     }
 
     /// A slot for the record at `offset` of the host copy `src` in the
@@ -7956,7 +7960,7 @@ impl HostList {
             None
         };
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-        if gather.closed {
+        if !gather.gate.allows(src_id) {
             return none(1);
         }
         let found = gather.sets.iter().position(|s| {
