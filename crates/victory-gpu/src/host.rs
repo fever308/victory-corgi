@@ -3810,14 +3810,22 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut by_shadow: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+                let key = Arc::as_ptr(shadow) as usize;
+                match by_shadow.get(&key) {
+                    Some(&i) => {
+                        let s = &mut spans[i];
+                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    }
+                    None => {
+                        by_shadow.insert(key, spans.len());
+                        spans.push((shadow.clone(), *address, *address + *len));
+                    }
                 }
             }
         }
@@ -5138,8 +5146,9 @@ impl Host {
                         };
                         for &(a, b) in ranges {
                             list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
-                            crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
+                        let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
+                        crate::shadow::CARD_STATS[0].fetch_add(bytes, Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
                         let Some(before) = before else {
                             continue;
@@ -5163,13 +5172,22 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(4, work.differs.0.GetGPUVirtualAddress());
+                        let joins = rehash_runs();
                         let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
                             vec![shadow.card_run(0, usize::MAX)]
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
+                            let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
+                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                                match runs.last_mut() {
+                                    Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => {
+                                        last.to = last.to.max(run.to);
+                                    }
+                                    _ => runs.push(run),
+                                }
+                            }
+                            runs
                         };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -6646,6 +6664,9 @@ impl Host {
                 SUBMIT_PHASES[SUB_ASK_ONCE_US].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
+        if prep::ahead_of_writes() {
+            batch.refresh_ahead(runs);
+        }
         for list in runs {
             list.run_deferred(&mut batch, self, &mut submitted);
             firsts.push(lists.len());
@@ -6654,6 +6675,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        batch.fill();
         batch.flush();
         {
             let t = std::time::Instant::now();
@@ -8735,6 +8757,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    batch.fill();
                     batch.title_written();
                     // `batch.title_written()` already timed and accounted its
                     // flushed refreshes in `PREPARING[0]`; measure only this
@@ -8751,6 +8774,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    if prep::wide_fills() {
+                        batch.fills.push((dst, src, len));
+                        continue;
+                    }
                     crate::shadow::copy_mapped_wide(dst as *mut u8, src as *const u8, len);
                     (len, true)
                 }
@@ -8764,6 +8791,7 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    batch.fill();
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
@@ -8864,22 +8892,25 @@ fn wide_refresh_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> b
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+#[path = "host_prep.rs"]
+mod prep;
+
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Where each copy (by address) is in `refreshes`: the list that makes
-    /// the heap's buffers ready adds some 4,100 copies, and searching them
-    /// for every refresh of a submission was tens of millions of
-    /// comparisons a frame.
     index: std::collections::HashMap<usize, usize>,
-    /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    fills: Vec<(usize, usize, usize)>,
+    ahead: std::collections::HashMap<usize, (usize, usize)>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+            return;
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -8895,7 +8926,9 @@ impl Batch {
     /// Before shaders are given a range of `shadow`'s copy: its pending
     /// refresh is done, the others stay pending.
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
-        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        self.ahead.remove(&key);
+        let Some(at) = self.index.remove(&key) else {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
@@ -8927,6 +8960,7 @@ impl Batch {
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
+        self.ahead.clear();
         self.textures.clear();
     }
 

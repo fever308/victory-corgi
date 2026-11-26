@@ -34,6 +34,69 @@ use std::sync::{Mutex, OnceLock, RwLock};
 pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
+/// The 4 KiB parts of a 64 KiB page.
+const PARTS: usize = PAGE / KERNEL_PAGE;
+/// All 16 parts of a 64 KiB page.
+const WHOLE: u16 = u16::MAX;
+
+/// Whether the 4 KiB parts of a page that `GetWriteWatch` names are kept so
+/// refreshes copy only the written 4 KiB sub-pages (`VICTORY_PAGE_PARTS=0`:
+/// copy the whole 64 KiB page, as before).
+fn parts_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_PARTS").is_none_or(|v| v != "0"))
+}
+
+/// Whether `Tracked::take` narrows previously-taken pages to their written
+/// 4 KiB sub-pages (`VICTORY_TAKE_PARTS=0`: whole 64 KiB pages).
+fn take_parts_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TAKE_PARTS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a write fault opens only the view that faulted and leaves other
+/// alias views read-only (marked unclean) (`VICTORY_OPEN_ONE_VIEW=0`: opens
+/// every alias view).
+fn open_one_view() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OPEN_ONE_VIEW").is_none_or(|v| v != "0"))
+}
+
+/// How long a view block just opened by a CPU write fault rests writable
+/// before refreshes guard it again (`VICTORY_GUARD_REST=<microseconds>`,
+/// 3,000 unless given; `0`: no rest).
+fn rest() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        REST_IN_TEST.get()
+    }
+    #[cfg(not(test))]
+    {
+        static US: OnceLock<u64> = OnceLock::new();
+        let us = *US.get_or_init(|| match std::env::var("VICTORY_GUARD_REST").as_deref() {
+            Ok("0") => 0,
+            Ok(v) => v.trim().parse::<u64>().ok().filter(|&us| us > 1).unwrap_or(3000),
+            Err(_) => 3000,
+        });
+        std::time::Duration::from_micros(us)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`rest`], for what this test thread asks (0 by default so existing tests
+    /// see immediate re-guarding unless opted in).
+    static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// Of pages previously copied (page number, epoch taken): the 4 KiB parts
+/// written since, a bit per 4 KiB, in the same order.
+pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if !parts_on() {
+        return vec![WHOLE; pages.len()];
+    }
+    pages.iter().map(|&(page, taken)| DIR.parts_since(page, taken)).collect()
+}
 
 /// Master switch for Milestone 4 watch redesign (lock-free `PageDir`,
 /// flat cold-page `PAGE_READONLY` promotion, and contiguous `VirtualProtect`
@@ -136,6 +199,11 @@ enum BitField {
 struct LeafChunk {
     written_bits: [AtomicU64; CHUNK_WORDS],
     written_epoch: [AtomicU64; CHUNK_PAGES],
+    /// Latest epoch at which the whole 64 KiB page was marked dirty.
+    whole_epoch: [AtomicU64; CHUNK_PAGES],
+    /// Lazily allocated per-4 KiB sub-page write epochs (only for chunks that
+    /// receive partial `GetWriteWatch` writes).
+    parts_epoch: AtomicPtr<[[AtomicU64; PARTS]; CHUNK_PAGES]>,
     watched_bits: [AtomicU64; CHUNK_WORDS],
     cold_ro_bits: [AtomicU64; CHUNK_WORDS],
     cold_streak: [AtomicU8; CHUNK_PAGES],
@@ -153,6 +221,8 @@ impl LeafChunk {
         Self {
             written_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
             written_epoch: [const { AtomicU64::new(0) }; CHUNK_PAGES],
+            whole_epoch: [const { AtomicU64::new(0) }; CHUNK_PAGES],
+            parts_epoch: AtomicPtr::new(std::ptr::null_mut()),
             watched_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
             cold_ro_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
             cold_streak: [const { AtomicU8::new(0) }; CHUNK_PAGES],
@@ -164,6 +234,34 @@ impl LeafChunk {
             guard_viewed_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
             lazy_armed_bits: [const { AtomicU64::new(0) }; CHUNK_WORDS],
         }
+    }
+
+    fn get_or_alloc_parts(&self) -> &[[AtomicU64; PARTS]; CHUNK_PAGES] {
+        let mut ptr = self.parts_epoch.load(Ordering::Acquire);
+        if ptr.is_null() {
+            let mut v: Vec<[AtomicU64; PARTS]> = Vec::with_capacity(CHUNK_PAGES);
+            v.resize_with(CHUNK_PAGES, || [const { AtomicU64::new(0) }; PARTS]);
+            let boxed: Box<[[AtomicU64; PARTS]; CHUNK_PAGES]> = v
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("exact chunk length"));
+            let fresh = Box::into_raw(boxed);
+            match self.parts_epoch.compare_exchange(
+                std::ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => ptr = fresh,
+                Err(existing) => {
+                    // SAFETY: `fresh` was never published to any other thread.
+                    unsafe { drop(Box::from_raw(fresh)) };
+                    ptr = existing;
+                }
+            }
+        }
+        // SAFETY: `ptr` is non-null and permanently live once published.
+        unsafe { &*ptr }
     }
 
     #[inline]
@@ -380,10 +478,26 @@ impl PageDir {
 
     #[inline]
     fn record_written(&self, page: usize, epoch: u64) {
-        if epoch == 0 {
+        self.record_written_parts(page, WHOLE, epoch);
+    }
+
+    #[inline]
+    fn record_written_parts(&self, page: usize, parts: u16, epoch: u64) {
+        if epoch == 0 || parts == 0 {
             return;
         }
         if let Some((leaf, idx)) = self.get_or_alloc(page) {
+            if parts == WHOLE || !parts_on() {
+                leaf.whole_epoch[idx].fetch_max(epoch, Ordering::AcqRel);
+            } else {
+                let table = leaf.get_or_alloc_parts();
+                let mut mask = parts;
+                while mask != 0 {
+                    let k = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    table[idx][k].fetch_max(epoch, Ordering::AcqRel);
+                }
+            }
             leaf.written_epoch[idx].fetch_max(epoch, Ordering::AcqRel);
             leaf.written_bits[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
         }
@@ -394,9 +508,40 @@ impl PageDir {
         let Some((leaf, idx)) = self.get_or_alloc(page) else {
             return 0;
         };
+        leaf.whole_epoch[idx].fetch_max(epoch, Ordering::AcqRel);
         let prev = leaf.written_epoch[idx].fetch_max(epoch, Ordering::AcqRel);
         leaf.written_bits[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
         prev
+    }
+
+    /// The 4 KiB parts of `page` written at an epoch strictly after `taken`.
+    fn parts_since(&self, page: usize, taken: u64) -> u16 {
+        if !parts_on() || taken == 0 {
+            return WHOLE;
+        }
+        let Some((leaf, idx)) = self.get(page) else {
+            return WHOLE;
+        };
+        if leaf.whole_epoch[idx].load(Ordering::Acquire) > taken {
+            return WHOLE;
+        }
+        let ptr = leaf.parts_epoch.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return if leaf.written_epoch[idx].load(Ordering::Acquire) > taken {
+                WHOLE
+            } else {
+                0
+            };
+        }
+        // SAFETY: `ptr` is non-null and permanently live once published.
+        let slots = unsafe { &(*ptr)[idx] };
+        let mut mask = 0u16;
+        for (k, at) in slots.iter().enumerate() {
+            if at.load(Ordering::Acquire) > taken {
+                mask |= 1u16 << k;
+            }
+        }
+        mask
     }
 
     fn collect_written(&self, first: usize, last: usize) -> (Vec<(usize, u64)>, u64) {
@@ -689,8 +834,16 @@ impl PageDir {
                 leaf.written_bits[w].fetch_and(!mask, Ordering::SeqCst);
                 true
             });
+            let parts_ptr = leaf.parts_epoch.load(Ordering::Acquire);
             for idx in lo_idx..hi_idx {
                 leaf.written_epoch[idx].store(0, Ordering::SeqCst);
+                leaf.whole_epoch[idx].store(0, Ordering::SeqCst);
+                if !parts_ptr.is_null() {
+                    // SAFETY: `parts_ptr` is permanently live once published.
+                    for slot in unsafe { &(*parts_ptr)[idx] } {
+                        slot.store(0, Ordering::SeqCst);
+                    }
+                }
             }
             true
         });
@@ -700,7 +853,7 @@ impl PageDir {
         &self,
         first: usize,
         last: usize,
-        dirty_sorted: &[usize],
+        dirty_sorted: &[(usize, u16)],
         frame32: u32,
         threshold: u8,
         out_promote: &mut Vec<usize>,
@@ -708,7 +861,7 @@ impl PageDir {
         if first >= last {
             return;
         }
-        let mut dirty_idx = dirty_sorted.partition_point(|&p| p < first);
+        let mut dirty_idx = dirty_sorted.partition_point(|&(p, _)| p < first);
         self.for_each_chunk(first, last, true, |chunk_page, leaf, lo_idx, hi_idx| {
             // Mark pages confirmed write-watched.
             for_each_word_in_chunk(lo_idx, hi_idx, |w, mask| {
@@ -717,10 +870,10 @@ impl PageDir {
             });
             for idx in lo_idx..hi_idx {
                 let page = chunk_page + idx;
-                while dirty_idx < dirty_sorted.len() && dirty_sorted[dirty_idx] < page {
+                while dirty_idx < dirty_sorted.len() && dirty_sorted[dirty_idx].0 < page {
                     dirty_idx += 1;
                 }
-                if dirty_idx < dirty_sorted.len() && dirty_sorted[dirty_idx] == page {
+                if dirty_idx < dirty_sorted.len() && dirty_sorted[dirty_idx].0 == page {
                     leaf.cold_streak[idx].store(0, Ordering::Release);
                     leaf.cold_last_frame[idx].store(frame32, Ordering::Release);
                     continue;
@@ -928,8 +1081,9 @@ fn in_view(first: usize, last: usize) -> bool {
 }
 
 /// Calls `GetWriteWatch(WRITE_WATCH_FLAG_RESET)` on `[first, last)` and
-/// returns `Some(dirty_pages_sorted_deduped)` on success or `None` on failure.
-fn call_get_write_watch(first: usize, last: usize, stats_kind_base: usize) -> Option<Vec<usize>> {
+/// returns `Some(dirty_pages_sorted_deduped_with_4k_parts)` on success or
+/// `None` on failure.
+fn call_get_write_watch(first: usize, last: usize, stats_kind_base: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     if first >= last {
@@ -974,9 +1128,33 @@ fn call_get_write_watch(first: usize, last: usize, stats_kind_base: usize) -> Op
             add(C::WatchUs, started.elapsed().as_micros() as u64);
             slow(started.elapsed().as_micros() as u64);
         }
-        let mut dirty: Vec<usize> = buf[..count].iter().map(|&at| at / PAGE).collect();
-        dirty.sort_unstable();
-        dirty.dedup();
+        let mut dirty: Vec<(usize, u16)> = Vec::new();
+        let mut in_order = true;
+        for &at in &buf[..count] {
+            let page = at / PAGE;
+            let part = 1u16 << ((at % PAGE) / KERNEL_PAGE);
+            match dirty.last_mut() {
+                Some((last, parts)) if *last == page => *parts |= part,
+                Some((last, _)) => {
+                    if page < *last {
+                        in_order = false;
+                    }
+                    dirty.push((page, part));
+                }
+                None => dirty.push((page, part)),
+            }
+        }
+        if !in_order {
+            dirty.sort_unstable_by_key(|&(page, _)| page);
+            let mut merged: Vec<(usize, u16)> = Vec::with_capacity(dirty.len());
+            for (page, part) in dirty {
+                match merged.last_mut() {
+                    Some((last, parts)) if *last == page => *parts |= part,
+                    _ => merged.push((page, part)),
+                }
+            }
+            dirty = merged;
+        }
         Some(dirty)
     })
 }
@@ -1070,12 +1248,12 @@ fn promote_cold_pages(candidates: &[usize]) {
                 return;
             }
             let now = next_epoch();
-            let mut d_idx = dirty.partition_point(|&b| b < from);
+            let mut d_idx = dirty.partition_point(|&(b, _)| b < from);
             for block in from..to {
-                while d_idx < dirty.len() && dirty[d_idx] < block {
+                while d_idx < dirty.len() && dirty[d_idx].0 < block {
                     d_idx += 1;
                 }
-                if d_idx < dirty.len() && dirty[d_idx] == block {
+                if d_idx < dirty.len() && dirty[d_idx].0 == block {
                     DIR.reset_cold(block, frame32);
                     // SAFETY: restoring `PAGE_READWRITE` on a block whose write snuck in before promotion.
                     unsafe {
@@ -1086,7 +1264,7 @@ fn promote_cold_pages(candidates: &[usize]) {
                             &mut old,
                         );
                     }
-                    DIR.record_written(block, now);
+                    DIR.record_written_parts(block, dirty[d_idx].1, now);
                 } else {
                     DIR.set_bit(block, BitField::ColdRo, true, Ordering::SeqCst);
                 }
@@ -1164,8 +1342,8 @@ fn ask_non_cold_bisect(
         return;
     }
     if let Some(dirty) = call_get_write_watch(first, last, 0) {
-        for &p in &dirty {
-            DIR.record_written(p, now);
+        for &(p, parts) in &dirty {
+            DIR.record_written_parts(p, parts, now);
         }
         DIR.note_clean_for_cold(first, last, &dirty, frame32, threshold, to_promote);
         push_merged_interval(covered, first, last);
@@ -1326,8 +1504,8 @@ fn collect_and_ask_batch(
                     ask_merged_interval(a, b, now, frame32, threshold, &mut covered, &mut to_promote);
                 }
             } else if let Some(dirty) = call_get_write_watch(group_first, group_last, 0) {
-                for &p in &dirty {
-                    DIR.record_written(p, now);
+                for &(p, parts) in &dirty {
+                    DIR.record_written_parts(p, parts, now);
                 }
                 for &(a, b) in &merged[i..k] {
                     DIR.note_clean_for_cold(a, b, &dirty, frame32, threshold, &mut to_promote);
@@ -1695,7 +1873,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             Some(next_epoch())
         } else {
             let mut all_ok = true;
-            let mut run_dirty: Vec<Vec<usize>> = Vec::with_capacity(non_cold.len());
+            let mut run_dirty: Vec<Vec<(usize, u16)>> = Vec::with_capacity(non_cold.len());
             for &(r0, r1) in &non_cold {
                 if let Some(d) = call_get_write_watch(r0, r1, 2) {
                     run_dirty.push(d);
@@ -1726,8 +1904,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 }
                 let now = next_epoch();
                 for (&(r0, r1), dirty) in non_cold.iter().zip(&run_dirty) {
-                    for &p in dirty {
-                        DIR.record_written(p, now);
+                    for &(p, parts) in dirty {
+                        DIR.record_written_parts(p, parts, now);
                     }
                     DIR.note_clean_for_cold(
                         r0,
@@ -1813,13 +1991,12 @@ impl Tracked {
             return Vec::new();
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut new: Vec<(usize, u64)> = Vec::new();
         for (page, write) in pages {
-            if seen.get(&page).is_some_and(|&last| last >= write) {
-                continue;
-            }
-            let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
-            if start >= end {
+            let last = seen.get(&page).copied();
+            if last.is_some_and(|last| last >= write)
+                || (page * PAGE).max(from) >= ((page + 1) * PAGE).min(to)
+            {
                 continue;
             }
             // Keep partial pages dirty: the caller has not taken the rest.
@@ -1828,9 +2005,33 @@ impl Tracked {
             {
                 seen.insert(page, write);
             }
-            match ranges.last_mut() {
-                Some((_, last)) if *last == start => *last = end,
-                _ => ranges.push((start, end)),
+            new.push((page, last.unwrap_or(0)));
+        }
+        // Of a page taken before, take only the 4 KiB parts written since
+        // (`VICTORY_TAKE_PARTS=0`: whole 64 KiB pages).
+        let parts = if take_parts_on() {
+            parts_written(&new)
+        } else {
+            vec![WHOLE; new.len()]
+        };
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for (&(page, last), &parts) in new.iter().zip(&parts) {
+            let mut parts = if last == 0 { WHOLE } else { parts };
+            while parts != 0 {
+                let first = parts.trailing_zeros() as usize;
+                let past = first + (!(parts >> first)).trailing_zeros() as usize;
+                parts &= if past >= PARTS { 0 } else { u16::MAX << past };
+                let (start, end) = (
+                    (page * PAGE + first * KERNEL_PAGE).max(from),
+                    (page * PAGE + past.min(PARTS) * KERNEL_PAGE).min(to),
+                );
+                if start >= end {
+                    continue;
+                }
+                match ranges.last_mut() {
+                    Some((_, last)) if *last == start => *last = end,
+                    _ => ranges.push((start, end)),
+                }
             }
         }
         ranges
@@ -1869,6 +2070,8 @@ struct Guards {
     /// Blocks the kernel is about to write for the runtime ([`kernel_writing`]),
     /// keyed by disjoint `[first, last)` block intervals with their expiry.
     pins: BTreeMap<usize, (usize, std::time::Instant)>,
+    /// View blocks opened by a CPU write fault, and when ([`rest`]).
+    opened: Option<std::collections::HashMap<usize, std::time::Instant>>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -1906,12 +2109,45 @@ fn view_known() -> bool {
 
 static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     pins: BTreeMap::new(),
+    opened: None,
 });
 
 /// How long blocks stay writable after [`kernel_writing`].
 const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Guards {
+    /// Whether `block` is resting writable after a recent CPU write fault.
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero()
+            && self
+                .opened
+                .as_ref()
+                .and_then(|m| m.get(&block))
+                .is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// Records that a CPU write fault just opened `block`.
+    fn opened(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        let map = self.opened.get_or_insert_with(Default::default);
+        if map.len() >= MANY {
+            map.retain(|_, at| at.elapsed().as_millis() < 50);
+            if map.len() >= MANY {
+                map.clear();
+            }
+        }
+        map.insert(block, std::time::Instant::now());
+    }
+
+    /// Forgets fault-rest timestamps for remapped/unmapped blocks `[first, last)`.
+    fn forget_opened(&mut self, first: usize, last: usize) {
+        if let Some(map) = self.opened.as_mut()
+            && !map.is_empty()
+        {
+            map.retain(|&b, _| b < first || b >= last);
+        }
+    }
+
     /// Whether `block` is left writable for a kernel write (`O(log P)`).
     fn pinned(&self, block: usize) -> bool {
         if self.pins.is_empty() {
@@ -2025,6 +2261,8 @@ pub(crate) fn note_lazy_view_armed(armed_vas: &[usize]) {
     let now = next_epoch();
     for &va in armed_vas {
         let b = va / PAGE;
+        DIR.set_bit(b, BitField::GuardProtected, false, Ordering::SeqCst);
+        DIR.set_bit(b, BitField::GuardClean, false, Ordering::SeqCst);
         DIR.record_written(b, now);
         DIR.set_bit(b, BitField::LazyArmed, true, Ordering::SeqCst);
     }
@@ -2111,6 +2349,8 @@ pub(crate) fn try_arm_lazy_under_guards(
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if guard_bits_fast_enabled() && DIR.all_guard_clean_or_lazy(first, last) {
+        #[cfg(feature = "diagnostics")]
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         return Some(Vec::new());
     }
     // `VICTORY_GUARD_ASK=1` asks Windows (`is_view`) on every guard check even
@@ -2125,28 +2365,42 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return None;
     }
     install();
+    let rest = rest();
     if guard_bits_fast_enabled() {
         let runs = DIR.collect_non_clean_non_lazy_runs(first, last);
         let mut written = Vec::new();
         if runs.is_empty() {
             return Some(written);
         }
-        let mut g = guards();
-        g.prune_pins();
+        // Release `GUARDS` between disjoint runs so title write faults are not
+        // queued behind a long multi-run guard pass.
         for (from, to) in runs {
-            guard_run(&mut g, from, to, &mut written);
+            let mut g = guards();
+            g.prune_pins();
+            guard_run(&mut g, from, to, &mut written, rest);
         }
+        #[cfg(feature = "diagnostics")]
+        crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
         return Some(written);
     }
     let mut g = guards();
     g.prune_pins();
     let mut written = Vec::new();
-    guard_run(&mut g, first, last, &mut written);
+    guard_run(&mut g, first, last, &mut written, rest);
+    drop(g);
+    #[cfg(feature = "diagnostics")]
+    crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
     Some(written)
 }
 
 /// [`guard`] for the blocks `first..last`, with the lock held alone.
-fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>) {
+fn guard_run(
+    g: &mut Guards,
+    first: usize,
+    last: usize,
+    written: &mut Vec<usize>,
+    rest: std::time::Duration,
+) {
     if first >= last {
         return;
     }
@@ -2169,31 +2423,35 @@ fn guard_run(g: &mut Guards, first: usize, last: usize, written: &mut Vec<usize>
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.pinned(block) || (lazy && crate::lazy_back::has_block(block)) {
-                // The kernel may be writing it or lazy copy-back holds it as
-                // PAGE_NOACCESS: left as-is, reported written at every check.
+            if g.pinned(block)
+                || (lazy && crate::lazy_back::has_block(block))
+                || g.rests(block, rest)
+            {
+                // Left open (pinned for kernel write, lazy copy-back armed, or
+                // resting after a recent CPU write fault): reported written at
+                // every check until it is eligible to be guarded again.
             } else if DIR.is_guard_protected(block) {
                 // Already read-only (e.g. guarded as an alias, or left unclean
                 // after an alias rebind / unguardable alias): becomes clean only
                 // once every alias view is also guarded.
                 if let Some(from) = run.take() {
-                    protect(g, from, block, lazy);
+                    protect(g, from, block, lazy, rest);
                 }
                 reclean.get_or_insert(block);
                 continue;
             } else {
                 if let Some(from) = reclean.take() {
-                    mark_protected_clean(g, from, block, lazy);
+                    mark_protected_clean(g, from, block, lazy, rest);
                 }
                 run.get_or_insert(block);
                 continue;
             }
         }
         if let Some(from) = run.take() {
-            protect(g, from, block, lazy);
+            protect(g, from, block, lazy, rest);
         }
         if let Some(from) = reclean.take() {
-            mark_protected_clean(g, from, block, lazy);
+            mark_protected_clean(g, from, block, lazy, rest);
         }
     }
 }
@@ -2310,6 +2568,7 @@ fn guard_aliases_for(
     from: usize,
     to: usize,
     lazy: bool,
+    rest: std::time::Duration,
 ) -> (Vec<(usize, Vec<usize>)>, std::collections::BTreeSet<usize>) {
     use std::collections::BTreeSet;
     if !view_guard() || from >= to {
@@ -2340,6 +2599,7 @@ fn guard_aliases_for(
             if g.pinned(alias)
                 || DIR.is_lazy_armed(alias)
                 || (lazy && crate::lazy_back::has_block(alias))
+                || (!DIR.is_guard_protected(alias) && g.rests(alias, rest))
             {
                 blocked = true;
                 break;
@@ -2369,8 +2629,14 @@ fn guard_aliases_for(
 /// Marks already-`GuardProtected` blocks `[from, to)` clean after ensuring
 /// every alias view of each block is guarded; any block with an unguardable
 /// alias stays unclean (`GuardClean = false`).
-fn mark_protected_clean(g: &Guards, from: usize, to: usize, lazy: bool) {
-    let (aliased, unguarded) = guard_aliases_for(g, from, to, lazy);
+fn mark_protected_clean(
+    g: &Guards,
+    from: usize,
+    to: usize,
+    lazy: bool,
+    rest: std::time::Duration,
+) {
+    let (aliased, unguarded) = guard_aliases_for(g, from, to, lazy, rest);
     for (block, aliases) in aliased {
         if !DIR.is_guard_protected(block) {
             continue;
@@ -2398,8 +2664,10 @@ fn mark_protected_clean(g: &Guards, from: usize, to: usize, lazy: bool) {
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean,
 /// also guarding all alias views of the same physical pages. Any block
 /// whose alias cannot be guarded is left out (stays changed).
-fn protect(g: &mut Guards, from: usize, to: usize, lazy: bool) {
-    let (aliased, unguarded) = guard_aliases_for(g, from, to, lazy);
+fn protect(g: &mut Guards, from: usize, to: usize, lazy: bool, rest: std::time::Duration) {
+    #[cfg(feature = "diagnostics")]
+    crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
+    let (aliased, unguarded) = guard_aliases_for(g, from, to, lazy, rest);
     if unguarded.is_empty() {
         protect_here(g, from, to);
     } else {
@@ -2463,6 +2731,10 @@ fn protect_alias_blocks(mut aliases: Vec<usize>) {
                 if vk {
                     DIR.set_bits_range(ok_from, ok_to, BitField::GuardViewed, true, Ordering::SeqCst);
                 }
+                #[cfg(feature = "diagnostics")]
+                for block in ok_from..ok_to {
+                    crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
+                }
             },
             &mut |_, _| {},
             &mut |_| {},
@@ -2523,24 +2795,37 @@ fn uncommitted_end(block: usize) -> usize {
     }
 }
 
-/// Gives write access back to the guarded blocks of `[start, end)` and all
-/// their alias views, noting them written; true if any in `[start, end)` was
-/// guarded. Marks every primary and alias block dirty/unprotected in `PageDir`
-/// strictly BEFORE any `VirtualProtect(..., PAGE_READWRITE)` opens a page.
-fn open(_g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)) -> bool {
+/// Gives write access back to the guarded blocks of `[start, end)` and marks
+/// all their alias views unclean; returns how many primary blocks were guarded.
+/// Under [`open_one_view`] (`VICTORY_OPEN_ONE_VIEW`, on by default), alias views
+/// outside `[start, end)` stay read-only (`GuardProtected`) and are only marked
+/// unclean (`GuardClean = false`) so later writes through them still fault
+/// while refreshes immediately observe the change.
+/// Marks every primary and alias block dirty/unprotected in `PageDir` strictly
+/// BEFORE any `VirtualProtect(..., PAGE_READWRITE)` opens a page.
+fn open(_g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)) -> usize {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if start >= end {
-        return false;
+        return 0;
     }
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let primary = DIR.collect_set_bits(first, last, BitField::GuardProtected);
     let aliased = DIR.collect_set_bits(first, last, BitField::GuardAliased);
+    let one = open_one_view();
     let mut alias_blocks = Vec::new();
     if !aliased.is_empty() {
         for block in aliased {
             DIR.set_bit(block, BitField::GuardAliased, false, Ordering::SeqCst);
             for alias in crate::inplace::pages_of(block * BLOCK) {
                 let ab = alias / BLOCK;
+                if one {
+                    if (ab < first || ab >= last)
+                        && DIR.clear_bit_was_set(ab, BitField::GuardClean, Ordering::SeqCst)
+                    {
+                        dirtied(ab * BLOCK);
+                    }
+                    continue;
+                }
                 DIR.set_bit(ab, BitField::GuardAliased, false, Ordering::SeqCst);
                 if ab < first || ab >= last {
                     alias_blocks.push(ab);
@@ -2579,7 +2864,7 @@ fn open(_g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize
     if !alias_blocks.is_empty() {
         protect_block_runs(&alias_blocks, PAGE_READWRITE);
     }
-    !primary.is_empty()
+    primary.len()
 }
 
 /// Before our own synchronous user-mode write into title memory
@@ -2606,8 +2891,12 @@ pub(crate) fn writing(at: usize, len: usize) {
     };
     if needs_open {
         let mut g = guards();
-        open(&mut g, at, end, |_| {});
+        let opened = open(&mut g, at, end, |_| {});
         demote_cold_range(&mut g, first, last);
+        drop(g);
+        #[cfg(feature = "diagnostics")]
+        crate::faultbook::note(crate::faultbook::What::Ours, first, last, opened as u64);
+        let _ = opened;
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
@@ -3057,6 +3346,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let range = at / BLOCK..end.div_ceil(BLOCK);
     g.unpin(range.start, range.end);
+    g.forget_opened(range.start, range.end);
     DIR.set_bits_range(range.start, range.end, BitField::GuardAbsent, false, Ordering::SeqCst);
     DIR.set_bits_range(range.start, range.end, BitField::GuardAliased, false, Ordering::SeqCst);
     DIR.set_bits_range(range.start, range.end, BitField::Watched, false, Ordering::Relaxed);
@@ -3100,6 +3390,7 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
     wrote(at, len);
     let lazy = crate::lazy_back::active();
+    let rest = rest();
     let mut g = guards();
     g.prune_pins();
     let end = at.saturating_add(len);
@@ -3133,6 +3424,7 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
                 }
                 if !DIR.is_guard_protected(alias) && !DIR.is_cold_ro(alias) {
                     if !g.pinned(alias)
+                        && !g.rests(alias, rest)
                         && !DIR.is_lazy_armed(alias)
                         && !(lazy && crate::lazy_back::has_block(alias))
                     {
@@ -3155,6 +3447,7 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
                 }
             }
             if !g.pinned(*block)
+                && !g.rests(*block, rest)
                 && !DIR.is_cold_ro(*block)
                 && !DIR.is_lazy_armed(*block)
                 && !(lazy && crate::lazy_back::has_block(*block))
@@ -3226,15 +3519,44 @@ fn install() {
         if access != WRITE {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        // Held across both checks when `open` returns false: another thread may
+        let block = at / BLOCK;
+        // Another thread may have opened the block since this one faulted:
+        // avoid waiting on `GUARDS` if `PageDir` and Windows already show it RW.
+        if lockfree_enabled()
+            && !DIR.is_guard_protected(block)
+            && !DIR.is_cold_ro(block)
+            && writable(at)
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        // Held across both checks when `open` returns 0: another thread may
         // have opened the block since this one faulted, and a copy may have
         // guarded it again since. Collect dirtied blocks and drop `GUARDS`
         // before calling `descriptor::host::remapped` so VEH faults cannot
         // deadlock with `REMAPPED`.
         let mut dirty_blocks = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         let handled = {
             let mut g = guards();
-            if open(&mut g, at, at + 1, |block| dirty_blocks.push(block)) {
+            #[cfg(feature = "diagnostics")]
+            let waited = began.elapsed();
+            let opened = open(&mut g, at, at + 1, |block| dirty_blocks.push(block));
+            if opened != 0 {
+                g.opened(block);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
+                    let held = (began.elapsed() - waited).as_nanos() as u64;
+                    crate::faultbook::note(
+                        crate::faultbook::What::Fault,
+                        block,
+                        (opened << 32) | ns,
+                        held,
+                    );
+                }
                 Some(true)
             } else if open_cold_ro(&mut g, at) || writable(at) {
                 Some(false)
@@ -4020,7 +4342,7 @@ mod tests {
 
         // Direct `open` check: opening alias `b` reports clean view `a`.
         let mut dirty = Vec::new();
-        assert!(open(&mut guards(), b + 8, b + 9, |block| dirty.push(block)));
+        assert_ne!(open(&mut guards(), b + 8, b + 9, |block| dirty.push(block)), 0);
         assert_eq!(dirty, [a]);
 
         // Re-guard `a` so a real CPU write through `b` enters the VEH handler.
@@ -4598,6 +4920,152 @@ mod tests {
 
         DIR.clear_written_range(block, block + 1);
         drop_views(section, &[va, two], BLOCK);
+    }
+
+    #[test]
+    fn the_parts_of_a_page_written_since_it_was_taken() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p7 = 0x7df1_0000_0000usize / PAGE;
+        let p9 = p7 + 2;
+        DIR.clear_written_range(p7, p9 + 1);
+
+        assert_eq!(DIR.parts_since(p7, 0), WHOLE);
+        DIR.record_written_parts(p7, WHOLE, 3);
+        // Parts 0 and 5 at 4, part 5 again at 6: at 2 the whole page is due.
+        DIR.record_written_parts(p7, 0b10_0001, 4);
+        DIR.record_written_parts(p7, 0b10_0000, 6);
+        assert_eq!(DIR.parts_since(p7, 2), WHOLE);
+        assert_eq!(DIR.parts_since(p7, 3), 0b10_0001);
+        assert_eq!(DIR.parts_since(p7, 4), 0b10_0000);
+        assert_eq!(DIR.parts_since(p7, 5), 0b10_0000);
+        assert_eq!(DIR.parts_since(p7, 6), 0);
+        // Written whole: all of it, whoever took it before.
+        DIR.record_written_parts(p7, WHOLE, 8);
+        assert_eq!(DIR.parts_since(p7, 7), WHOLE);
+        // A page never written whole before: only the recorded part is due.
+        DIR.record_written_parts(p9, 0b100, 9);
+        assert_eq!(DIR.parts_since(p9, 5), 0b100);
+        DIR.clear_written_range(p7, p9 + 1);
+    }
+
+    /// Of a page taken before, what is taken again is the 4 KiB pages written
+    /// since; a page never taken before is taken whole.
+    #[test]
+    fn what_is_taken_again_is_what_was_written() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        DIR.clear_written_range(p / PAGE, p / PAGE + 4);
+        let write = |at: usize| {
+            // SAFETY: committed pages of ours.
+            unsafe { ((p + at) as *mut u8).write_volatile(1) }
+        };
+        let tracked = track(p, 4 * PAGE, false).expect("watched");
+        write(5);
+        write(PAGE + 5000);
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 2 * PAGE)], "never taken");
+        assert!(tracked.take(p, p + 4 * PAGE).is_empty());
+        write(PAGE + 5000);
+        write(PAGE + 8192);
+        write(PAGE + 65535);
+        write(2 * PAGE);
+        assert_eq!(
+            tracked.take(p, p + 4 * PAGE),
+            [
+                (p + PAGE + 4096, p + PAGE + 3 * 4096),
+                (p + 2 * PAGE - 4096, p + 3 * PAGE),
+            ],
+            "page 2 was never taken"
+        );
+        write(2 * PAGE + 70);
+        // Two askings' writes are both included when taken after both.
+        assert!(writes(p, p + 4 * PAGE, false).is_some());
+        write(2 * PAGE + 9000);
+        assert_eq!(
+            tracked.take(p, p + 4 * PAGE),
+            [
+                (p + 2 * PAGE, p + 2 * PAGE + 4096),
+                (p + 2 * PAGE + 8192, p + 2 * PAGE + 12288),
+            ]
+        );
+        DIR.clear_written_range(p / PAGE, p / PAGE + 4);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A write opens the view it goes through and no other (`VICTORY_OPEN_ONE_VIEW`):
+    /// the others stay read-only, are reported written, and take writes of their own.
+    #[test]
+    fn a_write_opens_the_view_it_goes_through() {
+        let (section, one, two) = two_views(BLOCK);
+        let page = |view: usize| view / PAGE;
+        for view in [one, two] {
+            assert_eq!(guard(view, view + BLOCK), Some(vec![page(view)]));
+        }
+        // SAFETY (all): a view, opened by the handler.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert!(writable(two) && !writable(one));
+        unsafe { ((one + 8) as *mut u8).write(1) };
+        assert!(writable(two) && writable(one));
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]));
+        assert_eq!(guard(two, two + BLOCK), Some(vec![page(two)]));
+        // Written at the view left read-only after the other faulted.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert_eq!(
+            guard(one, one + BLOCK),
+            Some(vec![page(one)]),
+            "not clean, though never opened"
+        );
+        assert!(!writable(two) && !writable(one));
+        assert_eq!(guard(two, two + BLOCK), Some(vec![page(two)]));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        // A synchronous write to the still-guarded view opens it.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        assert!(!writable(one));
+        writing(one, 8);
+        assert!(writable(one));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// A block just opened by a CPU write fault rests writable (`VICTORY_GUARD_REST`)
+    /// and is reported written at every view of its physical page until the rest ends.
+    #[test]
+    fn a_block_just_written_rests() {
+        let (section, one, two) = two_views(BLOCK);
+        let page = one / PAGE;
+        let rests = |on: bool| {
+            REST_IN_TEST.set(std::time::Duration::from_secs(if on { 3600 } else { 0 }))
+        };
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        rests(true);
+        assert_eq!(
+            guard(one, one + BLOCK),
+            Some(Vec::new()),
+            "nothing written: as it was"
+        );
+        // SAFETY (all): a view, opened by the handler.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        for _ in 0..3 {
+            assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
+            assert!(writable(two), "no fault for the next write");
+            assert!(writes(two, two + BLOCK, true).is_some());
+            assert!(!clean(two / PAGE) && !clean(one / PAGE));
+            unsafe { ((two + 8) as *mut u8).write(1) };
+        }
+        rests(false);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
+        assert!(!writable(two) && !writable(one));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        drop_views(section, &[one, two], BLOCK);
     }
 }
 

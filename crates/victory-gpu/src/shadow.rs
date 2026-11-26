@@ -648,7 +648,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .as_ref()
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
+                let ranges = joined(std::mem::take(&mut *dirty));
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);
@@ -658,7 +658,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            out.push((shadow, ranges));
         }
         true
     });
@@ -667,7 +667,8 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    ranges.sort_unstable();
+    // Stable sort exploits already-sorted stretches arriving back-to-back.
+    ranges.sort();
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (from, to) in ranges {
         match out.last_mut() {
@@ -676,6 +677,71 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// `runs` (`from`, `to`, whether the copy held the page before), cut in those
+/// of pages held before (`pages`: page number and asking, in order) to the
+/// 4 KiB parts of each page that were written since (`parts`: a bit per 4 KiB).
+fn by_parts(
+    runs: Vec<(usize, usize, bool)>,
+    pages: &[(usize, u64)],
+    parts: &[u16],
+) -> Vec<(usize, usize, bool)> {
+    const PART: usize = PAGE / 16;
+    if parts.iter().all(|&p| p == u16::MAX) {
+        return runs;
+    }
+    let mut out: Vec<(usize, usize, bool)> = Vec::with_capacity(runs.len() + pages.len());
+    let mut pages = pages.iter().zip(parts).peekable();
+    for (from, to, known) in runs {
+        if !known {
+            out.push((from, to, known));
+            continue;
+        }
+        while let Some((&(page, _), &parts)) = pages.next_if(|((page, _), _)| page * PAGE < to) {
+            for k in (0..16).filter(|k| parts >> k & 1 != 0) {
+                let (a, b) = (
+                    (page * PAGE + k * PART).max(from),
+                    (page * PAGE + (k + 1) * PART).min(to),
+                );
+                if a >= b {
+                    continue;
+                }
+                match out.last_mut() {
+                    Some((_, end, true)) if *end == a => *end = b,
+                    _ => out.push((a, b, true)),
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::{PAGE, by_parts};
+
+    #[test]
+    fn runs_are_cut_to_the_parts_written() {
+        const P: usize = PAGE / 16;
+        let at = |page: usize, part: usize| page * PAGE + part * P;
+        let runs = vec![
+            (at(10, 1) + 100, at(12, 0), true),
+            (at(12, 0), at(13, 0), false),
+            (at(14, 0), at(14, 9) + 7, true),
+        ];
+        let pages = [(10, 5), (11, 5), (14, 6)];
+        assert_eq!(by_parts(runs.clone(), &pages, &[u16::MAX; 3]), runs);
+        assert_eq!(
+            by_parts(runs, &pages, &[0b1000_0000_0000_0011, 0b11, 0b10_0000_0000]),
+            [
+                (at(10, 1) + 100, at(10, 2), true),
+                (at(10, 15), at(11, 2), true),
+                (at(12, 0), at(13, 0), false),
+                (at(14, 9), at(14, 9) + 7, true),
+            ]
+        );
+    }
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -1460,20 +1526,41 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as before).
+///
+/// A frame gives hundreds of ranges of PC-memory copies to shaders; with 2–3
+/// frames in flight, 8 buffers only held the 8 largest and forced every other
+/// snapshot to allocate and free virtual memory every frame.
+fn snapshots_kept() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_SNAPSHOT_POOL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1024)
+    })
+}
+
+/// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
+/// the largest, and of those the largest one and the next ones up to `KEPT`
+/// bytes in all. Evicted buffers are dropped outside `POOL` so `VirtualFree`
+/// never stalls other pool users.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
-    pool.retain(|v| {
-        seen += 1;
+    let (mut kept, mut total) = (0, 0usize);
+    for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
-    });
+        if kept > 0 && total > KEPT {
+            break;
+        }
+        kept += 1;
+    }
+    let gone = pool.split_off(kept);
+    drop(pool);
+    drop(gone);
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -1641,6 +1728,12 @@ fn in_wide() -> bool {
     IN_WIDE.with(|flag| flag.get())
 }
 
+fn wide_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |n| n.get() / 2)
+        .clamp(2, 6)
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1649,7 +1742,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 6);
+        let n = wide_threads();
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1718,6 +1811,38 @@ fn wide(jobs: Vec<Job>) {
 /// [`wide`], for the host's own work on host copies (a submission's
 /// refreshes, the merge of what shaders wrote to card copies).
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
+    wide(jobs);
+}
+
+/// Runs `work(0..n)` across the warm worker pool and this thread, falling back
+/// inline when `n < 2` or called re-entrantly from inside a `wide` worker.
+pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if n == 0 {
+        return;
+    }
+    if n == 1 || in_wide() {
+        for i in 0..n {
+            work(i);
+        }
+        return;
+    }
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let work = Arc::new(work);
+    let threads = (wide_threads() + 1).min(n);
+    let jobs = (0..threads)
+        .map(|_| {
+            let (next, work) = (next.clone(), work.clone());
+            Box::new(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    work(i);
+                }
+            }) as Job
+        })
+        .collect();
     wide(jobs);
 }
 
@@ -4516,12 +4641,12 @@ impl Shadow {
                             true
                         } else {
                             *runs_left -= runs.len();
-                            for (r, m) in runs {
+                            for &(r, m) in &runs {
                                 held[r..r + m].copy_from_slice(&title[r..r + m]);
-                                self.card_changed(at + r, at + r + m);
-                                MERGED[1].fetch_add(1, Ordering::Relaxed);
                                 MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                             }
+                            MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            self.card_changed_runs(runs.into_iter().map(|(r, m)| (at + r, at + r + m)));
                             false
                         }
                     } else if let Some(snapshot) = before.as_mut() {
@@ -4954,7 +5079,10 @@ impl Shadow {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let mut clean_owned = own_clean.iter().peekable();
-        let mut run = None;
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        let mut run: Option<(usize, bool)> = None;
+        // Pages taken before and written since, in the order of their runs.
+        let mut again_at: Vec<(usize, u64)> = Vec::new();
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -4973,26 +5101,59 @@ impl Shadow {
             let at = &mut copied[page - base];
             let own_lazy_clean = pre_epoch.is_some_and(|pre| *at > 0 && pre <= *at);
             if !own_lazy_clean && (*at == 0 || write > *at) {
+                let taken = *at;
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
+                // Cut where pages taken before meet pages never taken.
+                let again = taken != 0;
+                if again {
+                    again_at.push((page, taken));
+                }
+                if let Some((first, known)) = run
+                    && known != again
+                {
+                    let lo = (first * PAGE).max(from);
+                    let hi = (page * PAGE).min(to);
+                    if lo < hi {
+                        runs.push((lo, hi, known));
+                    }
+                    run = None;
+                }
+                run.get_or_insert((page, again));
+            } else if let Some((first, known)) = run.take() {
                 let lo = (first * PAGE).max(from);
                 let hi = (page * PAGE).min(to);
                 if lo < hi {
-                    out.push((lo, hi));
+                    runs.push((lo, hi, known));
                 }
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
+        if let Some((first, known)) = run {
             let lo = (first * PAGE).max(from);
             let hi = ((last + 1) * PAGE).min(to);
             if lo < hi {
-                out.push((lo, hi));
+                runs.push((lo, hi, known));
+            }
+        }
+        drop(copied);
+        if again_at.is_empty() {
+            for (a, b, _) in runs {
+                match out.last_mut() {
+                    Some((_, end)) if *end == a => *end = b,
+                    _ => out.push((a, b)),
+                }
+            }
+            return;
+        }
+        let parts = crate::watch::parts_written(&again_at);
+        for (a, b, _) in by_parts(runs, &again_at, &parts) {
+            match out.last_mut() {
+                Some((_, end)) if *end == a => *end = b,
+                _ => out.push((a, b)),
             }
         }
     }
@@ -5112,19 +5273,26 @@ impl Shadow {
 
     /// Batched [`Shadow::card_changed`] for `segs`: acquires `card.dirty` once.
     fn card_changed_segs(&self, start: usize, segs: &[CopySeg]) {
+        self.card_changed_runs(segs.iter().filter(|s| s.len > 0).map(|s| {
+            let from = s.src - start;
+            (from, from + s.len)
+        }));
+    }
+
+    /// Batched [`Shadow::card_changed`] for offset `runs`: acquires `card.dirty` once.
+    fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
             return;
         };
-        if segs.is_empty() {
+        let mut iter = runs.peekable();
+        if iter.peek().is_none() {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        for seg in segs {
-            if seg.len == 0 {
+        for (from, to) in iter {
+            if from >= to {
                 continue;
             }
-            let from = seg.src - start;
-            let to = from + seg.len;
             match dirty.last_mut() {
                 Some(last) if from <= last.1 && to >= last.0 => {
                     *last = (last.0.min(from), last.1.max(to));

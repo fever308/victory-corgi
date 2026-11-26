@@ -224,11 +224,12 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
-/// The most host lists kept idle, and the most upload memory they may keep
-/// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`).
+/// The most host lists kept idle (128 were too few: flights land several at a
+/// time, so lists were thrown away and others made in the same frame), and the
+/// most upload memory they may keep between them (a list keeps scratch chunks
+/// over a reset only while lists do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST_DEFAULT: (usize, u64) = (128, 256 << 20);
+const IDLE_MOST_DEFAULT: (usize, u64) = (512, 256 << 20);
 
 /// The most idle lists kept and the most scratch memory in them
 /// (`VICTORY_LIST_POOL_MOST=<lists>`, `VICTORY_LIST_POOL_MB=<MiB>`,

@@ -1329,7 +1329,10 @@ extern "system" fn present(
         }
         async_poke();
         #[cfg(feature = "diagnostics")]
-        crate::fence::pace::frame();
+        {
+            crate::faultbook::frame();
+            crate::fence::pace::frame();
+        }
         return S_OK;
     }
     #[cfg(windows)]
@@ -1406,7 +1409,10 @@ extern "system" fn present(
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     #[cfg(all(windows, feature = "diagnostics"))]
-    crate::fence::pace::frame();
+    {
+        crate::faultbook::frame();
+        crate::fence::pace::frame();
+    }
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
