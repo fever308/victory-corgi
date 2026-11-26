@@ -290,6 +290,10 @@ pub(crate) struct State {
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
+    /// The render target views and the depth view the host list has, once
+    /// it has any ([`State::set_targets`]): per view the host texture (0:
+    /// a null view) and what its descriptor says.
+    host_targets: Option<BoundTargets>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -339,6 +343,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
+    /// (0: it has none yet).
+    recording: u64,
 }
 
 impl Drop for State {
@@ -579,6 +586,7 @@ impl State {
         self.fresh_records.clear();
         self.fresh_halves.clear();
         self.made.clear();
+        self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -869,6 +877,41 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture (0: a null view), and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
+/// Render targets and depth currently bound on the host list
+/// ([`State::host_targets`]), stored inline for the standard `<= 8` RTVs so
+/// cache hits allocate nothing on the heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundTargets {
+    rtvs: [TargetKey; 8],
+    len: u8,
+    extra: Vec<TargetKey>,
+    dsv: Option<TargetKey>,
+}
+
+impl BoundTargets {
+    fn new() -> Self {
+        Self {
+            rtvs: [(0, (0, [0; 7])); 8],
+            len: 0,
+            extra: Vec::new(),
+            dsv: None,
+        }
+    }
+
+    fn push(&mut self, key: TargetKey) {
+        if self.extra.is_empty() && usize::from(self.len) < self.rtvs.len() {
+            self.rtvs[usize::from(self.len)] = key;
+            self.len += 1;
+        } else {
+            self.extra.push(key);
+        }
+    }
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -1096,7 +1139,10 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already: the title sets the same targets again and
+    /// again, each time a host view per target and a call of the driver.
+    /// `VICTORY_BIND_CACHE=0` sets them every time.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         self.seen_gone();
         let Some(host) = crate::host::host() else {
@@ -1106,21 +1152,26 @@ impl State {
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
         self.targets_set = true;
-        self.targets.clear();
-        let mut rtv_stack = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
-        let mut rtv_len = 0usize;
-        let mut rtv_extra: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::new();
-        let mut push_rtv = |rtv: D3D12_CPU_DESCRIPTOR_HANDLE| {
-            if rtv_extra.is_empty() && rtv_len < rtv_stack.len() {
-                rtv_stack[rtv_len] = rtv;
-                rtv_len += 1;
+        #[derive(Clone, Copy)]
+        enum PendingRtv {
+            Null(D3D12_RENDER_TARGET_VIEW_DESC),
+            Live(&'static ID3D12Resource, crate::descriptor::RtvRecord),
+        }
+        let mut views_stack: [Option<PendingRtv>; 8] = [None; 8];
+        let mut views_len = 0usize;
+        let mut views_extra: Vec<PendingRtv> = Vec::new();
+        let mut push_view = |view: PendingRtv| {
+            if views_extra.is_empty() && views_len < views_stack.len() {
+                views_stack[views_len] = Some(view);
+                views_len += 1;
             } else {
-                if rtv_extra.is_empty() {
-                    rtv_extra.extend_from_slice(&rtv_stack[..rtv_len]);
+                if views_extra.is_empty() {
+                    views_extra.extend(views_stack[..views_len].iter().flatten().copied());
                 }
-                rtv_extra.push(rtv);
+                views_extra.push(view);
             }
         };
+        let mut now = BoundTargets::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1140,15 +1191,61 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    push_rtv(host.rtv(None, Some(&desc)));
+                    push_view(PendingRtv::Null(desc));
+                    now.push((0, record.key()));
                 }
                 continue;
             };
-            list.keep(texture);
-            self.targets.push(record.resource as usize);
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            push_rtv(host.rtv(Some(texture), record.desc().as_ref()));
+            push_view(PendingRtv::Live(texture, record));
+            now.push((texture.as_raw() as usize, record.key()));
+        }
+        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+            let texture = crate::resource::host_resource(record.resource)?;
+            Some((texture, record))
+        });
+        now.dsv = dsv
+            .as_ref()
+            .map(|(texture, record)| (texture.as_raw() as usize, record.key()));
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CACHE.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"))
+            && self.host_targets.as_ref() == Some(&now)
+        {
+            return;
+        }
+        self.host_targets = Some(now);
+        self.targets.clear();
+        let mut rtv_stack = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+        let mut rtv_len = 0usize;
+        let mut rtv_extra: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::new();
+        let mut push_rtv = |rtv: D3D12_CPU_DESCRIPTOR_HANDLE| {
+            if rtv_extra.is_empty() && rtv_len < rtv_stack.len() {
+                rtv_stack[rtv_len] = rtv;
+                rtv_len += 1;
+            } else {
+                if rtv_extra.is_empty() {
+                    rtv_extra.extend_from_slice(&rtv_stack[..rtv_len]);
+                }
+                rtv_extra.push(rtv);
+            }
+        };
+        let mut materialize = |view: PendingRtv| match view {
+            PendingRtv::Null(desc) => push_rtv(host.rtv(None, Some(&desc))),
+            PendingRtv::Live(texture, record) => {
+                list.keep(texture);
+                self.targets.push(record.resource as usize);
+                #[cfg(feature = "diagnostics")]
+                crate::capture::note_target(record.resource);
+                push_rtv(host.rtv(Some(texture), record.desc().as_ref()));
+            }
+        };
+        if views_extra.is_empty() {
+            for view in views_stack[..views_len].iter().flatten().copied() {
+                materialize(view);
+            }
+        } else {
+            for view in views_extra {
+                materialize(view);
+            }
         }
         let rtvs: &[D3D12_CPU_DESCRIPTOR_HANDLE] = if rtv_extra.is_empty() {
             &rtv_stack[..rtv_len]
@@ -1157,8 +1254,7 @@ impl State {
         };
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
+        let dsv = dsv.map(|(texture, record)| {
             list.keep(texture);
             self.depth = record.resource as usize;
             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
@@ -1167,7 +1263,7 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            host.dsv(texture, record.depth_desc().as_ref())
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -1269,6 +1365,7 @@ impl State {
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
+        self.host_targets = None;
         if self.targets_set {
             let handles = std::mem::take(&mut self.target_handles);
             self.set_targets(list, &handles, self.depth_handle);
@@ -2238,12 +2335,9 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_default();
         let mut changed = host.buffer_changes();
-        let mut uavs_guard = HEAP_UAVS.lock().unwrap_or_else(|e| e.into_inner());
-        let uavs = uavs_guard.get_or_insert_with(Default::default);
         let full = heap_pass_full() || (heap_buffers_full() && cache.passes % 16 == 0);
         let (slots, retry_batch): (Vec<u32>, std::collections::HashMap<u32, u8>) = if full {
             cache.clear();
-            uavs.clear();
             changed.clear();
             (host.buffer_slots(), std::collections::HashMap::new())
         } else {
@@ -2270,77 +2364,149 @@ impl State {
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        let mut handle_slot = |n: usize,
-                                 index: u32,
-                                 mirrored: Option<(
-            View,
-            Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
-        )>| {
-            uavs.remove(&index);
-            let Some((view, copy_hint)) = mirrored else {
-                cache.remove_slot(index);
-                return;
-            };
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
-                GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
-                crate::host::log_removal_context();
+        /// The title's heap, shared across the view worker threads during this pass.
+        struct SharedHeap<'a>(&'a crate::descriptor::Heap);
+        // SAFETY: descriptor heaps are free-threaded and live for the pass.
+        unsafe impl Sync for SharedHeap<'_> {}
+        impl SharedHeap<'_> {
+            fn start(&self) -> u64 {
+                self.0.start
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) =
-                copy_hint.or_else(|| crate::descriptor::host::buffer_copy(&view))
-            else {
-                cache.remove_slot(index);
-                if !full
-                    && crate::descriptor::host::buffer_range(&view).is_some_and(|(_, l)| l > 0)
-                {
-                    if let Some(&rem) = retry_batch.get(&index) {
-                        if rem > 1 {
-                            cache.retry.insert(index, rem - 1);
-                        }
-                    } else if changed.binary_search(&index).is_ok() {
-                        cache.retry.insert(index, RETRY_ATTEMPTS);
-                    }
-                }
-                return;
-            };
-            #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
-            }
-            if matches!(
-                view,
-                crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..)
-            ) {
-                uavs.insert(index, (shadow.clone(), address, address + len));
-            }
-            cache.set_slot(index, shadow, address, address + len);
-        };
-        if crate::descriptor::host::descriptor_fast() {
-            host.mirror_buffer_slots(heap.start, 32, u32::MAX, &slots, handle_slot);
-        } else {
-            for (n, &index) in slots.iter().enumerate() {
-                let mirrored = heap
-                    .handle(index)
-                    .and_then(|handle| host.mirror(index, handle, true))
-                    .map(|view| (view, None));
-                handle_slot(n, index, mirrored);
+            fn handle(&self, index: u32) -> Option<u64> {
+                self.0.handle(index)
             }
         }
-        drop(uavs_guard);
+        enum BufferLook {
+            Empty,
+            Miss { retryable: bool },
+            Hit {
+                shadow: std::sync::Arc<crate::shadow::Shadow>,
+                from: u64,
+                to: u64,
+                is_uav: bool,
+            },
+        }
+        const AT_A_TIME: usize = 256;
+        let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
+        let found: Vec<std::sync::OnceLock<Vec<(u32, BufferLook)>>> =
+            parts.iter().map(|_| Default::default()).collect();
+        let desc_fast = crate::descriptor::host::descriptor_fast();
+        let shared_heap = SharedHeap(heap);
+        crate::descriptor::host::each_view(false, parts.len(), &|n| {
+            let chunk = parts[n];
+            let mut looked = Vec::with_capacity(chunk.len());
+            let mut process_slot = |_pos: usize,
+                                    index: u32,
+                                    mirrored: Option<(
+                View,
+                Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+            )>| {
+                let Some((view, copy_hint)) = mirrored else {
+                    looked.push((index, BufferLook::Empty));
+                    return;
+                };
+                // The copy the slot shows (`buffer_copy`), not the one the
+                // view's range alone would find.
+                let Some((shadow, address, len)) =
+                    copy_hint.or_else(|| crate::descriptor::host::buffer_copy(&view))
+                else {
+                    let retryable = !full
+                        && crate::descriptor::host::buffer_range(&view).is_some_and(|(_, l)| l > 0);
+                    looked.push((index, BufferLook::Miss { retryable }));
+                    return;
+                };
+                #[cfg(feature = "diagnostics")]
+                if host.shows(index, &shadow.buffer) == Some(false) {
+                    HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                let is_uav = matches!(
+                    view,
+                    crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(true, ..)
+                );
+                looked.push((
+                    index,
+                    BufferLook::Hit {
+                        shadow,
+                        from: address,
+                        to: address + len,
+                        is_uav,
+                    },
+                ));
+            };
+            if desc_fast {
+                host.mirror_buffer_slots(shared_heap.start(), 32, u32::MAX, chunk, process_slot);
+            } else {
+                for (pos, &index) in chunk.iter().enumerate() {
+                    let mirrored = shared_heap
+                        .handle(index)
+                        .and_then(|handle| host.mirror(index, handle, true))
+                        .map(|view| (view, None));
+                    process_slot(pos, index, mirrored);
+                }
+            }
+            // After each piece while the device lives (a cheap query).
+            if alive
+                && let Some(why) = crate::descriptor::host::device_removed()
+                && !GONE.swap(true, Ordering::Relaxed)
+            {
+                let last: Vec<String> = chunk
+                    .iter()
+                    .filter_map(|&i| {
+                        crate::descriptor::view(shared_heap.handle(i)?)
+                            .map(|v| format!("{i}: {v:?}"))
+                    })
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                tracing::error!(
+                    why,
+                    "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}"
+                );
+                crate::host::log_removal_context();
+            }
+            let _ = found[n].set(looked);
+        });
+        {
+            let mut uavs_guard = HEAP_UAVS.lock().unwrap_or_else(|e| e.into_inner());
+            let uavs = uavs_guard.get_or_insert_with(Default::default);
+            if full {
+                uavs.clear();
+            }
+            for (index, look) in found
+                .into_iter()
+                .filter_map(std::sync::OnceLock::into_inner)
+                .flatten()
+            {
+                uavs.remove(&index);
+                match look {
+                    BufferLook::Empty => cache.remove_slot(index),
+                    BufferLook::Miss { retryable } => {
+                        cache.remove_slot(index);
+                        if retryable {
+                            if let Some(&rem) = retry_batch.get(&index) {
+                                if rem > 1 {
+                                    cache.retry.insert(index, rem - 1);
+                                }
+                            } else if changed.binary_search(&index).is_ok() {
+                                cache.retry.insert(index, RETRY_ATTEMPTS);
+                            }
+                        }
+                    }
+                    BufferLook::Hit {
+                        shadow,
+                        from,
+                        to,
+                        is_uav,
+                    } => {
+                        if is_uav {
+                            uavs.insert(index, (shadow.clone(), from, to));
+                        }
+                        cache.set_slot(index, shadow, from, to);
+                    }
+                }
+            }
+        }
         cache.reconcile_dirty();
         let views = cache.ranges.len() as u32;
         let copies = cache.spans.len();
@@ -3684,11 +3850,16 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
+            // Their places among `used`, on the stack for the common <= 32 entries.
+            let mut places: Few<u16, 32> = Few::default();
+            for (i, _) in used
                 .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+                .enumerate()
+                .filter(|(_, u)| tables(u) && u.slot == slot)
+            {
+                places.push(i as u16);
+            }
+            let entries = || places.iter().map(|&i| &used[usize::from(i)]);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3698,26 +3869,24 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let mut selected: Vec<u32> = indexed
-                .iter()
-                .filter(|index| index.table_slot == slot)
-                .map(|index| {
-                    let constant = self.user_value(
-                        compute,
-                        index.constant_slot,
-                        RootType::Constants,
-                        index.constant_dword,
-                    );
-                    // The shader adds i32 byte offsets and shifts by 5.
-                    index.byte_offset.wrapping_add(constant << index.shift) / 32
-                })
-                .collect();
+            let mut selected: Few<u32, 8> = Few::default();
+            for index in indexed.iter().filter(|index| index.table_slot == slot) {
+                let constant = self.user_value(
+                    compute,
+                    index.constant_slot,
+                    RootType::Constants,
+                    index.constant_dword,
+                );
+                // The shader adds i32 byte offsets and shifts by 5.
+                let k = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+                if !selected.contains(&k) {
+                    selected.push(k);
+                }
+            }
             selected.sort_unstable();
-            selected.dedup();
             // The descriptors the shader moves halves through count too: one
             // past every entry was left out of the table.
-            let n = entries
-                .iter()
+            let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .chain(half.iter().filter(|&&(s, _)| s == slot).map(|&(_, at)| at / 8))
@@ -3754,14 +3923,14 @@ impl State {
                     }
             });
             if let Some(&Fresh { first, .. }) = same {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         self.readable_once(list, u.kind, &view);
                     }
                 }
-                for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                for &k in selected.iter() {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3804,11 +3973,60 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            let list_views = crate::descriptor::host::list_views();
+            if list_views && self.recording == 0 {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
+            let recording = self.recording;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                // A view this list has made before: its descriptor copied via
+                // `CopyDescriptorsSimple`, skipping repeated view creation (and
+                // repeated buffer-SRV refreshes on the same host list).
+                if list_views
+                    && !(has_half && half.contains(&(slot, k * 8)))
+                    && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
+                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                {
+                    let kind = entries()
+                        .find(|u| u.table_offset_dwords / 8 == k)
+                        .map(|u| u.kind)
+                        .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                    let was = (listed.ready, listed.tabled);
+                    if let Some(kind) = kind {
+                        let list_ptr = std::ptr::from_ref(list) as usize;
+                        let copies = crate::host::TITLE_COPIES.load(Ordering::Relaxed);
+                        if !(kind == ResourceType::Srv
+                            && listed.buffer_only
+                            && listed.ready == (list_ptr, copies))
+                            && let Some(view) =
+                                crate::descriptor::host::listed_view(recording, words)
+                        {
+                            self.readable_once(list, kind, &view);
+                            if kind == ResourceType::Srv && listed.buffer_only {
+                                listed.ready = (list_ptr, copies);
+                            }
+                        }
+                    }
+                    if let Some(title) = title_first
+                        && listed.texture
+                        && listed.tabled != Some((title + k, kind.is_some()))
+                    {
+                        listed.tabled = Some((title + k, kind.is_some()));
+                        host.texture_slot_tabled(title + k, kind.is_some());
+                        if kind.is_some() {
+                            host.mirror(title + k, table + u64::from(k) * 32, true);
+                        }
+                    }
+                    if was != (listed.ready, listed.tabled) {
+                        crate::descriptor::host::note_listed(recording, words, listed);
+                    }
+                    continue;
+                }
+                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         // In a host copy, on a 256-byte boundary: the view is
@@ -4663,11 +4881,65 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn view_kind(view: &View) -> Option<ResourceType> {
+pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     match view {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
         View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
         _ => None,
+    }
+}
+
+/// A few things, up to `N` of them without heap allocation: used while
+/// walking a draw's descriptor tables.
+struct Few<T, const N: usize> {
+    few: [T; N],
+    len: usize,
+    /// All of them, if they exceed `N`.
+    many: Vec<T>,
+}
+
+impl<T: Copy + Default, const N: usize> Default for Few<T, N> {
+    fn default() -> Self {
+        Few {
+            few: [T::default(); N],
+            len: 0,
+            many: Vec::new(),
+        }
+    }
+}
+
+impl<T: Copy, const N: usize> Few<T, N> {
+    fn push(&mut self, what: T) {
+        if self.many.is_empty() && self.len < N {
+            self.few[self.len] = what;
+            self.len += 1;
+        } else {
+            if self.many.is_empty() {
+                self.many.extend_from_slice(&self.few);
+            }
+            self.many.push(what);
+        }
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for Few<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        if self.many.is_empty() {
+            &self.few[..self.len]
+        } else {
+            &self.many
+        }
+    }
+}
+
+impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        if self.many.is_empty() {
+            &mut self.few[..self.len]
+        } else {
+            &mut self.many
+        }
     }
 }
 
@@ -5337,5 +5609,40 @@ mod tests {
         assert_eq!(batch2.len(), 6);
         assert!(cache.retry.is_empty());
         assert!(cache.take_retries(4).is_empty());
+    }
+
+    #[test]
+    fn few_keeps_items_in_order_inline_and_on_spill() {
+        for n in 0..10u32 {
+            let mut few: super::Few<u32, 4> = super::Few::default();
+            (0..n).for_each(|i| few.push(n - i));
+            assert_eq!(few.to_vec(), (0..n).map(|i| n - i).collect::<Vec<_>>());
+            few.sort_unstable();
+            assert_eq!(few.to_vec(), (1..=n).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn bound_targets_compares_inline_and_depth_keys() {
+        let mut a = super::BoundTargets::new();
+        let mut b = super::BoundTargets::new();
+        assert_eq!(a, b);
+        let k1 = (0x1000usize, (0x2000usize, [1, 28, 4, 0, 0, 0, 0]));
+        let k2 = (0x3000usize, (0x4000usize, [1, 28, 4, 1, 0, 0, 0]));
+        a.push(k1);
+        assert_ne!(a, b);
+        b.push(k1);
+        assert_eq!(a, b);
+        a.dsv = Some(k2);
+        assert_ne!(a, b);
+        b.dsv = Some(k2);
+        assert_eq!(a, b);
+        // Pushing past 8 RTVs spills cleanly into `extra`.
+        for i in 0..9usize {
+            let k = (0x1000 + i, (0x2000 + i, [0; 7]));
+            a.push(k);
+            b.push(k);
+        }
+        assert_eq!(a, b);
     }
 }

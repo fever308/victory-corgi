@@ -313,6 +313,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -899,6 +908,17 @@ pub(super) fn resolve_views(records: &[[u32; 2]], out: &mut Vec<Option<View>>) {
     }
 }
 
+/// The words of the record at `handle`, if they are a view's.
+#[cfg(windows)]
+pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (words[0] == VIEW_TAG).then_some(words)
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
@@ -1050,13 +1070,29 @@ fn mirror_range(dst: u64, count: u32, step: u64) {
     }
 }
 
+/// Whether [`copy_simple`] skips writing when `dst` already holds the exact
+/// bytes at `src` (avoiding write-watch dirtying and VEH faults on guarded
+/// heap pages). On by default; `VICTORY_SAME_RECORDS=0` writes every time.
+fn same_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_none_or(|v| v != "0"))
+}
+
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
+    if dst != 0 && src != 0 && len > 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        unsafe {
+            let same = same_records()
+                && (dst == src
+                    || std::slice::from_raw_parts(dst as *const u8, len as usize)
+                        == std::slice::from_raw_parts(src as *const u8, len as usize));
+            if !same {
+                std::ptr::copy(src as *const u8, dst as *mut u8, len as usize);
+            }
+        }
         #[cfg(windows)]
         mirror_range(dst, count, step);
     }
@@ -1618,5 +1654,66 @@ mod tests {
         assert_eq!(view(cpu_dst.as_ptr() as u64 + 32), view(src_base + 32));
 
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rtv_key_and_record_at_and_same_records_copy_simple() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let null = std::ptr::null();
+
+        // `RtvRecord::key` distinguishes resource, described flag, and desc words.
+        let mut rtv_slots = [[0u64; 16]; 3];
+        let r0 = rtv_slots[0].as_mut_ptr() as u64;
+        let r1 = rtv_slots[1].as_mut_ptr() as u64;
+        let r2 = rtv_slots[2].as_mut_ptr() as u64;
+        let res = 0x4444_0000usize as This;
+        let d_a = [28, 4, 0, 0, 0, 0];
+        let d_b = [28, 4, 1, 0, 0, 0];
+        create_rtv(null, res, &d_a, r0);
+        create_rtv(null, res, &d_a, r1);
+        create_rtv(null, res, &d_b, r2);
+        assert_eq!(rtv_record(r0).unwrap().key(), rtv_record(r1).unwrap().key());
+        assert_ne!(rtv_record(r0).unwrap().key(), rtv_record(r2).unwrap().key());
+
+        // `record_at` returns Some for valid view records and None for zero/untagged.
+        let mut slots = [0u64; 8];
+        let s0 = slots.as_mut_ptr() as u64;
+        assert_eq!(record_at(0), None);
+        assert_eq!(record_at(s0), None);
+        create_cbv(null, &[0x1000, 0, 256, 0], s0);
+        assert!(record_at(s0).is_some());
+
+        // `copy_simple` skips writing when `dst` bytes already equal `src` bytes,
+        // leaving a write-watched destination page clean (`VICTORY_SAME_RECORDS=1`).
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let dst = memory as u64;
+        let tracked = crate::watch::track(dst as usize, crate::watch::PAGE, true).unwrap();
+        // First copy writes bytes and dirties the page.
+        copy_simple(null, 1, dst, s0, VIEWS_KIND);
+        assert!(!tracked.take(dst as usize, dst as usize + crate::watch::PAGE).is_empty());
+        // Second identical copy skips writing when `same_records()` is active.
+        if same_records() {
+            copy_simple(null, 1, dst, s0, VIEWS_KIND);
+            assert!(
+                tracked
+                    .take(dst as usize, dst as usize + crate::watch::PAGE)
+                    .is_empty(),
+                "identical copy_simple must not dirty write-watched page"
+            );
+        }
+        // SAFETY: allocation belongs to this test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 }
