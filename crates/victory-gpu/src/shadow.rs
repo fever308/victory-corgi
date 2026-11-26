@@ -2181,8 +2181,28 @@ pub(crate) fn refresh_batch(
         }
     }
 
+    if crate::lazy_back::active() && (!all_segs.is_empty() || !mirrored.is_empty()) {
+        let mut ranges: Vec<(usize, usize)> = all_segs
+            .iter()
+            .filter(|s| s.len > 0)
+            .map(|s| (s.src, s.len))
+            .collect();
+        for &idx in &mirrored {
+            let (shadow, _, _, plan) = &planned[idx];
+            let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+            for &(raw_from, raw_to) in &plan.runs {
+                let (from, to) = (raw_from.max(start), raw_to.min(end));
+                if from < to {
+                    ranges.push((from, to - from));
+                }
+            }
+        }
+        if !ranges.is_empty() {
+            crate::lazy_back::materialize_ranges(&ranges);
+        }
+    }
+
     if !all_segs.is_empty() {
-        materialize_copy_segs(&all_segs);
         if !run_copy_segs_checked(&all_segs) {
             materialize_copy_segs(&all_segs);
             let _ = run_copy_segs_checked(&all_segs);
@@ -5253,6 +5273,27 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether this shadow has any in-flight GPU writes on `Host::queue`
+    /// (declared shader writes in `pending` or unlanded card-copy uploads in `card.sent`).
+    pub(crate) fn has_inflight_gpu_write(&self) -> bool {
+        if !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+            return true;
+        }
+        if let Some(card) = &self.card {
+            let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+            if card
+                .sent
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|s| s.2 > fetched)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the

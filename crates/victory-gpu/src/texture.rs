@@ -1844,7 +1844,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
             let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            if valid || crate::host::read_into_probe(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
                 there += 1;
             } else if all {
                 return (there, of);
@@ -1853,6 +1853,49 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
         page += n;
     }
     (there, of)
+}
+
+/// Batched 64 KiB block readability count for `[start, end)` using up to 256
+/// addresses per `K32QueryWorkingSetEx` syscall instead of one syscall per block.
+fn readable_blocks(start: usize, end: usize) -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const BLOCK: usize = 64 << 10;
+    const KERNEL_PAGE: usize = 4096;
+    let mut there = 0u64;
+    // SAFETY: plain data filled by `K32QueryWorkingSetEx`.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut spans = [(0usize, 0u64); 256];
+    let mut block = start & !(BLOCK - 1);
+    while block < end {
+        let mut n = 0usize;
+        while block < end && n < info.len() {
+            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
+            info[n].VirtualAddress = (lo & !(KERNEL_PAGE - 1)) as *mut _;
+            spans[n] = (lo, (hi - lo) as u64);
+            n += 1;
+            block = block.saturating_add(BLOCK);
+        }
+        // SAFETY: `n` entries of the given size; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for i in 0..n {
+            // SAFETY: plain data filled by the query.
+            let valid = asked && unsafe { info[i].VirtualAttributes.Flags } & 1 != 0;
+            let mut byte = [0u8];
+            if valid || crate::host::read_into_probe(spans[i].0 as *const u8, &mut byte) {
+                there += spans[i].1;
+            }
+        }
+    }
+    there
 }
 
 fn committed_by_query(at: *const u8, len: usize) -> bool {
@@ -1870,6 +1913,43 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
         p = info.BaseAddress as usize + info.RegionSize;
     }
     true
+}
+
+/// Checks whether either `first` or `last` page is readable in a single
+/// 2-entry `K32QueryWorkingSetEx` syscall (with `read_into_probe` fallback).
+fn either_endpoint_readable(first: usize, last: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const KERNEL_PAGE: usize = 4096;
+    let p0 = first & !(KERNEL_PAGE - 1);
+    let p1 = last & !(KERNEL_PAGE - 1);
+    let n = if p0 == p1 { 1 } else { 2 };
+    // SAFETY: plain data filled by `K32QueryWorkingSetEx`.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 2] = unsafe { std::mem::zeroed() };
+    info[0].VirtualAddress = p0 as *mut _;
+    info[1].VirtualAddress = p1 as *mut _;
+    // SAFETY: `n` entries of the given size; our own process.
+    let asked = unsafe {
+        K32QueryWorkingSetEx(
+            GetCurrentProcess(),
+            info.as_mut_ptr().cast(),
+            (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+        )
+    } != 0;
+    let addrs = [first, last];
+    for i in 0..n {
+        // SAFETY: plain data filled by the query.
+        if asked && unsafe { info[i].VirtualAttributes.Flags } & 1 != 0 {
+            return true;
+        }
+        let mut byte = [0u8];
+        if crate::host::read_into_probe(addrs[i] as *const u8, &mut byte) {
+            return true;
+        }
+    }
+    false
 }
 
 /// How many bytes of `[at, at + len)` are committed memory: all of a
@@ -1895,7 +1975,11 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
+    if by_query() {
+        if !committed_by_query(at, 1) && !committed_by_query((end - 1) as *const u8, 1) {
+            return 0;
+        }
+    } else if !either_endpoint_readable(start, end - 1) {
         return 0;
     }
     if !by_query() {
@@ -1913,17 +1997,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // for each of its missing pages, every frame it stayed due: 1,663
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
-        const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
-        let mut block = start & !(BLOCK - 1);
-        while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
-            }
-            block = block.saturating_add(BLOCK);
-        }
-        return there;
+        return readable_blocks(start, end);
     }
     let (mut p, mut there) = (start, 0u64);
     while p < end {

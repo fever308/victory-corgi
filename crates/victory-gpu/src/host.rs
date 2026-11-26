@@ -9318,17 +9318,12 @@ unsafe fn victory_copy_try(dst: *mut u8, src: *const u8, len: usize) -> u32 {
     }
 }
 
-/// `VICTORY_FAST_COPY=1` (experiment): what is read from title memory into
-/// host memory (fills of upload memory, refreshes of host copies) is copied
-/// in this process, not by the kernel (`ReadProcessMemory`,
-/// a system call for each of about 14,000 copies of a gameplay frame: 24
-/// ms of the submitting thread, run 12). A page of the source that is not
-/// there faults; a handler sends the copy to its failure exit and the
-/// kernel's copy is used as before.
+/// Whether title-to-host reads use vectorized in-process copies with VEH
+/// fallback (`VICTORY_FAST_COPY=0` restores legacy `ReadProcessMemory`).
 fn fast_fill() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_FAST_COPY").is_some_and(|v| v == "1");
+        let on = std::env::var_os("VICTORY_FAST_COPY").is_none_or(|v| v != "0");
         if on {
             install_fast_copy_handler();
         }
@@ -9355,8 +9350,7 @@ fn fast_copy_fail_rip(rip: u64) -> Option<u64> {
 }
 
 /// Whether `rip` lies inside `victory_copy_try_{avx2,sse2}`'s faulting copy
-/// region so `watch::on_write` can yield to `fast_fill`'s VEH.
-#[allow(dead_code)] // Wired by Wave B in `watch::on_write`.
+/// region so `watch::on_write` yields to `fast_fill`'s VEH.
 pub(crate) fn is_fast_copy_rip(rip: u64) -> bool {
     fast_copy_fail_rip(rip).is_some()
 }
@@ -9514,6 +9508,26 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// [`read_into`] without calling [`crate::lazy_back::materialize_range`].
 /// Safe to call while holding `Shadow` locks after materializing outside.
 pub(crate) fn read_into_raw(src: *const u8, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    if fast_fill() {
+        // SAFETY: `dst` is valid writable memory; faults on `src` redirect to
+        // `fail` via `fast_fill`'s VEH without invoking `lazy_back::handle_fault`.
+        if unsafe { victory_copy_try(dst.as_mut_ptr(), src, dst.len()) } != 0 {
+            return true;
+        }
+        if range_has_lazy_block(src as usize, dst.len()) {
+            return false;
+        }
+    }
+    read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// Probes readability via `ReadProcessMemory` without raising a VEH fault on
+/// unmapped pages (used by `texture::readable` after `QueryWorkingSetEx`).
+pub(crate) fn read_into_probe(src: *const u8, dst: &mut [u8]) -> bool {
+    crate::lazy_back::materialize_range(src as usize, dst.len());
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -9916,13 +9930,33 @@ impl Host {
 
     /// Synchronizes an auxiliary `COPY` queue behind the latest `self.queue`
     /// signal and returns the `QUEUE_ORDER` watermark visible after the wait.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn sync_copy_queue(&self, copy_queue: &ID3D12CommandQueue) -> windows::core::Result<u64> {
+        self.sync_copy_queue_for(copy_queue, true)
+    }
+
+    /// Synchronizes an auxiliary `COPY` queue behind `self.queue` only when
+    /// `wait_direct` is true and `self.fence` has not already completed past
+    /// `last_signalled`; otherwise returns immediately so hardware DMA does not
+    /// stall behind unrelated in-flight 3D work.
+    pub(crate) fn sync_copy_queue_for(
+        &self,
+        copy_queue: &ID3D12CommandQueue,
+        wait_direct: bool,
+    ) -> windows::core::Result<u64> {
         let (v, order) = *self.last_signalled.lock().unwrap_or_else(|e| e.into_inner());
         if v > 0 {
-            // SAFETY: `self.fence` is live and `v` was already signalled on `self.queue`.
-            unsafe { copy_queue.Wait(&self.fence, v)? };
+            // SAFETY: `self.fence` is live.
+            if unsafe { self.fence.GetCompletedValue() } >= v {
+                return Ok(order.max(crate::shadow::relay_fetched_value()));
+            }
+            if wait_direct {
+                // SAFETY: `self.fence` is live and `v` was already signalled on `self.queue`.
+                unsafe { copy_queue.Wait(&self.fence, v)? };
+                return Ok(order.max(crate::shadow::relay_fetched_value()));
+            }
         }
-        Ok(order.max(crate::shadow::relay_fetched_value()))
+        Ok(crate::shadow::relay_fetched_value())
     }
 
     /// Copies back GPU-written ranges of any ReBAR shadows in `back` via a

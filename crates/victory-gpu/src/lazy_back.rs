@@ -39,10 +39,15 @@ use windows_sys::Win32::System::Memory::{
 use crate::shadow::Shadow;
 use crate::watch::PAGE;
 
-/// Default number of distinct frames with CPU faults before a block promotes to hot.
-const DEFAULT_PROMOTE_FRAMES: u32 = 3;
-/// Distinct frames without a CPU fault after which a hot entry decays back to lazy.
+/// Default number of distinct frames with CPU/internal materializations before
+/// a block promotes to hot.
+const DEFAULT_PROMOTE_FRAMES: u32 = 2;
+/// Distinct idle frames without a fault or active GPU write after which a hot
+/// entry decays back to lazy.
 const HOT_DECAY_FRAMES: u64 = 120;
+/// Base interval (in frames) before an actively GPU-written hot block allows a
+/// single reprobe deferral (doubles on each re-promotion up to 16x).
+const HOT_REPROBE_FRAMES: u64 = 1800;
 /// Bounded ring of recently materialized/discarded blocks to absorb multi-thread read-fault races.
 const RECENT_CAP: usize = 2048;
 /// Initial reusable readback buffer size for the dedicated lazy fetcher (4 MiB).
@@ -60,7 +65,7 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_BACK").is_some_and(|v| v == "1"))
 }
 
-/// Number of distinct frames a block must fault on before promoting to hot (`VICTORY_LAZY_PROMOTE_FRAMES`, default 3).
+/// Number of distinct frames a block must fault on before promoting to hot (`VICTORY_LAZY_PROMOTE_FRAMES`, default 2).
 fn promote_frames() -> u32 {
     static N: OnceLock<u32> = OnceLock::new();
     *N.get_or_init(|| {
@@ -109,6 +114,9 @@ enum MaterializeReason {
 struct HotEntry {
     faults: u32,
     last_frame: u64,
+    promoted_frame: u64,
+    reprobes: u32,
+    reprobing: bool,
 }
 
 struct LazyTable {
@@ -301,13 +309,14 @@ impl LazyFetcher {
 
     #[cfg(test)]
     fn fetch(&mut self, shadow: &Shadow, offset: usize, len: usize) -> windows::core::Result<Vec<u8>> {
-        let (buf, _, _) = self.fetch_batch(&[(shadow, offset, len)])?;
+        let (buf, _, _) = self.fetch_batch(&[(shadow, offset, len)], true)?;
         Ok(buf)
     }
 
     fn fetch_batch(
         &mut self,
         items: &[(&Shadow, usize, usize)],
+        wait_direct: bool,
     ) -> windows::core::Result<(Vec<u8>, Vec<(usize, usize)>, u64)> {
         if items.is_empty() {
             return Ok((Vec::new(), Vec::new(), 0));
@@ -355,7 +364,7 @@ impl LazyFetcher {
                 }
             }
             self.list.Close()?;
-            let fetched_after = host.sync_copy_queue(&self.queue)?;
+            let fetched_after = host.sync_copy_queue_for(&self.queue, wait_direct)?;
             let lists = [Some(self.list.cast::<ID3D12CommandList>()?)];
             self.queue.ExecuteCommandLists(&lists);
             self.sent += 1;
@@ -388,6 +397,13 @@ fn fetch_gpu_batch(
     if items.is_empty() {
         return Ok((Vec::new(), Vec::new(), 0));
     }
+    // Check in-flight DIRECT-queue writers outside `FETCHER` (lock order).
+    // When none of the batch's shadows have pending shader writes or unlanded
+    // card uploads, the hardware COPY queue runs immediately without stalling
+    // behind unrelated in-flight 3D work on `Host::queue`.
+    let wait_direct = items
+        .iter()
+        .any(|&(shadow, _, _)| shadow.has_inflight_gpu_write());
     let mut guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Some(LazyFetcher::new()?);
@@ -395,7 +411,7 @@ fn fetch_gpu_batch(
     guard
         .as_mut()
         .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?
-        .fetch_batch(items)
+        .fetch_batch(items, wait_direct)
 }
 
 #[cfg(test)]
@@ -493,11 +509,22 @@ fn try_defer_page_inner(
 
     {
         let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&hot) = table.hot.get(&primary_block) {
+        if let Some(hot) = table.hot.get_mut(&primary_block) {
+            let threshold = promote_frames();
             if frame > hot.last_frame.saturating_add(HOT_DECAY_FRAMES) {
                 table.hot.remove(&primary_block);
-            } else if hot.faults >= promote_frames() {
-                return false;
+            } else if hot.faults >= threshold {
+                let reprobe_after = HOT_REPROBE_FRAMES << hot.reprobes.min(4);
+                if frame > hot.promoted_frame.saturating_add(reprobe_after) {
+                    hot.faults = threshold.saturating_sub(1);
+                    hot.last_frame = frame;
+                    hot.promoted_frame = frame;
+                    hot.reprobes = hot.reprobes.saturating_add(1);
+                    hot.reprobing = true;
+                } else {
+                    hot.last_frame = frame;
+                    return false;
+                }
             }
         }
         if let Some(existing) = table.pages.get_mut(&primary_block) {
@@ -685,22 +712,29 @@ fn note_fault_hot_locked(table: &mut LazyTable, primary_block: usize) {
     let entry = table.hot.entry(primary_block).or_insert(HotEntry {
         faults: 0,
         last_frame: frame,
+        promoted_frame: frame,
+        reprobes: 0,
+        reprobing: false,
     });
-    if entry.faults == 0 || frame > entry.last_frame.saturating_add(HOT_DECAY_FRAMES) {
+    if entry.faults == 0
+        || (!entry.reprobing && frame > entry.last_frame.saturating_add(HOT_DECAY_FRAMES))
+    {
         entry.faults = 1;
         entry.last_frame = frame;
-    } else if frame != entry.last_frame {
+        entry.reprobing = false;
+        if threshold == 1 {
+            entry.promoted_frame = frame;
+            STATS.hot_promoted.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if entry.reprobing || frame != entry.last_frame {
         let was_below = entry.faults < threshold;
         entry.faults = entry.faults.saturating_add(1);
         entry.last_frame = frame;
+        entry.reprobing = false;
         if was_below && entry.faults >= threshold {
+            entry.promoted_frame = frame;
             STATS.hot_promoted.fetch_add(1, Ordering::Relaxed);
-            return;
         }
-    }
-    if entry.faults >= threshold && threshold == 1 {
-        // First fault promotes immediately when `VICTORY_LAZY_PROMOTE_FRAMES=1`.
-        STATS.hot_promoted.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2404,6 +2438,152 @@ mod tests {
         drop(shadow);
         // SAFETY: cleanup.
         unsafe { free_watch_pages(ptr) };
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_active_hot_block_does_not_decay_after_120_frames_and_reprobes_cleanly() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let ptr = alloc_watch_pages(1);
+        // SAFETY: `ptr` owns `PAGE` bytes.
+        unsafe { ptr::write_bytes(ptr, 0x11, PAGE) };
+        let va = ptr as usize;
+        let block = va / PAGE;
+        clear_hot_for_test(block);
+
+        let Some((shadow, _side)) = make_card_shadow_at(va as u64, 1, 0x11) else {
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+
+        // Promote the block across `promote_frames()` distinct frames.
+        let threshold = promote_frames();
+        for f in 0..threshold {
+            advance_frames(1);
+            gpu_write_shadow(&shadow, 0, &[0x50 + f as u8; 8]);
+            assert!(try_defer_page_inner(&shadow, 0, PAGE, (f + 1) as u64));
+            // SAFETY: CPU read fault increments hot counter.
+            assert_eq!(unsafe { ptr.read() }, 0x50 + f as u8);
+        }
+
+        // Stay actively GPU-written for > HOT_DECAY_FRAMES (e.g. 200 frames):
+        // must remain hot without thrashing every 120 frames.
+        for f in 0..(HOT_DECAY_FRAMES + 80) {
+            advance_frames(1);
+            assert!(
+                !try_defer_page_inner(&shadow, 0, PAGE, 100 + f),
+                "actively GPU-written hot block must not decay at active frame {f}"
+            );
+        }
+
+        // Simulate reaching the reprobe horizon while still active (stepping in
+        // chunks <= HOT_DECAY_FRAMES so inactivity decay does not trigger).
+        let step = HOT_DECAY_FRAMES / 2;
+        let mut advanced = HOT_DECAY_FRAMES + 80;
+        while advanced <= HOT_REPROBE_FRAMES {
+            advance_frames(step as usize);
+            advanced += step;
+            let deferred = try_defer_page_inner(&shadow, 0, PAGE, 1000 + advanced);
+            if advanced <= HOT_REPROBE_FRAMES {
+                assert!(!deferred, "must stay hot before reprobe horizon");
+            } else {
+                assert!(deferred, "must allow one reprobe deferral past reprobe horizon");
+            }
+        }
+
+        // One fault on the reprobed block must immediately re-promote it on the
+        // very same frame so the next flight skips deferral again.
+        // SAFETY: volatile read triggers VEH materialization and re-promotion.
+        let got = unsafe { ptr.read_volatile() };
+        assert_eq!(got, 0x50 + (threshold - 1) as u8);
+        assert!(!has_block(block), "reprobe read must materialize deferred block");
+        advance_frames(1);
+        assert!(
+            !try_defer_page_inner(&shadow, 0, PAGE, 9999),
+            "single fault during reprobe must immediately re-promote hot block"
+        );
+
+        clear_hot_for_test(block);
+        drop(shadow);
+        // SAFETY: cleanup.
+        unsafe { free_watch_pages(ptr) };
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn fast_copy_read_into_raw_and_unmapped_hole_respect_lazy_back_and_holes() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        // Reserve 3 pages, commit pages 0 and 2, leave page 1 uncommitted (hole).
+        // SAFETY: reserving a fresh 3-page region for test.
+        let base = unsafe { VirtualAlloc(ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE) } as *mut u8;
+        assert!(!base.is_null(), "VirtualAlloc reserve failed");
+        // SAFETY: committing pages 0 and 2 inside `base`.
+        let p0 = unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) } as *mut u8;
+        let p2 = unsafe {
+            VirtualAlloc(base.add(2 * PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READWRITE)
+        } as *mut u8;
+        assert_eq!(p0, base);
+        assert_eq!(p2, unsafe { base.add(2 * PAGE) });
+        // SAFETY: pages 0 and 2 are committed RW.
+        unsafe {
+            ptr::write_bytes(p0, 0x3A, PAGE);
+            ptr::write_bytes(p2, 0x7C, PAGE);
+        }
+
+        // 1. `copy_mapped_raw_checked` across committed + hole + committed zeroes
+        //    only the hole and preserves both committed pages.
+        let mut dst = vec![0xEEu8; 3 * PAGE];
+        assert!(crate::host::copy_mapped_raw_checked(
+            dst.as_mut_ptr(),
+            base,
+            3 * PAGE,
+            false
+        ));
+        assert!(dst[..PAGE].iter().all(|&b| b == 0x3A));
+        assert!(dst[PAGE..2 * PAGE].iter().all(|&b| b == 0x00));
+        assert!(dst[2 * PAGE..].iter().all(|&b| b == 0x7C));
+
+        // 2. `read_into_raw` on mapped page succeeds; on uncommitted hole returns false.
+        let mut buf = vec![0u8; 64];
+        assert!(crate::host::read_into_raw(p0, &mut buf));
+        assert!(buf.iter().all(|&b| b == 0x3A));
+        assert!(!crate::host::read_into_raw(unsafe { base.add(PAGE) }, &mut buf));
+
+        // 3. `read_into_raw` on a `lazy_back` `PAGE_NOACCESS` page returns false
+        //    WITHOUT triggering `lazy_back::handle_fault` materialization.
+        let va0 = p0 as usize;
+        clear_hot_for_test(va0 / PAGE);
+        if let Some((shadow, _side)) = make_card_shadow_at(va0 as u64, 1, 0x3A) {
+            gpu_write_shadow(&shadow, 0, &[0x91; 16]);
+            assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+            assert!(has_block(va0 / PAGE));
+            assert!(
+                !crate::host::read_into_raw(p0, &mut buf),
+                "read_into_raw must return false on deferred PAGE_NOACCESS"
+            );
+            assert!(
+                has_block(va0 / PAGE),
+                "read_into_raw must NOT materialize lazy_back block under caller locks"
+            );
+            // `read_into_fast` materializes and returns the GPU bytes.
+            assert!(crate::host::read_into_fast(p0, &mut buf));
+            assert_eq!(&buf[..16], &[0x91; 16]);
+            assert!(!has_block(va0 / PAGE));
+            clear_hot_for_test(va0 / PAGE);
+            drop(shadow);
+        }
+
+        // SAFETY: releasing test reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
         h.log_messages();
         assert_eq!(h.d3d12_errors(), errors_before);
     }
