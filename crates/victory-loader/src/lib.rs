@@ -22,7 +22,9 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
-mod console_insn;
+mod zen2_emul;
+#[cfg(windows)]
+use zen2_emul as console_insn;
 mod crash;
 pub mod prepare;
 pub mod resolve;

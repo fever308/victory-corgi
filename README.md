@@ -57,7 +57,9 @@ from across the VIctory community:
     (`#747` levels-on-demand fixes), and **Jonirulah** (`#670` guarded-view
     watch skip, `#648` in-flight card fetch).
 - **[XCL](https://github.com/ivall/xcl)** — **ivall** and contributors
-  (GPL-2.0-only reference for console runtime behavior).
+  (used as a reference for console runtime behavior only; no code taken. The
+  Zen 2 console-instruction emulator is an independent clean-room
+  implementation under GPL-3.0-or-later).
 
 ## What This Fork Adds (79 Commits Ahead of `Corgansm/victory-corgi`)
 
@@ -144,9 +146,10 @@ rights holder.
   services, the Direct3D 12 back end and the shader recompiler. Licensed
   GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
   the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
+- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors was
+  used as a reference for console runtime behavior only; no code was taken.
+  The Zen 2 console-instruction emulator (`zen2_emul.rs`) is an independent
+  clean-room implementation under GPL-3.0-or-later.
 - The guard over every view of a memory page is code by **myokex**
   ([victory-amd](https://github.com/myokex/victory-amd), commit `c6dc4d8`), which
   adapts pull request #115 here by Spexivus, its correction by joroyt and a part of
