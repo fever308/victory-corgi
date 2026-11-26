@@ -71,9 +71,14 @@ thread_local! {
     static MARKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
-    /// pass's own per frame.
-    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    /// pass's own per frame, and whether it runs before a bake draw.
+    static PASS_BUDGET: std::cell::Cell<Option<(u64, u64, bool)>> = const { std::cell::Cell::new(None) };
 }
+
+/// What [`crate::descriptor::host::HostHeap::texture_news`] said when the
+/// pass before a bake last served all there was, plus one (0: it did not):
+/// until something is new, the next bakes of the frame need no pass.
+static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 
 /// The milliseconds of every frame the pass that uploads textures picked
 /// by index takes before a shader that picks by index has asked for it
@@ -2445,6 +2450,12 @@ impl State {
             return;
         };
         let bake = bake && left > 0;
+        if bake && !first {
+            let (writes, noted) = host.texture_news();
+            if !noted && BAKE_SERVED.load(Ordering::Relaxed) == writes + 1 {
+                return;
+            }
+        }
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
             let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
@@ -2459,7 +2470,7 @@ impl State {
         }
         let began = std::time::Instant::now();
         crate::descriptor::sync_heaps();
-        PASS_BUDGET.set(Some(budget));
+        PASS_BUDGET.set(Some((budget.0, budget.1, bake)));
         self.heap_textures(list, heap, host);
         PASS_BUDGET.set(None);
         if bake {
@@ -2605,6 +2616,7 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        host.texture_slots_short(frame);
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
@@ -2660,15 +2672,20 @@ impl State {
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
-            }
-            None => (span, per_frame),
+        let (span, bytes_at_most, baking) = match PASS_BUDGET.get() {
+            Some((ms, bytes, bake)) => (
+                std::time::Duration::from_millis(ms),
+                SPENT.load(Ordering::Relaxed).saturating_add(bytes),
+                bake,
+            ),
+            None => (span, per_frame, false),
         };
         let began = std::time::Instant::now();
+        BAKE_SERVED.store(0, Ordering::Relaxed);
+        let mut served = due.len() < 4096;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                served = false;
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -2716,6 +2733,7 @@ impl State {
                 }
             }
             let mut partly = None;
+            let mut there = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
@@ -2730,6 +2748,7 @@ impl State {
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
+                there = Some(mapped);
                 if mapped < len {
                     // Uploaded in part before: again only once it is all
                     // there, or at least twice what it was (about a mip
@@ -2788,9 +2807,11 @@ impl State {
                         // goes on, within a count that bounds one pass.
                         host.texture_slot_held(index, write, frame + most);
                         if refused > 1024 {
+                            served = false;
                             break;
                         }
                     } else if refused > 256 {
+                        served = false;
                         break;
                     }
                     continue;
@@ -2824,7 +2845,11 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
+                // (What was found mapped of it a moment ago is not asked
+                // again, unless the host copy may need more.)
+                crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
                 readable(list, sampled.kind, view);
+                crate::texture::PICKING.set(None);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2837,7 +2862,7 @@ impl State {
                 crate::host::log_removal_context();
                 return;
             }
-            let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
+            let (bytes, whole) = crate::texture::staged(resource, there.is_none()).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
             // then on as a slot with nothing new (a placed texture: until
             // more of it is mapped; a texture object at an address the
@@ -2885,6 +2910,9 @@ impl State {
                 }
                 None => host.texture_slot_done(index, write, again),
             }
+        }
+        if baking && served {
+            BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
     }
 

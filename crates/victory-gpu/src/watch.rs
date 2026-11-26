@@ -3001,6 +3001,44 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
     Some(Reading(Held::Bytes(s.read(at, end))))
 }
 
+/// Returns when the change of a mapping overlapping `[at, at + len)` that is
+/// under way, if one is, is over (or has been going on for 2 ms): pages it
+/// took away for its moment are back. Another may have begun.
+pub(crate) fn change_over(at: usize, len: usize) {
+    if !by_range() {
+        if !matches!(MAPPING.try_read(), Err(std::sync::TryLockError::WouldBlock)) {
+            return;
+        }
+        let started = std::time::Instant::now();
+        while matches!(MAPPING.try_read(), Err(std::sync::TryLockError::WouldBlock))
+            && started.elapsed().as_millis() < 2
+        {
+            for _ in 0..50 {
+                std::hint::spin_loop();
+            }
+        }
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut s = spans();
+    if !s.changes.iter().any(|c| meet(c.1, c.2, at, end)) {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2);
+    while s.changes.iter().any(|c| meet(c.1, c.2, at, end)) {
+        let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            break;
+        };
+        s.waiting += 1;
+        let (next, timeout) = SPANS_LEFT.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner());
+        s = next;
+        s.waiting -= 1;
+        if timeout.timed_out() {
+            break;
+        }
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).

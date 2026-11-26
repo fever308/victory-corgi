@@ -9637,7 +9637,7 @@ pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) {
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
-fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
+pub(crate) fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
     let end = start + len;
     let mut at = start;
     while at < end {
@@ -11095,11 +11095,14 @@ impl Meter {
                     crate::texture::hash_every()
                 );
             }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
+            let [through, left, filled, short] =
+                [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if through + left + filled > 0.0 {
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
+                     {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
+                     with less than was mapped (looked at again)"
                 );
             }
         }
