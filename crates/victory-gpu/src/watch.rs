@@ -827,18 +827,29 @@ fn push_merged_interval(out: &mut Vec<(usize, usize)>, first: usize, last: usize
 }
 
 /// Thread-local scratch buffer for `GetWriteWatch` output, eliminating global
-/// lock contention on buffer resizing.
+/// lock contention on buffer resizing. Moves the `Vec` out during `f` so any
+/// re-entrant VEH call on the same thread never panics on `RefCell`.
 fn with_watch_scratch<R>(count: usize, f: impl FnOnce(&mut Vec<usize>) -> R) -> R {
     thread_local! {
         static SCRATCH: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     }
+    let mut buf = SCRATCH.with(|cell| {
+        cell.try_borrow_mut()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default()
+    });
+    if buf.len() < count {
+        buf.resize(count, 0);
+    }
+    let out = f(&mut buf);
     SCRATCH.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        if buf.len() < count {
-            buf.resize(count, 0);
+        if let Ok(mut saved) = cell.try_borrow_mut()
+            && buf.capacity() > saved.capacity()
+        {
+            *saved = buf;
         }
-        f(&mut buf)
-    })
+    });
+    out
 }
 
 /// Experiment (`VICTORY_WATCH_STATS=1`): the kernel askings by where they

@@ -531,15 +531,27 @@ thread_local! {
 }
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
-/// contents are whatever the last texture left).
+/// contents are whatever the last texture left). Moves the buffer out of the
+/// thread-local `RefCell` during `f` so VEH / `lazy_back` re-entrancy on the
+/// same thread can never panic with `RefCell already borrowed`.
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
-    READ.with(|read| {
-        let mut read = read.borrow_mut();
-        if read.len() < size {
-            read.resize(size, 0);
+    let mut read = READ.with(|slot| {
+        slot.try_borrow_mut()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default()
+    });
+    if read.len() < size {
+        read.resize(size, 0);
+    }
+    let out = f(&mut read[..size]);
+    READ.with(|slot| {
+        if let Ok(mut saved) = slot.try_borrow_mut()
+            && read.capacity() > saved.capacity()
+        {
+            *saved = read;
         }
-        f(&mut read[..size])
-    })
+    });
+    out
 }
 
 /// Whether a texture all of whose memory is mapped is read through the
@@ -1504,27 +1516,36 @@ pub(crate) fn fingerprint(at: u64, len: u64, mips: &[(u64, u64)]) -> u64 {
     }
     let len = len as usize;
     let mut hasher = blake3::Hasher::new();
-    READ.with(|read| {
-        let mut read = read.borrow_mut();
-        let longest = mips.iter().map(|&(_, n)| n as usize).max().unwrap_or(0);
-        read.resize((3 * WINDOW).max(longest), 0);
-        let mut take = |from: usize, bytes: usize| {
-            read[..bytes].fill(0);
-            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
-            hasher.update(&read[..bytes]);
-        };
-        if len <= 3 * WINDOW {
-            take(0, len);
-        } else {
-            take(0, WINDOW);
-            take((len / 2) & !0xfff, WINDOW);
-            take(len - WINDOW, WINDOW);
-            for &(from, bytes) in mips {
-                let from = from as usize;
-                if from < len {
-                    take(from, (bytes as usize).min(len - from));
-                }
+    let mut read = READ.with(|slot| {
+        slot.try_borrow_mut()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default()
+    });
+    let longest = mips.iter().map(|&(_, n)| n as usize).max().unwrap_or(0);
+    read.resize((3 * WINDOW).max(longest), 0);
+    let mut take = |from: usize, bytes: usize| {
+        read[..bytes].fill(0);
+        crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+        hasher.update(&read[..bytes]);
+    };
+    if len <= 3 * WINDOW {
+        take(0, len);
+    } else {
+        take(0, WINDOW);
+        take((len / 2) & !0xfff, WINDOW);
+        take(len - WINDOW, WINDOW);
+        for &(from, bytes) in mips {
+            let from = from as usize;
+            if from < len {
+                take(from, (bytes as usize).min(len - from));
             }
+        }
+    }
+    READ.with(|slot| {
+        if let Ok(mut saved) = slot.try_borrow_mut()
+            && read.capacity() > saved.capacity()
+        {
+            *saved = read;
         }
     });
     let hash = hasher.finalize();
