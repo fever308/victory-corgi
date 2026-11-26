@@ -946,6 +946,22 @@ pub(crate) fn relay_fetched(number: u64) {
     RELAY_FETCHED.fetch_max(number, Ordering::AcqRel);
 }
 
+/// Current [`RELAY_FETCHED`] watermark.
+pub(crate) fn relay_fetched_value() -> u64 {
+    RELAY_FETCHED.load(Ordering::Acquire)
+}
+
+/// Maximum `Card::sent` queue length observed across live carded shadows.
+pub(crate) fn card_sent_max() -> usize {
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .filter_map(|s| s.card.as_ref().map(|c| c.sent.lock().unwrap_or_else(|e| e.into_inner()).len()))
+        .max()
+        .unwrap_or(0)
+}
+
 /// With [`relay`]: how many submissions that are not copied back yet
 /// declared each range shaders may be writing (range, count, the last
 /// submission that declared it).

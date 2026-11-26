@@ -301,16 +301,16 @@ impl LazyFetcher {
 
     #[cfg(test)]
     fn fetch(&mut self, shadow: &Shadow, offset: usize, len: usize) -> windows::core::Result<Vec<u8>> {
-        let (buf, _) = self.fetch_batch(&[(shadow, offset, len)])?;
+        let (buf, _, _) = self.fetch_batch(&[(shadow, offset, len)])?;
         Ok(buf)
     }
 
     fn fetch_batch(
         &mut self,
         items: &[(&Shadow, usize, usize)],
-    ) -> windows::core::Result<(Vec<u8>, Vec<(usize, usize)>)> {
+    ) -> windows::core::Result<(Vec<u8>, Vec<(usize, usize)>, u64)> {
         if items.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), 0));
         }
         let host = crate::host::host().ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
         let mut total_bytes = 0usize;
@@ -355,7 +355,7 @@ impl LazyFetcher {
                 }
             }
             self.list.Close()?;
-            host.sync_copy_queue(&self.queue)?;
+            let fetched_after = host.sync_copy_queue(&self.queue)?;
             let lists = [Some(self.list.cast::<ID3D12CommandList>()?)];
             self.queue.ExecuteCommandLists(&lists);
             self.sent += 1;
@@ -367,7 +367,7 @@ impl LazyFetcher {
             if total_bytes > 0 {
                 std::ptr::copy_nonoverlapping(*rb_ptr, out.as_mut_ptr(), total_bytes);
             }
-            Ok((out, slices))
+            Ok((out, slices, fetched_after))
         }
     }
 }
@@ -384,9 +384,9 @@ pub(crate) fn fetcher_sent_count() -> u64 {
 
 fn fetch_gpu_batch(
     items: &[(&Shadow, usize, usize)],
-) -> windows::core::Result<(Vec<u8>, Vec<(usize, usize)>)> {
+) -> windows::core::Result<(Vec<u8>, Vec<(usize, usize)>, u64)> {
     if items.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), 0));
     }
     let mut guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -679,20 +679,6 @@ pub(crate) fn owned_cpu_clean_blocks_in(
     out
 }
 
-/// Returns the minimum `fetched_after` watermark among currently deferred `card` entries, if any.
-pub(crate) fn min_card_fetched_after() -> Option<u64> {
-    if !active() {
-        return None;
-    }
-    let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    table
-        .pages
-        .values()
-        .filter(|e| e.shadow.carded())
-        .map(|e| e.fetched_after)
-        .min()
-}
-
 fn note_fault_hot_locked(table: &mut LazyTable, primary_block: usize) {
     let frame = crate::frame::current();
     let threshold = promote_frames();
@@ -748,9 +734,10 @@ fn materialize_claimed_batch(claimed: Vec<ClaimedBlock>, reason: MaterializeReas
     };
 
     match fetched {
-        Ok((buf, slices)) => {
+        Ok((buf, slices, live_fetched_after)) => {
             for (item, (buf_off, buf_len)) in claimed.iter().zip(slices) {
                 let gpu_bytes = &buf[buf_off..buf_off + buf_len];
+                let merge_after = item.fetched_after.max(live_fetched_after);
                 // Section-backed views merge GPU->title bytes via `inplace` own `PAGE_READWRITE`
                 // views BEFORE restoring `PAGE_READWRITE` on `armed_vas`, so concurrent title
                 // threads never observe stale pre-GPU-write RAM without faulting.
@@ -761,7 +748,7 @@ fn materialize_claimed_batch(claimed: Vec<ClaimedBlock>, reason: MaterializeReas
                             .card_merge_relay_via_own(
                                 item.offset,
                                 gpu_bytes,
-                                item.fetched_after,
+                                merge_after,
                                 &mut scratch,
                             )
                             .is_some()
@@ -795,7 +782,7 @@ fn materialize_claimed_batch(claimed: Vec<ClaimedBlock>, reason: MaterializeReas
                         item.shadow.card_merge_relay(
                             item.offset,
                             gpu_bytes,
-                            item.fetched_after,
+                            merge_after,
                             &mut scratch,
                         );
                     } else if item.shadow.is_rebar() {
@@ -2366,6 +2353,57 @@ mod tests {
             free_watch_pages(ptr2);
             free_watch_pages(ptr3);
         }
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_deferred_card_page_does_not_pin_card_sent_and_materializes_live() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let len = PAGE;
+        let ptr = alloc_watch_pages(len);
+        assert!(!ptr.is_null());
+        let va = ptr as usize;
+        clear_hot_for_test(va / PAGE);
+        // SAFETY: `ptr` is valid writable `PAGE` bytes.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0x11, len);
+        }
+        let Some((shadow, _side)) = make_card_shadow_at(va as u64, 1, 0x11) else {
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+
+        // Simulate a cold page deferred at an ancient submission watermark (`fetched_after = 1`).
+        gpu_write_shadow(&shadow, 0, &[0x5A; 32]);
+        assert!(try_defer_page_inner(&shadow, 0, len, 1));
+        assert!(has_block(va / PAGE));
+
+        // Advance `RELAY_FETCHED` far beyond `1` and verify `relay_fetched_value()` reflects it
+        // (no longer pinned by `min_card_fetched_after`) and `card_dirty` prunes `Card::sent`.
+        let base = crate::shadow::relay_fetched_value();
+        let far = base.saturating_add(10_000);
+        crate::shadow::relay_fetched(far);
+        assert!(crate::shadow::relay_fetched_value() >= far);
+        let _ = crate::shadow::card_dirty(far.saturating_add(1));
+        assert_eq!(crate::shadow::card_sent_max(), 0);
+
+        // Materializing the cold page fetches live GPU bytes using the current watermark.
+        materialize_range(va, len);
+        assert!(!has_block(va / PAGE));
+        // SAFETY: page is materialized and readable.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(ptr, 32), &[0x5A; 32]);
+        }
+
+        clear_hot_for_test(va / PAGE);
+        drop(shadow);
+        // SAFETY: cleanup.
+        unsafe { free_watch_pages(ptr) };
         h.log_messages();
         assert_eq!(h.d3d12_errors(), errors_before);
     }

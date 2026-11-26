@@ -136,10 +136,10 @@ pub(crate) struct Host {
     /// `queue` (`VICTORY_RELAY_COPY_QUEUE=0` disables it).
     copy_queue: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
-    /// Last fence value successfully signalled on `self.queue`, published with
-    /// `Ordering::Release` so [`Host::sync_copy_queue`] can synchronize auxiliary
-    /// `COPY` queues on the GPU timeline without taking `self.submitted`.
-    last_signalled: std::sync::atomic::AtomicU64,
+    /// Last `(fence_value, queue_order)` signalled on `self.queue`, published
+    /// so [`Host::sync_copy_queue`] synchronizes auxiliary `COPY` queues and
+    /// returns the exact `QUEUE_ORDER` watermark visible after the wait.
+    last_signalled: Mutex<(u64, u64)>,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -849,6 +849,20 @@ const PREP_FILL_BYTES: usize = 4;
 const PREP_TITLE_COPY_US: usize = 5;
 const PREP_TITLE_COPY_COUNT: usize = 6;
 
+/// Microsecond phase breakdown of `Host::submit` (`started`..`prepared` plus
+/// `ExecuteCommandLists`): `[ask_once, stale, gpu_write+snap, deferred_run,
+/// card_dirty, card_rec, marks, exec]`.
+static SUBMIT_PHASES: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+const SUB_ASK_ONCE_US: usize = 0;
+const SUB_STALE_US: usize = 1;
+const SUB_GPU_WRITE_US: usize = 2;
+const SUB_DEFERRED_RUN_US: usize = 3;
+const SUB_CARD_DIRTY_US: usize = 4;
+const SUB_CARD_REC_US: usize = 5;
+const SUB_MARKS_US: usize = 6;
+const SUB_EXEC_US: usize = 7;
+
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
 /// memory) and the graphics card's own (indirect arguments, twins' copies).
@@ -1266,7 +1280,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             copy_queue,
             fence,
-            last_signalled: std::sync::atomic::AtomicU64::new(0),
+            last_signalled: Mutex::new((0, 0)),
             submitted: Mutex::new(0),
             event,
             rtvs,
@@ -5080,10 +5094,13 @@ impl Host {
             }
             None => 0,
         };
+        let t_dirty = std::time::Instant::now();
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        SUBMIT_PHASES[SUB_CARD_DIRTY_US].fetch_add(t_dirty.elapsed().as_micros() as u64, Ordering::Relaxed);
         if declared.is_empty() && dirty.is_empty() {
             return None;
         }
+        let t_rec = std::time::Instant::now();
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
         // A copy whose shader writes are declared for the first time gets
@@ -5327,6 +5344,7 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
+        SUBMIT_PHASES[SUB_CARD_REC_US].fetch_add(t_rec.elapsed().as_micros() as u64, Ordering::Relaxed);
         Some(plan)
     }
 
@@ -5573,13 +5591,12 @@ impl Host {
 
         let completed_order = plans.iter().map(|p| p.order_after).max().unwrap_or(0);
         if !card_done_inflight && !has_card {
-            let safe_limit = crate::lazy_back::min_card_fetched_after();
             if inflight_fetch() {
                 // The next merge may be of a flight in the air now, with
                 // bytes from when it ran: only sends up to these plans' are
                 // older than it.
                 if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
-                    crate::shadow::relay_fetched(safe_limit.map_or(last, |m| last.min(m)));
+                    crate::shadow::relay_fetched(last);
                 }
             } else {
                 // Nothing to fetch for card copies: every send up to these flights is done.
@@ -5588,7 +5605,7 @@ impl Host {
                 } else {
                     *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
                 };
-                crate::shadow::relay_fetched(safe_limit.map_or(after, |m| after.min(m)));
+                crate::shadow::relay_fetched(after);
             }
         }
         if !has_card && !has_rebar {
@@ -5707,8 +5724,7 @@ impl Host {
             // fetch inside flights only those up to these plans' are
             // (`fallback_fetched_mark`).
             let mark = fallback_fetched_mark(inflight_fetch(), after, landed_max);
-            let safe_limit = crate::lazy_back::min_card_fetched_after();
-            crate::shadow::relay_fetched(safe_limit.map_or(mark, |m| mark.min(m)));
+            crate::shadow::relay_fetched(mark);
         }
         if has_rebar {
             RELAY_REBAR_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -6112,7 +6128,7 @@ impl Host {
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
-                    self.last_signalled.store(*submitted, Ordering::Release);
+                    self.note_signalled(*submitted);
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
                     WaitForSingleObject(self.event, INFINITE);
@@ -6602,7 +6618,9 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if let Some(ranges) = &ask_once_ranges {
+            let t = std::time::Instant::now();
             crate::watch::ask_once(ranges);
+            SUBMIT_PHASES[SUB_ASK_ONCE_US].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         // Behind flights: the title wrote memory that a flight's shaders
         // may write too, and this submission refreshes it. Only the flights
@@ -6610,7 +6628,9 @@ impl Host {
         // under `VICTORY_RANGE_SETTLE=0`), and then the asking is made again:
         // the copy-back wrote title memory, which other copies of it must see.
         if behind {
+            let t = std::time::Instant::now();
             let stale = stale_under_flights(runs);
+            SUBMIT_PHASES[SUB_STALE_US].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
                 self.settle_stale(&mut submitted, &stale);
@@ -6618,10 +6638,12 @@ impl Host {
                 // `settle_stale` may land GPU writes into private write-watched
                 // title memory without updating `DIR`, so void any standing
                 // `VICTORY_ASK_SHARED` asking before re-asking.
+                let t = std::time::Instant::now();
                 crate::watch::ask_once_void();
                 if let Some(ranges) = &ask_once_ranges {
                     crate::watch::ask_once(ranges);
                 }
+                SUBMIT_PHASES[SUB_ASK_ONCE_US].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
         for list in runs {
@@ -6633,16 +6655,21 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        crate::watch::ask_once_end();
+        {
+            let t = std::time::Instant::now();
+            crate::watch::ask_once_end();
+            SUBMIT_PHASES[SUB_ASK_ONCE_US].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
-            #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
+            let snap_us = snapshots.elapsed().as_micros() as u64;
+            SUBMIT_PHASES[SUB_GPU_WRITE_US].fetch_add(snap_us, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+            crate::copystat::add(crate::copystat::C::SnapshotUs, snap_us);
         }
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
@@ -6657,6 +6684,7 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        let t_marks = std::time::Instant::now();
         let mut rebar_hash_plan = if rebar_entries.is_empty() {
             RebarHashPlan::default()
         } else {
@@ -6670,19 +6698,22 @@ impl Host {
         } else {
             (None, None)
         };
+        SUBMIT_PHASES[SUB_MARKS_US].fetch_add(t_marks.elapsed().as_micros() as u64, Ordering::Relaxed);
         let prepared = std::time::Instant::now();
         if late {
             if let Some(cl) = marks_list.take() {
                 lists.push(Some(cl));
             }
             *submitted += 1;
+            let t_exec = std::time::Instant::now();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            SUBMIT_PHASES[SUB_EXEC_US].fetch_add(t_exec.elapsed().as_micros() as u64, Ordering::Relaxed);
             if signalled.is_ok() {
-                self.last_signalled.store(*submitted, Ordering::Release);
+                self.note_signalled(*submitted);
             }
             self.card_sent();
             if let Err(e) = signalled {
@@ -6761,7 +6792,7 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| {
-                        self.last_signalled.store(*submitted, Ordering::Release);
+                        self.note_signalled(*submitted);
                         self.fence.SetEventOnCompletion(*submitted, self.event)
                     });
                 match waited {
@@ -8736,6 +8767,7 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    let t_run = std::time::Instant::now();
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
@@ -8743,6 +8775,7 @@ impl HostList {
                         crate::watch::ask_once_end();
                         crate::watch::ask_once_void();
                     }
+                    SUBMIT_PHASES[SUB_DEFERRED_RUN_US].fetch_add(t_run.elapsed().as_micros() as u64, Ordering::Relaxed);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -8757,15 +8790,16 @@ impl HostList {
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
                     batch.flush_one(shadow);
-                    #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
                     shadow.writing(*address, *len, |buffer, size| {
                         host.readback_rebar_to_vec(submitted, buffer, size)
                     });
+                    let gw_us = snapshot.elapsed().as_micros() as u64;
+                    SUBMIT_PHASES[SUB_GPU_WRITE_US].fetch_add(gw_us, Ordering::Relaxed);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);
-                        add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
+                        add(C::SnapshotUs, gw_us);
                     }
                     continue;
                 }
@@ -9837,16 +9871,24 @@ impl Host {
         &self.queue
     }
 
-    /// Synchronizes an auxiliary `COPY` queue on the GPU timeline behind the
-    /// most recent fence value signalled on `self.queue`.
-    #[allow(dead_code)] // Wired by Wave B in `lazy_back::LazyFetcher::fetch`.
-    pub(crate) fn sync_copy_queue(&self, copy_queue: &ID3D12CommandQueue) -> windows::core::Result<()> {
-        let v = self.last_signalled.load(Ordering::Acquire);
+    /// Records `(fence_val, current QUEUE_ORDER)` after `self.queue.Signal`.
+    fn note_signalled(&self, fence_val: u64) {
+        let order = *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pair = self.last_signalled.lock().unwrap_or_else(|e| e.into_inner());
+        if fence_val > pair.0 {
+            *pair = (fence_val, order);
+        }
+    }
+
+    /// Synchronizes an auxiliary `COPY` queue behind the latest `self.queue`
+    /// signal and returns the `QUEUE_ORDER` watermark visible after the wait.
+    pub(crate) fn sync_copy_queue(&self, copy_queue: &ID3D12CommandQueue) -> windows::core::Result<u64> {
+        let (v, order) = *self.last_signalled.lock().unwrap_or_else(|e| e.into_inner());
         if v > 0 {
             // SAFETY: `self.fence` is live and `v` was already signalled on `self.queue`.
             unsafe { copy_queue.Wait(&self.fence, v)? };
         }
-        Ok(())
+        Ok(order.max(crate::shadow::relay_fetched_value()))
     }
 
     /// Copies back GPU-written ranges of any ReBAR shadows in `back` via a
@@ -10216,7 +10258,7 @@ impl Host {
             self.queue.ExecuteCommandLists(&[Some(cmd)]);
             match self.queue.Signal(&self.fence, *submitted) {
                 Ok(()) => {
-                    self.last_signalled.store(*submitted, Ordering::Release);
+                    self.note_signalled(*submitted);
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                     Ok(()) => {
                         let waited = WaitForSingleObject(self.event, INFINITE);
@@ -11247,6 +11289,14 @@ impl Meter {
                  refresh-copy {prep_refresh_copy_ms:.1} ms, fills {prep_fill_ms:.1} ms \
                  ({prep_fill_count:.0} fills, {prep_fill_mb:.1} MB), \
                  title-copies {prep_title_copy_ms:.1} ms ({prep_title_copy_count:.0})"
+            );
+            let [s_ask, s_stale, s_gw, s_run, s_dirty, s_rec, s_marks, s_exec] =
+                [0, 1, 2, 3, 4, 5, 6, 7].map(|i| SUBMIT_PHASES[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / logged_frames);
+            tracing::info!(
+                "submit preparing breakdown per frame: ask-once {s_ask:.1} ms, stale {s_stale:.1} ms, \
+                 gpu-write+snap {s_gw:.1} ms, deferred-run {s_run:.1} ms, card-dirty {s_dirty:.1} ms, \
+                 card-rec {s_rec:.1} ms, marks {s_marks:.1} ms; exec {s_exec:.1} ms (card-sent-max {})",
+                crate::shadow::card_sent_max()
             );
             let (buf_n, buf_b, loose_n, loose_b, loose_pin, rebar_b) = crate::shadow::cache_stats();
             let rebar_loose_mb = crate::shadow::rebar_loose_bytes() >> 20;

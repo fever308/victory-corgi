@@ -2138,7 +2138,7 @@ mod rebar_tests {
         direct_list.close();
         h.execute(&[&direct_list]);
         direct_list.reset();
-        assert!(h.last_signalled.load(std::sync::atomic::Ordering::Acquire) > 0);
+        assert!(h.last_signalled.lock().unwrap().0 > 0);
 
         // Create a private COPY queue, call `h.sync_copy_queue`, and read back `dst_default`.
         // SAFETY: plain D3D12 COPY queue, allocator, list, fence, and Win32 event.
