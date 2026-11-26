@@ -557,13 +557,16 @@ fn wide_lowering_enabled(
     if wide_here {
         return true;
     }
-    // Verified water-shading compute hashes safe with wave-wide lowering.
-    // Note: 5dc3b25986622949 and 6f225b641c5b0708 are intentionally excluded
-    // (caused black rectangles on water).
+    // Verified water-shading compute hashes safe with wave-wide lowering
+    // (includes a10179ab7eda0dc3 = CS_TransmissionVolumetrics_VolumePortalsOnly
+    // / Submerged from fxceless/victory-fork#1248).
+    // Note: 5dc3b25986622949 and 6f225b641c5b0708 (_Tiled / _Tiled_LocalLights)
+    // are intentionally excluded (caused black rectangles around the boat).
     matches!(
         hash,
         "6871d6e4b3ac9a10"
             | "926c46bab3b86bd6"
+            | "a10179ab7eda0dc3"
             | "369cbe906ea72764"
             | "2cc4c197ee29e291"
     ) && group_sync != 0
@@ -2969,6 +2972,7 @@ mod barycentric_tests {
         let checked = [
             "6871d6e4b3ac9a10",
             "926c46bab3b86bd6",
+            "a10179ab7eda0dc3",
             "369cbe906ea72764",
             "2cc4c197ee29e291",
         ];
