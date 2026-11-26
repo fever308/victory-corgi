@@ -1193,20 +1193,21 @@ fn promote_cold_pages(candidates: &[usize]) {
     let frame32 = current_frame32();
     let lazy = crate::lazy_back::active();
 
-    // Lock order: `WATCH_SERIAL` -> `GUARDS`. Holding both across `VirtualProtect` +
-    // `GetWriteWatch` verification ensures `ColdRo` is never visible until
-    // verified clean, and `on_write` (which acquires `GUARDS` without `WATCH_SERIAL`)
-    // serializes cleanly if a title thread faults before `GUARDS` drops.
+    // Lock order: `WATCH_SERIAL` -> `GUARD_SHARDS` (ascending). Holding both
+    // across `VirtualProtect` + `GetWriteWatch` verification ensures `ColdRo`
+    // is never visible until verified clean, and `on_write` (which acquires
+    // only the faulted block's shard without `WATCH_SERIAL`) serializes cleanly
+    // if a title thread faults before the shard lock drops.
     let _serial = WATCH_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let mut g = guards();
-    g.prune_pins();
+    let mut locked = GuardLockSet::lock_blocks(&sorted);
+    locked.prune_pins();
 
     let mut eligible = Vec::with_capacity(sorted.len());
     for block in sorted {
         if DIR.is_cold_ro(block)
             || DIR.any_guard_flag(block)
             || DIR.cold_streak(block) < threshold_u8
-            || g.pinned(block)
+            || locked.pinned(block)
             || (lazy && crate::lazy_back::has_block(block))
             || in_view(block, block + 1)
         {
@@ -1289,12 +1290,13 @@ fn promote_cold_pages(candidates: &[usize]) {
 }
 
 /// Demotes any cold-promoted `PAGE_READONLY` blocks in `first..last` back to
-/// `PAGE_READWRITE` and resets their cold streak while `GUARDS` is held.
-fn demote_cold_range(_g: &mut Guards, first: usize, last: usize) {
+/// `PAGE_READWRITE` and resets their cold streak while their guard shards are held.
+fn demote_cold_range(locked: &impl ShardAccess, first: usize, last: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if first >= last {
         return;
     }
+    debug_assert_range_locked(locked, first, last);
     let frame32 = current_frame32();
     let cold_blocks = DIR.collect_set_bits(first, last, BitField::ColdRo);
     if cold_blocks.is_empty() {
@@ -2062,17 +2064,120 @@ fn known_view(start: usize) -> bool {
     if lockfree_enabled() {
         return DIR.is_known_view(first, view_known());
     }
-    let _g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+    let _g = guard_shard_read(shard_of(first));
     DIR.is_known_view(first, view_known())
 }
 
-struct Guards {
-    /// Blocks the kernel is about to write for the runtime ([`kernel_writing`]),
-    /// keyed by disjoint `[first, last)` block intervals with their expiry.
+/// Number of contiguous 64 KiB blocks mapped to one guard-shard stripe
+/// (`1 << 4` = 16 blocks = 1 MiB) so contiguous runs stay in one shard while
+/// disjoint buffers/textures land on independent shards.
+const SHARD_BLOCK_SHIFT: usize = 4;
+const SHARD_BLOCKS: usize = 1 << SHARD_BLOCK_SHIFT;
+/// Power-of-two number of independent guard shards (128 MiB wrap-around period,
+/// avoiding collisions between 64 MiB-aligned pools while keeping `ShardMask`
+/// in a single `u128`).
+const GUARD_SHARDS: usize = 128;
+
+#[inline]
+const fn shard_of(block: usize) -> usize {
+    (block >> SHARD_BLOCK_SHIFT) & (GUARD_SHARDS - 1)
+}
+
+/// Splits `[first, last)` into maximal sub-runs where every block belongs to
+/// the same guard shard, invoking `f(shard, sub_first, sub_last)` in order.
+#[inline]
+fn for_each_shard_run(first: usize, last: usize, mut f: impl FnMut(usize, usize, usize)) {
+    let mut cur = first;
+    while cur < last {
+        let stripe_end = (cur & !(SHARD_BLOCKS - 1)).saturating_add(SHARD_BLOCKS);
+        let next = stripe_end.min(last);
+        f(shard_of(cur), cur, next);
+        cur = next;
+    }
+}
+
+/// Bitset of guard shard indices `0..GUARD_SHARDS`. Iterating set bits via
+/// `trailing_zeros()` always yields shard indices in strictly ascending order.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ShardMask(u128);
+
+impl ShardMask {
+    const EMPTY: Self = Self(0);
+
+    #[inline]
+    const fn single(shard: usize) -> Self {
+        Self(1u128 << shard)
+    }
+
+    #[inline]
+    fn insert(&mut self, shard: usize) {
+        self.0 |= 1u128 << shard;
+    }
+
+    #[inline]
+    fn insert_block(&mut self, block: usize) {
+        self.insert(shard_of(block));
+    }
+
+    #[inline]
+    fn insert_range(&mut self, first: usize, last: usize) {
+        if first >= last {
+            return;
+        }
+        let s0 = first >> SHARD_BLOCK_SHIFT;
+        let s1 = (last - 1) >> SHARD_BLOCK_SHIFT;
+        if s1 - s0 + 1 >= GUARD_SHARDS {
+            self.0 = u128::MAX;
+            return;
+        }
+        for s in s0..=s1 {
+            self.insert(s & (GUARD_SHARDS - 1));
+        }
+    }
+
+    #[inline]
+    fn is_subset_of(self, other: Self) -> bool {
+        (self.0 & !other.0) == 0
+    }
+
+    #[inline]
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[inline]
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[inline]
+    fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    #[inline]
+    fn for_each(self, mut f: impl FnMut(usize)) {
+        let mut rem = self.0;
+        while rem != 0 {
+            let s = rem.trailing_zeros() as usize;
+            rem &= rem - 1;
+            f(s);
+        }
+    }
+}
+
+struct GuardShard {
+    /// Blocks in this shard the kernel is about to write for the runtime
+    /// ([`kernel_writing`]), keyed by disjoint `[first, last)` block intervals
+    /// clipped to stripes belonging to this shard, with their expiry.
     pins: BTreeMap<usize, (usize, std::time::Instant)>,
-    /// View blocks opened by a CPU write fault, and when ([`rest`]).
+    /// View blocks in this shard opened by a CPU write fault, and when ([`rest`]).
     opened: Option<std::collections::HashMap<usize, std::time::Instant>>,
 }
+
+/// Cache-line padded shard slot to prevent false sharing between adjacent shards.
+#[repr(align(64))]
+struct GuardShardSlot(RwLock<GuardShard>);
 
 /// Whether a block once guarded stays known as view memory while its
 /// guard is open (`VICTORY_VIEW_KNOWN=1` or `alt`; off by default).
@@ -2107,15 +2212,23 @@ fn view_known() -> bool {
     }
 }
 
-static GUARDS: RwLock<Guards> = RwLock::new(Guards {
-    pins: BTreeMap::new(),
-    opened: None,
-});
+/// Sharded guard metadata table.
+///
+/// Global lock order (strictly acyclic):
+/// `WATCH_SERIAL` -> `GUARD_SHARDS_TABLE[0..GUARD_SHARDS]` (strictly ascending
+/// shard index) -> `inplace::VIEWS` / `lazy_back::LAZY_STATE` (leaf locks).
+/// `descriptor::host::REMAPPED` is never acquired while any guard shard is held.
+static GUARD_SHARDS_TABLE: [GuardShardSlot; GUARD_SHARDS] = [const {
+    GuardShardSlot(RwLock::new(GuardShard {
+        pins: BTreeMap::new(),
+        opened: None,
+    }))
+}; GUARD_SHARDS];
 
 /// How long blocks stay writable after [`kernel_writing`].
 const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 
-impl Guards {
+impl GuardShard {
     /// Whether `block` is resting writable after a recent CPU write fault.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
         !rest.is_zero()
@@ -2128,7 +2241,7 @@ impl Guards {
 
     /// Records that a CPU write fault just opened `block`.
     fn opened(&mut self, block: usize) {
-        const MANY: usize = 1 << 13;
+        const MANY: usize = 1 << 10;
         let map = self.opened.get_or_insert_with(Default::default);
         if map.len() >= MANY {
             map.retain(|_, at| at.elapsed().as_millis() < 50);
@@ -2161,6 +2274,7 @@ impl Guards {
 
     /// Marks `[first, last)` pinned until at least `until`, coalescing any
     /// overlapping or adjacent intervals so `pins` stays compact and disjoint.
+    /// Caller must clip `[first, last)` to blocks belonging to this shard.
     fn pin(&mut self, mut first: usize, mut last: usize, mut until: std::time::Instant) {
         if first >= last {
             return;
@@ -2224,15 +2338,335 @@ impl Guards {
 }
 
 /// Lock-free `GuardClean` bitmap fast path; `VICTORY_GUARD_BITS=0` takes the
-/// `GUARDS` lock on every guard check, as before.
+/// shard lock on every guard check, as before.
 fn guard_bits_fast_enabled() -> bool {
     static BITS: OnceLock<bool> = OnceLock::new();
     lockfree_enabled()
         && *BITS.get_or_init(|| std::env::var_os("VICTORY_GUARD_BITS").is_none_or(|v| v != "0"))
 }
 
-fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
-    GUARDS.write().unwrap_or_else(|e| e.into_inner())
+#[inline]
+fn guard_shard(shard: usize) -> std::sync::RwLockWriteGuard<'static, GuardShard> {
+    GUARD_SHARDS_TABLE[shard]
+        .0
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[inline]
+fn guard_shard_read(shard: usize) -> std::sync::RwLockReadGuard<'static, GuardShard> {
+    GUARD_SHARDS_TABLE[shard]
+        .0
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Proof token that the required guard shard write locks are currently held.
+trait ShardAccess {
+    fn pinned(&self, block: usize) -> bool;
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool;
+    fn debug_assert_locked(&self, block: usize);
+}
+
+#[inline]
+fn debug_assert_range_locked(access: &impl ShardAccess, first: usize, last: usize) {
+    #[cfg(debug_assertions)]
+    for_each_shard_run(first, last, |_, lo, _| access.debug_assert_locked(lo));
+    #[cfg(not(debug_assertions))]
+    let _ = (access, first, last);
+}
+
+struct SingleShard<'a> {
+    shard: usize,
+    guard: &'a GuardShard,
+}
+
+impl ShardAccess for SingleShard<'_> {
+    #[inline]
+    fn pinned(&self, block: usize) -> bool {
+        debug_assert_eq!(shard_of(block), self.shard);
+        self.guard.pinned(block)
+    }
+
+    #[inline]
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        debug_assert_eq!(shard_of(block), self.shard);
+        self.guard.rests(block, rest)
+    }
+
+    #[inline]
+    fn debug_assert_locked(&self, block: usize) {
+        debug_assert_eq!(shard_of(block), self.shard);
+    }
+}
+
+enum GuardLockInner {
+    Empty,
+    Single(usize, std::sync::RwLockWriteGuard<'static, GuardShard>),
+    Multi(Vec<(usize, std::sync::RwLockWriteGuard<'static, GuardShard>)>),
+}
+
+/// Holds write locks for a set of guard shards, ALWAYS acquired in strictly
+/// ascending shard index order (`0..GUARD_SHARDS`) for deadlock freedom.
+struct GuardLockSet {
+    mask: ShardMask,
+    inner: GuardLockInner,
+}
+
+impl GuardLockSet {
+    fn lock_mask(mask: ShardMask) -> Self {
+        let count = mask.count();
+        let inner = match count {
+            0 => GuardLockInner::Empty,
+            1 => {
+                let s = mask.0.trailing_zeros() as usize;
+                GuardLockInner::Single(s, guard_shard(s))
+            }
+            _ => {
+                let mut guards = Vec::with_capacity(count as usize);
+                mask.for_each(|s| guards.push((s, guard_shard(s))));
+                GuardLockInner::Multi(guards)
+            }
+        };
+        Self { mask, inner }
+    }
+
+    fn lock_range(first: usize, last: usize) -> Self {
+        let mut mask = ShardMask::EMPTY;
+        mask.insert_range(first, last);
+        Self::lock_mask(mask)
+    }
+
+    fn lock_blocks(blocks: &[usize]) -> Self {
+        let mut mask = ShardMask::EMPTY;
+        for &b in blocks {
+            mask.insert_block(b);
+        }
+        Self::lock_mask(mask)
+    }
+
+    #[inline]
+    fn shard(&self, s: usize) -> &GuardShard {
+        match &self.inner {
+            GuardLockInner::Single(idx, g) if *idx == s => g,
+            GuardLockInner::Multi(v) => {
+                let pos = v
+                    .binary_search_by_key(&s, |&(idx, _)| idx)
+                    .expect("guard shard must be locked");
+                &v[pos].1
+            }
+            _ => panic!("guard shard {s} not locked"),
+        }
+    }
+
+    #[inline]
+    fn shard_mut(&mut self, s: usize) -> &mut GuardShard {
+        match &mut self.inner {
+            GuardLockInner::Single(idx, g) if *idx == s => g,
+            GuardLockInner::Multi(v) => {
+                let pos = v
+                    .binary_search_by_key(&s, |&(idx, _)| idx)
+                    .expect("guard shard must be locked");
+                &mut v[pos].1
+            }
+            _ => panic!("guard shard {s} not locked"),
+        }
+    }
+
+    fn for_each_mut(&mut self, mut f: impl FnMut(&mut GuardShard)) {
+        match &mut self.inner {
+            GuardLockInner::Empty => {}
+            GuardLockInner::Single(_, g) => f(g),
+            GuardLockInner::Multi(v) => {
+                for (_, g) in v {
+                    f(g);
+                }
+            }
+        }
+    }
+
+    fn prune_pins(&mut self) {
+        self.for_each_mut(GuardShard::prune_pins);
+    }
+
+    fn pin_range(&mut self, first: usize, last: usize, until: std::time::Instant) {
+        for_each_shard_run(first, last, |s, lo, hi| {
+            self.shard_mut(s).pin(lo, hi, until);
+        });
+    }
+
+    fn unpin_range(&mut self, first: usize, last: usize) {
+        self.for_each_mut(|g| g.unpin(first, last));
+    }
+
+    fn forget_opened_range(&mut self, first: usize, last: usize) {
+        self.for_each_mut(|g| g.forget_opened(first, last));
+    }
+}
+
+impl ShardAccess for GuardLockSet {
+    #[inline]
+    fn pinned(&self, block: usize) -> bool {
+        self.shard(shard_of(block)).pinned(block)
+    }
+
+    #[inline]
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        self.shard(shard_of(block)).rests(block, rest)
+    }
+
+    #[inline]
+    fn debug_assert_locked(&self, block: usize) {
+        debug_assert!(self.mask.0 & (1u128 << shard_of(block)) != 0);
+    }
+}
+
+/// Acquires read locks for all guard shards covering `[first, last)` in
+/// strictly ascending shard order (only used when `VICTORY_WATCH_LOCKFREE=0`).
+fn lock_shards_read_range(
+    first: usize,
+    last: usize,
+) -> Vec<std::sync::RwLockReadGuard<'static, GuardShard>> {
+    let mut mask = ShardMask::EMPTY;
+    mask.insert_range(first, last);
+    let mut guards = Vec::with_capacity(mask.count() as usize);
+    mask.for_each(|s| guards.push(guard_shard_read(s)));
+    guards
+}
+
+/// Collects `(block, alias_blocks)` for every block in `[from, to)` that has
+/// `2..=MANY_VIEWS` views in `inplace`, holding `inplace::VIEWS` as a leaf lock.
+fn collect_aliases(from: usize, to: usize) -> Vec<(usize, Vec<usize>)> {
+    let mut entries: Vec<(usize, Vec<usize>)> = Vec::new();
+    if !view_guard() || from >= to {
+        return entries;
+    }
+    crate::inplace::for_each_alias_in(
+        from.saturating_mul(BLOCK),
+        to.saturating_mul(BLOCK),
+        |block, shown| {
+            entries.push((block, shown.iter().map(|&a| a / BLOCK).collect()));
+        },
+    );
+    entries
+}
+
+/// Locks `base_mask` plus every guard shard touched by aliases of `[from, to)`
+/// in strictly ascending shard order. Retries (dropping all locks first) only
+/// if a concurrent view mapping added an alias in a shard outside `mask`.
+fn lock_with_aliases(
+    mut mask: ShardMask,
+    from: usize,
+    to: usize,
+) -> (GuardLockSet, Vec<(usize, Vec<usize>)>) {
+    loop {
+        let locked = GuardLockSet::lock_mask(mask);
+        let entries = collect_aliases(from, to);
+        let mut needed = mask;
+        for (_, aliases) in &entries {
+            for &a in aliases {
+                needed.insert_block(a);
+            }
+        }
+        if needed.is_subset_of(mask) {
+            return (locked, entries);
+        }
+        drop(locked);
+        mask = needed;
+    }
+}
+
+/// Locks all guard shards covering `[first, last)` plus every alias block
+/// (both current `inplace` aliases and any `GuardAliased` blocks) in strictly
+/// ascending shard order.
+fn lock_range_and_all_aliases(first: usize, last: usize) -> (GuardLockSet, Vec<usize>) {
+    let mut mask = ShardMask::EMPTY;
+    mask.insert_range(first, last);
+    loop {
+        let locked = GuardLockSet::lock_mask(mask);
+        let mut alias_blocks = Vec::new();
+        if view_guard() {
+            crate::inplace::for_each_alias_in(
+                first.saturating_mul(BLOCK),
+                last.saturating_mul(BLOCK),
+                |block, shown| {
+                    for &alias in shown {
+                        let alias_block = alias / BLOCK;
+                        if alias_block != block {
+                            alias_blocks.push(alias_block);
+                        }
+                    }
+                },
+            );
+        }
+        for block in DIR.collect_set_bits(first, last, BitField::GuardAliased) {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let ab = alias / BLOCK;
+                if ab < first || ab >= last {
+                    alias_blocks.push(ab);
+                }
+            }
+        }
+        alias_blocks.sort_unstable();
+        alias_blocks.dedup();
+        let mut needed = mask;
+        for &ab in &alias_blocks {
+            needed.insert_block(ab);
+        }
+        if needed.is_subset_of(mask) {
+            return (locked, alias_blocks);
+        }
+        drop(locked);
+        mask = needed;
+    }
+}
+
+/// Locks the guard shards needed by [`open_under_locked`] for `[first, last)`.
+/// Under [`open_one_view`] (default), only `[first, last)`'s shards are locked;
+/// otherwise every alias shard of any `GuardAliased` block in `[first, last)`
+/// is also locked in strictly ascending order.
+fn lock_range_for_open(first: usize, last: usize) -> GuardLockSet {
+    let mut mask = ShardMask::EMPTY;
+    mask.insert_range(first, last);
+    if open_one_view() {
+        return GuardLockSet::lock_mask(mask);
+    }
+    loop {
+        let locked = GuardLockSet::lock_mask(mask);
+        let mut needed = mask;
+        for block in DIR.collect_set_bits(first, last, BitField::GuardAliased) {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                needed.insert_block(alias / BLOCK);
+            }
+        }
+        if needed.is_subset_of(mask) {
+            return locked;
+        }
+        drop(locked);
+        mask = needed;
+    }
+}
+
+/// Cold VEH fallback for `VICTORY_OPEN_ONE_VIEW=0`: locks `block`'s shard and
+/// all shards of its `GuardAliased` views in strictly ascending order.
+#[cold]
+#[inline(never)]
+fn lock_block_with_aliases(block: usize) -> GuardLockSet {
+    let mut mask = ShardMask::single(shard_of(block));
+    loop {
+        let locked = GuardLockSet::lock_mask(mask);
+        let mut needed = mask;
+        if DIR.get_bit(block, BitField::GuardAliased, Ordering::SeqCst) {
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                needed.insert_block(alias / BLOCK);
+            }
+        }
+        if needed.is_subset_of(mask) {
+            return locked;
+        }
+        drop(locked);
+        mask = needed;
+    }
 }
 
 /// Whether the block `page` is read-only by our hand and unwritten since a
@@ -2241,7 +2675,7 @@ pub(crate) fn clean(page: usize) -> bool {
     if lockfree_enabled() {
         return DIR.is_guard_clean(page);
     }
-    let _g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+    let _g = guard_shard_read(shard_of(page));
     DIR.is_guard_clean(page)
 }
 
@@ -2291,10 +2725,10 @@ pub(crate) fn clear_lazy_view_armed_block(block: usize) {
 }
 
 /// Atomically checks pin state, clears guard/cold metadata for `blocks`, and
-/// invokes `arm(cpu_clean_after)` under `GUARDS` (`GUARDS -> LAZY_STATE` lock
-/// order) so no concurrent `guard()`, `promote_cold_pages()`, or
-/// `kernel_writing()` can re-arm or pin `blocks` between disarming and
-/// `LAZY_STATE` insertion.
+/// invokes `arm(cpu_clean_after)` under all affected guard shards
+/// (`GUARD_SHARDS_TABLE (ascending) -> LAZY_STATE` lock order) so no concurrent
+/// `guard()`, `promote_cold_pages()`, or `kernel_writing()` can re-arm or pin
+/// `blocks` between disarming and `LAZY_STATE` insertion.
 pub(crate) fn try_arm_lazy_under_guards(
     blocks: &[usize],
     arm: impl FnOnce(Option<u64>) -> bool,
@@ -2303,9 +2737,9 @@ pub(crate) fn try_arm_lazy_under_guards(
     if blocks.is_empty() {
         return false;
     }
-    let mut g = guards();
-    g.prune_pins();
-    if blocks.iter().any(|&b| g.pinned(b)) {
+    let mut locked = GuardLockSet::lock_blocks(blocks);
+    locked.prune_pins();
+    if blocks.iter().any(|&b| locked.pinned(b)) {
         return false;
     }
     let primary_block = blocks[0];
@@ -2354,7 +2788,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return Some(Vec::new());
     }
     // `VICTORY_GUARD_ASK=1` asks Windows (`is_view`) on every guard check even
-    // when the block is already known to `GUARDS` or `inplace`.
+    // when the block is already known to `PageDir` or `inplace`.
     static ASK: OnceLock<bool> = OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
         && (DIR.is_known_view(first, view_known())
@@ -2372,30 +2806,41 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if runs.is_empty() {
             return Some(written);
         }
-        // Release `GUARDS` between disjoint runs so title write faults are not
-        // queued behind a long multi-run guard pass.
+        // Split each run at guard-shard boundaries so each pass locks only 1
+        // shard and unrelated workers / title write faults never contend.
         for (from, to) in runs {
-            let mut g = guards();
-            g.prune_pins();
-            guard_run(&mut g, from, to, &mut written, rest);
+            for_each_shard_run(from, to, |shard, s_from, s_to| {
+                guard_run_shard(shard, s_from, s_to, &mut written, rest);
+            });
         }
         #[cfg(feature = "diagnostics")]
         crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
         return Some(written);
     }
-    let mut g = guards();
-    g.prune_pins();
     let mut written = Vec::new();
-    guard_run(&mut g, first, last, &mut written, rest);
-    drop(g);
+    for_each_shard_run(first, last, |shard, s_from, s_to| {
+        guard_run_shard(shard, s_from, s_to, &mut written, rest);
+    });
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Asked, first, last, written.len() as u64);
     Some(written)
 }
 
-/// [`guard`] for the blocks `first..last`, with the lock held alone.
-fn guard_run(
-    g: &mut Guards,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardBlockKind {
+    End,
+    Skip,
+    LeaveOpen,
+    Reclean,
+    Protect,
+}
+
+/// [`guard`] for a shard-local sub-run `first..last` where every block maps to
+/// `shard`. Locks only `shard` on the common path; if a block has an alias in
+/// another shard, drops `shard` first and finishes that sub-run under an
+/// ascending-order [`GuardLockSet`] before resuming.
+fn guard_run_shard(
+    shard: usize,
     first: usize,
     last: usize,
     written: &mut Vec<usize>,
@@ -2404,55 +2849,142 @@ fn guard_run(
     if first >= last {
         return;
     }
-    let mut run: Option<usize> = None;
-    let mut reclean: Option<usize> = None;
-    let mut uncommitted_until = first;
     let lazy = crate::lazy_back::active();
-    for block in first..=last {
-        let is_clean_or_lazy =
-            block < last && (DIR.is_guard_clean(block) || DIR.is_lazy_armed(block));
-        let mut open = block < last && !is_clean_or_lazy;
-        if open && DIR.is_guard_absent(block) {
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
-            }
-            open = block >= uncommitted_until;
-            if open {
-                DIR.set_bit(block, BitField::GuardAbsent, false, Ordering::SeqCst);
-            }
-        }
-        if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.pinned(block)
-                || (lazy && crate::lazy_back::has_block(block))
-                || g.rests(block, rest)
-            {
-                // Left open (pinned for kernel write, lazy copy-back armed, or
-                // resting after a recent CPU write fault): reported written at
-                // every check until it is eligible to be guarded again.
-            } else if DIR.is_guard_protected(block) {
-                // Already read-only (e.g. guarded as an alias, or left unclean
-                // after an alias rebind / unguardable alias): becomes clean only
-                // once every alias view is also guarded.
-                if let Some(from) = run.take() {
-                    protect(g, from, block, lazy, rest);
+    let mut cur = first;
+    let mut uncommitted_until = first;
+    while cur < last {
+        let mut deferred: Option<(usize, usize, ShardMask)> = None;
+        let mut next_cur = last;
+        {
+            let mut g = guard_shard(shard);
+            g.prune_pins();
+            let mut run: Option<usize> = None;
+            let mut reclean: Option<usize> = None;
+            for block in cur..=last {
+                let kind = if block == last {
+                    GuardBlockKind::End
+                } else if DIR.is_guard_clean(block) || DIR.is_lazy_armed(block) {
+                    GuardBlockKind::Skip
+                } else {
+                    let mut open = true;
+                    if DIR.is_guard_absent(block) {
+                        if block >= uncommitted_until {
+                            uncommitted_until = uncommitted_end(block);
+                        }
+                        open = block >= uncommitted_until;
+                        if open {
+                            DIR.set_bit(block, BitField::GuardAbsent, false, Ordering::SeqCst);
+                        }
+                    }
+                    if !open {
+                        GuardBlockKind::Skip
+                    } else if g.pinned(block)
+                        || (lazy && crate::lazy_back::has_block(block))
+                        || g.rests(block, rest)
+                    {
+                        GuardBlockKind::LeaveOpen
+                    } else if DIR.is_guard_protected(block) {
+                        GuardBlockKind::Reclean
+                    } else {
+                        GuardBlockKind::Protect
+                    }
+                };
+
+                if kind != GuardBlockKind::Protect
+                    && let Some(from) = run.take()
+                    && let Err(mask) = try_protect_single_shard(&g, shard, from, block, lazy, rest)
+                {
+                    deferred = Some((from, block, mask));
+                    next_cur = block;
+                    break;
                 }
-                reclean.get_or_insert(block);
-                continue;
-            } else {
-                if let Some(from) = reclean.take() {
-                    mark_protected_clean(g, from, block, lazy, rest);
+                if kind != GuardBlockKind::Reclean
+                    && let Some(from) = reclean.take()
+                    && let Err(mask) =
+                        try_mark_protected_clean_single_shard(&g, shard, from, block, lazy, rest)
+                {
+                    deferred = Some((from, block, mask));
+                    next_cur = block;
+                    break;
                 }
-                run.get_or_insert(block);
-                continue;
+
+                match kind {
+                    GuardBlockKind::End | GuardBlockKind::Skip => {}
+                    GuardBlockKind::LeaveOpen => {
+                        // Left open (pinned for kernel write, lazy copy-back armed, or
+                        // resting after a recent CPU write fault): reported written at
+                        // every check until it is eligible to be guarded again.
+                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                    }
+                    GuardBlockKind::Reclean => {
+                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                        reclean.get_or_insert(block);
+                    }
+                    GuardBlockKind::Protect => {
+                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                        run.get_or_insert(block);
+                    }
+                }
             }
         }
-        if let Some(from) = run.take() {
-            protect(g, from, block, lazy, rest);
+        if let Some((from, to, alias_mask)) = deferred {
+            finish_guard_range_multi_shard(shard, alias_mask, from, to, lazy, rest);
         }
-        if let Some(from) = reclean.take() {
-            mark_protected_clean(g, from, block, lazy, rest);
+        cur = next_cur;
+    }
+}
+
+/// Completes guarding/recleaning `[from, to)` (all blocks in `primary_shard`)
+/// when at least one block has an alias in another shard, holding all primary
+/// and alias shards simultaneously in strictly ascending shard order.
+fn finish_guard_range_multi_shard(
+    primary_shard: usize,
+    initial_alias_mask: ShardMask,
+    from: usize,
+    to: usize,
+    lazy: bool,
+    rest: std::time::Duration,
+) {
+    let base_mask = initial_alias_mask.union(ShardMask::single(primary_shard));
+    let (mut locked, entries) = lock_with_aliases(base_mask, from, to);
+    locked.prune_pins();
+
+    // Re-evaluate eligibility under the full lock set because `primary_shard`
+    // was briefly released during the lock upgrade.
+    let mut protect_runs: Vec<(usize, usize)> = Vec::new();
+    let mut reclean_runs: Vec<(usize, usize)> = Vec::new();
+    for block in from..to {
+        if DIR.is_guard_clean(block)
+            || DIR.is_lazy_armed(block)
+            || DIR.is_guard_absent(block)
+            || locked.pinned(block)
+            || (lazy && crate::lazy_back::has_block(block))
+            || locked.rests(block, rest)
+        {
+            continue;
         }
+        if DIR.is_guard_protected(block) {
+            push_merged_interval(&mut reclean_runs, block, block + 1);
+        } else {
+            push_merged_interval(&mut protect_runs, block, block + 1);
+        }
+    }
+
+    for (r_from, r_to) in protect_runs {
+        let sub_entries: Vec<(usize, Vec<usize>)> = entries
+            .iter()
+            .filter(|&&(b, _)| b >= r_from && b < r_to)
+            .cloned()
+            .collect();
+        protect_with_access(&locked, sub_entries, r_from, r_to, lazy, rest);
+    }
+    for (r_from, r_to) in reclean_runs {
+        let sub_entries: Vec<(usize, Vec<usize>)> = entries
+            .iter()
+            .filter(|&&(b, _)| b >= r_from && b < r_to)
+            .cloned()
+            .collect();
+        mark_protected_clean_with_access(&locked, sub_entries, r_from, r_to, lazy, rest);
     }
 }
 
@@ -2559,31 +3091,18 @@ fn protect_block_runs(blocks: &[usize], prot: u32) {
     });
 }
 
-/// Guards the other mappings of blocks in `[from, to)`, returning:
+/// Guards the other mappings of blocks in `entries` while their guard shards
+/// are held via `access`, returning:
 /// - `(block, shown_blocks)` entries whose other mappings are all guarded;
-/// - the set of blocks in `[from, to)` that still have an unguardable mapping
-///   (pinned, lazy-armed, or `VirtualProtect` failed) and must stay changed.
-fn guard_aliases_for(
-    g: &Guards,
-    from: usize,
-    to: usize,
+/// - the set of blocks that still have an unguardable mapping (pinned,
+///   lazy-armed, resting, or `VirtualProtect` failed) and must stay changed.
+fn guard_aliases_with(
+    access: &impl ShardAccess,
+    mut entries: Vec<(usize, Vec<usize>)>,
     lazy: bool,
     rest: std::time::Duration,
 ) -> (Vec<(usize, Vec<usize>)>, std::collections::BTreeSet<usize>) {
     use std::collections::BTreeSet;
-    if !view_guard() || from >= to {
-        return (Vec::new(), BTreeSet::new());
-    }
-    // Collect alias lists while holding `inplace::VIEWS` as a leaf lock so
-    // `lazy_back::has_block` and `VirtualProtect` never nest inside `VIEWS`.
-    let mut entries: Vec<(usize, Vec<usize>)> = Vec::new();
-    crate::inplace::for_each_alias_in(
-        from.saturating_mul(BLOCK),
-        to.saturating_mul(BLOCK),
-        |block, shown| {
-            entries.push((block, shown.iter().map(|&a| a / BLOCK).collect()));
-        },
-    );
     if entries.is_empty() {
         return (Vec::new(), BTreeSet::new());
     }
@@ -2596,10 +3115,10 @@ fn guard_aliases_for(
             if alias == *block {
                 continue;
             }
-            if g.pinned(alias)
+            if access.pinned(alias)
                 || DIR.is_lazy_armed(alias)
                 || (lazy && crate::lazy_back::has_block(alias))
-                || (!DIR.is_guard_protected(alias) && g.rests(alias, rest))
+                || (!DIR.is_guard_protected(alias) && access.rests(alias, rest))
             {
                 blocked = true;
                 break;
@@ -2611,6 +3130,7 @@ fn guard_aliases_for(
         }
         for &alias in aliases {
             if alias != *block && !DIR.is_guard_protected(alias) && !DIR.is_cold_ro(alias) {
+                access.debug_assert_locked(alias);
                 alias_targets.push(alias);
                 pending_pairs.push((*block, alias));
             }
@@ -2626,17 +3146,72 @@ fn guard_aliases_for(
     (entries, unguarded)
 }
 
+/// Computes the shard mask required by every alias in `entries`.
+fn alias_entries_mask(entries: &[(usize, Vec<usize>)]) -> ShardMask {
+    let mut mask = ShardMask::EMPTY;
+    for (_, aliases) in entries {
+        for &a in aliases {
+            mask.insert_block(a);
+        }
+    }
+    mask
+}
+
+/// Attempts [`mark_protected_clean_with_access`] while holding only `shard`.
+/// Returns `Err(alias_mask)` without mutating anything if any alias lies in
+/// another shard.
+fn try_mark_protected_clean_single_shard(
+    g: &GuardShard,
+    shard: usize,
+    from: usize,
+    to: usize,
+    lazy: bool,
+    rest: std::time::Duration,
+) -> Result<(), ShardMask> {
+    let entries = collect_aliases(from, to);
+    let alias_mask = alias_entries_mask(&entries);
+    if !alias_mask.is_subset_of(ShardMask::single(shard)) {
+        return Err(alias_mask);
+    }
+    let access = SingleShard { shard, guard: g };
+    mark_protected_clean_with_access(&access, entries, from, to, lazy, rest);
+    Ok(())
+}
+
+/// Attempts [`protect_with_access`] while holding only `shard`.
+/// Returns `Err(alias_mask)` without mutating anything if any alias lies in
+/// another shard.
+fn try_protect_single_shard(
+    g: &GuardShard,
+    shard: usize,
+    from: usize,
+    to: usize,
+    lazy: bool,
+    rest: std::time::Duration,
+) -> Result<(), ShardMask> {
+    let entries = collect_aliases(from, to);
+    let alias_mask = alias_entries_mask(&entries);
+    if !alias_mask.is_subset_of(ShardMask::single(shard)) {
+        return Err(alias_mask);
+    }
+    let access = SingleShard { shard, guard: g };
+    protect_with_access(&access, entries, from, to, lazy, rest);
+    Ok(())
+}
+
 /// Marks already-`GuardProtected` blocks `[from, to)` clean after ensuring
 /// every alias view of each block is guarded; any block with an unguardable
 /// alias stays unclean (`GuardClean = false`).
-fn mark_protected_clean(
-    g: &Guards,
+fn mark_protected_clean_with_access(
+    access: &impl ShardAccess,
+    entries: Vec<(usize, Vec<usize>)>,
     from: usize,
     to: usize,
     lazy: bool,
     rest: std::time::Duration,
 ) {
-    let (aliased, unguarded) = guard_aliases_for(g, from, to, lazy, rest);
+    debug_assert_range_locked(access, from, to);
+    let (aliased, unguarded) = guard_aliases_with(access, entries, lazy, rest);
     for (block, aliases) in aliased {
         if !DIR.is_guard_protected(block) {
             continue;
@@ -2664,22 +3239,30 @@ fn mark_protected_clean(
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean,
 /// also guarding all alias views of the same physical pages. Any block
 /// whose alias cannot be guarded is left out (stays changed).
-fn protect(g: &mut Guards, from: usize, to: usize, lazy: bool, rest: std::time::Duration) {
+fn protect_with_access(
+    access: &impl ShardAccess,
+    entries: Vec<(usize, Vec<usize>)>,
+    from: usize,
+    to: usize,
+    lazy: bool,
+    rest: std::time::Duration,
+) {
+    debug_assert_range_locked(access, from, to);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
-    let (aliased, unguarded) = guard_aliases_for(g, from, to, lazy, rest);
+    let (aliased, unguarded) = guard_aliases_with(access, entries, lazy, rest);
     if unguarded.is_empty() {
-        protect_here(g, from, to);
+        protect_here(access, from, to);
     } else {
         let mut cur = from;
         for bad in unguarded {
             if cur < bad {
-                protect_here(g, cur, bad);
+                protect_here(access, cur, bad);
             }
             cur = bad + 1;
         }
         if cur < to {
-            protect_here(g, cur, to);
+            protect_here(access, cur, to);
         }
     }
     for (block, aliases) in aliased {
@@ -2742,9 +3325,10 @@ fn protect_alias_blocks(mut aliases: Vec<usize>) {
     });
 }
 
-/// [`protect`] for one range, without the other views of its pages.
-fn protect_here(_g: &mut Guards, from: usize, to: usize) {
+/// [`protect_with_access`] for one range, without the other views of its pages.
+fn protect_here(access: &impl ShardAccess, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READONLY;
+    debug_assert_range_locked(access, from, to);
     let vk = view_known();
     virtual_protect_adaptive(
         from,
@@ -2803,12 +3387,18 @@ fn uncommitted_end(block: usize) -> usize {
 /// while refreshes immediately observe the change.
 /// Marks every primary and alias block dirty/unprotected in `PageDir` strictly
 /// BEFORE any `VirtualProtect(..., PAGE_READWRITE)` opens a page.
-fn open(_g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize)) -> usize {
+fn open_under_locked(
+    access: &impl ShardAccess,
+    start: usize,
+    end: usize,
+    mut dirtied: impl FnMut(usize),
+) -> usize {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if start >= end {
         return 0;
     }
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    debug_assert_range_locked(access, first, last);
     let primary = DIR.collect_set_bits(first, last, BitField::GuardProtected);
     let aliased = DIR.collect_set_bits(first, last, BitField::GuardAliased);
     let one = open_one_view();
@@ -2826,6 +3416,7 @@ fn open(_g: &mut Guards, start: usize, end: usize, mut dirtied: impl FnMut(usize
                     }
                     continue;
                 }
+                access.debug_assert_locked(ab);
                 DIR.set_bit(ab, BitField::GuardAliased, false, Ordering::SeqCst);
                 if ab < first || ab >= last {
                     alias_blocks.push(ab);
@@ -2882,7 +3473,7 @@ pub(crate) fn writing(at: usize, len: usize) {
             &[BitField::GuardProtected, BitField::GuardAliased, BitField::ColdRo],
         )
     } else {
-        let _g = GUARDS.read().unwrap_or_else(|e| e.into_inner());
+        let _g = lock_shards_read_range(first, last);
         DIR.any_bits_in_range(
             first,
             last,
@@ -2890,10 +3481,10 @@ pub(crate) fn writing(at: usize, len: usize) {
         )
     };
     if needs_open {
-        let mut g = guards();
-        let opened = open(&mut g, at, end, |_| {});
-        demote_cold_range(&mut g, first, last);
-        drop(g);
+        let locked = lock_range_for_open(first, last);
+        let opened = open_under_locked(&locked, at, end, |_| {});
+        demote_cold_range(&locked, first, last);
+        drop(locked);
         #[cfg(feature = "diagnostics")]
         crate::faultbook::note(crate::faultbook::What::Ours, first, last, opened as u64);
         let _ = opened;
@@ -2913,43 +3504,17 @@ pub fn kernel_writing(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
     // Pin + clear guard/cold metadata across the range and all aliases under
-    // `GUARDS` strictly BEFORE any `VirtualProtect(..., PAGE_READWRITE)` and
-    // BEFORE `lazy_back::materialize_range`, so neither a concurrent
+    // their guard shards (ascending order) strictly BEFORE any
+    // `VirtualProtect(..., PAGE_READWRITE)` and BEFORE
+    // `lazy_back::materialize_range`, so neither a concurrent
     // `try_arm_lazy_under_guards` nor a lock-free `PageDir` reader can race.
     {
-        let mut g = guards();
-        g.prune_pins();
+        let (mut locked, alias_blocks) = lock_range_and_all_aliases(first, last);
+        locked.prune_pins();
         let until = std::time::Instant::now() + PIN;
-        g.pin(first, last, until);
-        let mut alias_blocks = Vec::new();
-        if view_guard() {
-            crate::inplace::for_each_alias_in(
-                first.saturating_mul(BLOCK),
-                last.saturating_mul(BLOCK),
-                |block, shown| {
-                    for &alias in shown {
-                        let alias_block = alias / BLOCK;
-                        if alias_block != block {
-                            alias_blocks.push(alias_block);
-                        }
-                    }
-                },
-            );
-        }
-        for block in DIR.collect_set_bits(first, last, BitField::GuardAliased) {
-            DIR.set_bit(block, BitField::GuardAliased, false, Ordering::SeqCst);
-            for alias in crate::inplace::pages_of(block * BLOCK) {
-                let ab = alias / BLOCK;
-                DIR.set_bit(ab, BitField::GuardAliased, false, Ordering::SeqCst);
-                if ab < first || ab >= last {
-                    alias_blocks.push(ab);
-                }
-            }
-        }
-        alias_blocks.sort_unstable();
-        alias_blocks.dedup();
+        locked.pin_range(first, last, until);
         for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
-            g.pin(r_from, r_to, until);
+            locked.pin_range(r_from, r_to, until);
         });
 
         let frame32 = current_frame32();
@@ -3026,17 +3591,21 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
     {
-        let mut g = guards();
+        let locked = if mode & 1 != 0 {
+            lock_range_for_open(first, last)
+        } else {
+            GuardLockSet::lock_range(first, last)
+        };
         let guarded = DIR.count_bits_in_range(first, last, BitField::GuardProtected);
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
         if mode & 1 != 0 {
             if guarded != 0 {
-                open(&mut g, at, end, |_| {});
+                open_under_locked(&locked, at, end, |_| {});
             }
             if DIR.any_bits_in_range(first, last, &[BitField::ColdRo]) {
-                demote_cold_range(&mut g, first, last);
+                demote_cold_range(&locked, first, last);
             }
         }
     }
@@ -3058,7 +3627,18 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if crate::lazy_back::active() {
         crate::lazy_back::materialize_ranges(&ranges);
     }
-    let _g = guards();
+    let mut mask = ShardMask::EMPTY;
+    for &(at, n) in &ranges {
+        if n == 0 {
+            continue;
+        }
+        let end = at.saturating_add(n);
+        mask.insert_range(at / BLOCK, end.div_ceil(BLOCK));
+    }
+    if mask.is_empty() {
+        return;
+    }
+    let _locked = GuardLockSet::lock_mask(mask);
     let mut to_open = Vec::new();
     #[cfg(feature = "diagnostics")]
     let mut opened_ranges = 0u64;
@@ -3342,11 +3922,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
     let end = at.saturating_add(len);
     let range = at / BLOCK..end.div_ceil(BLOCK);
-    g.unpin(range.start, range.end);
-    g.forget_opened(range.start, range.end);
+    if range.start >= range.end {
+        return;
+    }
+    let mut locked = GuardLockSet::lock_range(range.start, range.end);
+    locked.unpin_range(range.start, range.end);
+    locked.forget_opened_range(range.start, range.end);
     DIR.set_bits_range(range.start, range.end, BitField::GuardAbsent, false, Ordering::SeqCst);
     DIR.set_bits_range(range.start, range.end, BitField::GuardAliased, false, Ordering::SeqCst);
     DIR.set_bits_range(range.start, range.end, BitField::Watched, false, Ordering::Relaxed);
@@ -3391,22 +3974,18 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
     wrote(at, len);
     let lazy = crate::lazy_back::active();
     let rest = rest();
-    let mut g = guards();
-    g.prune_pins();
     let end = at.saturating_add(len);
     let range = at / BLOCK..end.div_ceil(BLOCK);
-    DIR.set_bits_range(range.start, range.end, BitField::GuardClean, false, Ordering::SeqCst);
     if !view_guard() {
+        let _locked = GuardLockSet::lock_range(range.start, range.end);
+        DIR.set_bits_range(range.start, range.end, BitField::GuardClean, false, Ordering::SeqCst);
         return;
     }
-    let mut entries: Vec<(usize, Vec<usize>)> = Vec::new();
-    crate::inplace::for_each_alias_in(
-        range.start.saturating_mul(BLOCK),
-        range.end.saturating_mul(BLOCK),
-        |block, shown| {
-            entries.push((block, shown.iter().map(|&a| a / BLOCK).collect()));
-        },
-    );
+    let mut base_mask = ShardMask::EMPTY;
+    base_mask.insert_range(range.start, range.end);
+    let (mut locked, entries) = lock_with_aliases(base_mask, range.start, range.end);
+    locked.prune_pins();
+    DIR.set_bits_range(range.start, range.end, BitField::GuardClean, false, Ordering::SeqCst);
     if entries.is_empty() {
         return;
     }
@@ -3423,8 +4002,8 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
                     continue;
                 }
                 if !DIR.is_guard_protected(alias) && !DIR.is_cold_ro(alias) {
-                    if !g.pinned(alias)
-                        && !g.rests(alias, rest)
+                    if !locked.pinned(alias)
+                        && !locked.rests(alias, rest)
                         && !DIR.is_lazy_armed(alias)
                         && !(lazy && crate::lazy_back::has_block(alias))
                     {
@@ -3446,8 +4025,8 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
                     DIR.set_bit(alias, BitField::GuardClean, false, Ordering::SeqCst);
                 }
             }
-            if !g.pinned(*block)
-                && !g.rests(*block, rest)
+            if !locked.pinned(*block)
+                && !locked.rests(*block, rest)
                 && !DIR.is_cold_ro(*block)
                 && !DIR.is_lazy_armed(*block)
                 && !(lazy && crate::lazy_back::has_block(*block))
@@ -3473,11 +4052,12 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
 }
 
 /// Restores `PAGE_READWRITE` for a cold-promoted write-watched 64 KiB block
-/// upon CPU write fault while `GUARDS` is held, recording the page dirty
+/// upon CPU write fault while its guard shard is held, recording the page dirty
 /// strictly before opening write access.
-fn open_cold_ro(_g: &mut Guards, at: usize) -> bool {
+fn open_cold_ro(access: &impl ShardAccess, at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let block = at / BLOCK;
+    access.debug_assert_locked(block);
     if !DIR.is_cold_ro(block) {
         return false;
     }
@@ -3488,6 +4068,42 @@ fn open_cold_ro(_g: &mut Guards, at: usize) -> bool {
     let mut old = 0u32;
     // SAFETY: `block` was cold-promoted to `PAGE_READONLY` by us; restoring `PAGE_READWRITE`.
     unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0 }
+}
+
+/// Cold VEH path when `VICTORY_OPEN_ONE_VIEW=0` and the faulted block has
+/// cross-shard aliases that must all be opened together under ascending locks.
+#[cold]
+#[inline(never)]
+fn handle_cross_shard_write_fault(
+    at: usize,
+    block: usize,
+    shard: usize,
+    dirty_blocks: &mut Vec<usize>,
+    #[cfg(feature = "diagnostics")] began: std::time::Instant,
+) -> Option<bool> {
+    let mut locked = lock_block_with_aliases(block);
+    #[cfg(feature = "diagnostics")]
+    let waited = began.elapsed();
+    let opened = open_under_locked(&locked, at, at + 1, |b| dirty_blocks.push(b));
+    if opened != 0 {
+        locked.shard_mut(shard).opened(block);
+        #[cfg(feature = "diagnostics")]
+        {
+            let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
+            let held = (began.elapsed() - waited).as_nanos() as u64;
+            crate::faultbook::note(
+                crate::faultbook::What::Fault,
+                block,
+                (opened << 32) | ns,
+                held,
+            );
+        }
+        Some(true)
+    } else if open_cold_ro(&locked, at) || writable(at) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -3521,7 +4137,7 @@ fn install() {
         }
         let block = at / BLOCK;
         // Another thread may have opened the block since this one faulted:
-        // avoid waiting on `GUARDS` if `PageDir` and Windows already show it RW.
+        // avoid waiting on the shard lock if `PageDir` and Windows already show it RW.
         if lockfree_enabled()
             && !DIR.is_guard_protected(block)
             && !DIR.is_cold_ro(block)
@@ -3531,37 +4147,56 @@ fn install() {
             crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        // Held across both checks when `open` returns 0: another thread may
-        // have opened the block since this one faulted, and a copy may have
-        // guarded it again since. Collect dirtied blocks and drop `GUARDS`
-        // before calling `descriptor::host::remapped` so VEH faults cannot
-        // deadlock with `REMAPPED`.
+        // Held across both checks when `open_under_locked` returns 0: another
+        // thread may have opened the block since this one faulted, and a copy
+        // may have guarded it again since. Collect dirtied blocks and drop the
+        // shard lock before calling `descriptor::host::remapped` so VEH faults
+        // cannot deadlock with `REMAPPED`.
         let mut dirty_blocks = Vec::new();
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
+        let shard = shard_of(block);
         let handled = {
-            let mut g = guards();
+            let mut g = guard_shard(shard);
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
-            let opened = open(&mut g, at, at + 1, |block| dirty_blocks.push(block));
-            if opened != 0 {
-                g.opened(block);
-                #[cfg(feature = "diagnostics")]
-                {
-                    let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
-                    let held = (began.elapsed() - waited).as_nanos() as u64;
-                    crate::faultbook::note(
-                        crate::faultbook::What::Fault,
-                        block,
-                        (opened << 32) | ns,
-                        held,
-                    );
-                }
-                Some(true)
-            } else if open_cold_ro(&mut g, at) || writable(at) {
-                Some(false)
+            let needs_cross_shard = !open_one_view()
+                && DIR.get_bit(block, BitField::GuardAliased, Ordering::SeqCst)
+                && crate::inplace::pages_of(block * BLOCK)
+                    .iter()
+                    .any(|&a| shard_of(a / BLOCK) != shard);
+            if needs_cross_shard {
+                drop(g);
+                handle_cross_shard_write_fault(
+                    at,
+                    block,
+                    shard,
+                    &mut dirty_blocks,
+                    #[cfg(feature = "diagnostics")]
+                    began,
+                )
             } else {
-                None
+                let single = SingleShard { shard, guard: &g };
+                let opened = open_under_locked(&single, at, at + 1, |b| dirty_blocks.push(b));
+                if opened != 0 {
+                    g.opened(block);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
+                        let held = (began.elapsed() - waited).as_nanos() as u64;
+                        crate::faultbook::note(
+                            crate::faultbook::What::Fault,
+                            block,
+                            (opened << 32) | ns,
+                            held,
+                        );
+                    }
+                    Some(true)
+                } else if open_cold_ro(&single, at) || writable(at) {
+                    Some(false)
+                } else {
+                    None
+                }
             }
         };
         match handled {
@@ -3632,6 +4267,25 @@ mod tests {
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     static JOURNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear_all_pins() {
+        for s in 0..GUARD_SHARDS {
+            guard_shard(s).pins.clear();
+        }
+    }
+
+    fn pin_blocks_for_test(first: usize, last: usize, until: std::time::Instant) {
+        let mut locked = GuardLockSet::lock_range(first, last);
+        locked.pin_range(first, last, until);
+    }
+
+    fn open_for_test(start: usize, end: usize, dirtied: impl FnMut(usize)) -> usize {
+        if start >= end {
+            return 0;
+        }
+        let locked = lock_range_for_open(start / BLOCK, end.div_ceil(BLOCK));
+        open_under_locked(&locked, start, end, dirtied)
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
@@ -4071,13 +4725,13 @@ mod tests {
         assert!(writable(other + BLOCK));
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         // Once the pin expires, the block re-guards cleanly.
-        guards().pins.clear();
+        clear_all_pins();
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Half a page and the next: both blocks, not just the first's.
         kernel_writing(other + BLOCK / 2, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
-        guards().pins.clear();
+        clear_all_pins();
         drop_views(section, &[guarded, other], SIZE);
     }
 
@@ -4167,7 +4821,7 @@ mod tests {
         // Pin `b` initially: guarding `a` MUST leave `a` unclean while `b` is
         // pinned and writable (cannot be guarded yet).
         let until = std::time::Instant::now() + PIN;
-        guards().pin(b / BLOCK, b / BLOCK + 1, until);
+        pin_blocks_for_test(b / BLOCK, b / BLOCK + 1, until);
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
         assert_eq!(
             guard(a, a + BLOCK),
@@ -4178,7 +4832,7 @@ mod tests {
 
         // Clear the pin, write through `b`, then guard `a` cleanly, then re-open
         // `b` alone via `title_memory_alias_rebound` on `a`.
-        guards().pins.clear();
+        clear_all_pins();
         // SAFETY: `b` is writable committed view memory.
         unsafe { ((b + 4) as *mut u8).write_volatile(0x42) };
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
@@ -4248,7 +4902,7 @@ mod tests {
 
         // Once `b`'s pin expires, `take` reports once more, guards both views,
         // and becomes clean.
-        guards().pins.clear();
+        clear_all_pins();
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(
             t.take(a, a + PAGE).is_empty(),
@@ -4269,12 +4923,12 @@ mod tests {
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         // Clear `c`'s pin -> `a` becomes clean again, then pin `c` and exercise
         // `title_memory_alias_rebound(c, BLOCK)` directly.
-        guards().pins.clear();
+        clear_all_pins();
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(t.take(a, a + PAGE).is_empty());
         {
             let until = std::time::Instant::now() + PIN;
-            guards().pin(c / BLOCK, c / BLOCK + 1, until);
+            pin_blocks_for_test(c / BLOCK, c / BLOCK + 1, until);
             DIR.set_bit(c / BLOCK, BitField::GuardProtected, false, Ordering::SeqCst);
         }
         title_memory_alias_rebound(c, BLOCK);
@@ -4284,7 +4938,7 @@ mod tests {
         );
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
-        guards().pins.clear();
+        clear_all_pins();
 
         // A `LazyArmed` (`PAGE_NOACCESS`) alias `b` must NEVER have its
         // `PAGE_NOACCESS` overwritten with `PAGE_READONLY`, and must leave `a`
@@ -4342,7 +4996,7 @@ mod tests {
 
         // Direct `open` check: opening alias `b` reports clean view `a`.
         let mut dirty = Vec::new();
-        assert_ne!(open(&mut guards(), b + 8, b + 9, |block| dirty.push(block)), 0);
+        assert_ne!(open_for_test(b + 8, b + 9, |block| dirty.push(block)), 0);
         assert_eq!(dirty, [a]);
 
         // Re-guard `a` so a real CPU write through `b` enters the VEH handler.
@@ -4626,7 +5280,7 @@ mod tests {
         kernel_writing(base + 3 * PAGE, PAGE);
         assert!(!DIR.is_cold_ro(base / PAGE + 3));
         assert!(writable(base + 3 * PAGE));
-        guards().pins.clear();
+        clear_all_pins();
     }
 
     #[test]
@@ -4815,10 +5469,7 @@ mod tests {
 
         // Pin `b1`: `try_arm_lazy_under_guards(&[b0, b1])` must refuse without
         // invoking `arm` or clearing `b0`'s guard metadata.
-        {
-            let mut g = guards();
-            g.pin(b1, b1 + 1, std::time::Instant::now() + PIN);
-        }
+        pin_blocks_for_test(b1, b1 + 1, std::time::Instant::now() + PIN);
         let mut armed = false;
         assert!(!try_arm_lazy_under_guards(&[b0, b1, b2], |_| {
             armed = true;
@@ -4827,8 +5478,8 @@ mod tests {
         assert!(!armed, "arm closure must not run when any block is pinned");
         assert!(DIR.is_guard_protected(b0));
 
-        // Clear pin, simulate a cold bit on `b1`, and arm under `GUARDS`.
-        guards().pins.clear();
+        // Clear pin, simulate a cold bit on `b1`, and arm under guard shards.
+        clear_all_pins();
         DIR.set_bit(b1, BitField::ColdRo, true, Ordering::SeqCst);
         let blocks = [b0, b1, b2];
         let ok = try_arm_lazy_under_guards(&blocks, |cpu_clean_after| {
@@ -5066,6 +5717,201 @@ mod tests {
         assert!(!writable(two) && !writable(one));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// Exercises sharded `GUARD_SHARDS_TABLE` across single-shard, cross-shard,
+    /// and multi-view alias boundaries under concurrent `guard()`,
+    /// `try_arm_lazy_under_guards()`, `kernel_writing()`, and `on_write()` VEH
+    /// faults, verifying pin/rest semantics and deadlock freedom.
+    #[test]
+    fn sharded_guards_concurrent_ops_and_cross_shard_boundaries() {
+        let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // `SHARD_BLOCKS + 4` blocks (1.25 MiB) guarantees every view spans at
+        // least two distinct guard shards.
+        const BLOCKS: usize = SHARD_BLOCKS + 4;
+        const SIZE: usize = BLOCKS * BLOCK;
+        let (sec_a, one, two) = two_views(SIZE);
+        let (sec_b, three, four) = two_views(SIZE);
+
+        let b_one = one / BLOCK;
+        let b_two = two / BLOCK;
+        let b_three = three / BLOCK;
+        assert_ne!(
+            shard_of(b_one),
+            shard_of(b_one + BLOCKS - 1),
+            "test view must cross a guard shard boundary"
+        );
+        // Find the first index inside `0..BLOCKS` where the shard changes.
+        let boundary = (1..BLOCKS)
+            .find(|&i| shard_of(b_one + i) != shard_of(b_one + i - 1))
+            .expect("shard boundary inside multi-stripe view");
+
+        // 1. Cross-shard guarding & pin semantics across both alias views.
+        let initial = guard(one, one + SIZE).expect("view guarded");
+        assert_eq!(initial.len(), BLOCKS);
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        for i in 0..BLOCKS {
+            assert!(DIR.is_guard_protected(b_one + i));
+            assert!(DIR.is_guard_clean(b_one + i));
+            assert!(!writable(one + i * BLOCK));
+            assert!(!writable(two + i * BLOCK));
+        }
+
+        // Pin two blocks straddling the shard boundary via `kernel_writing`.
+        let pin_lo = boundary - 1;
+        let pin_hi = boundary + 1;
+        kernel_writing(one + pin_lo * BLOCK, (pin_hi - pin_lo) * BLOCK);
+        for i in pin_lo..pin_hi {
+            assert!(writable(one + i * BLOCK), "pinned primary block {i} must be writable");
+            assert!(writable(two + i * BLOCK), "pinned alias block {i} must be writable");
+        }
+        let expected_pinned: Vec<usize> = (pin_lo..pin_hi).map(|i| b_one + i).collect();
+        assert_eq!(guard(one, one + SIZE), Some(expected_pinned.clone()));
+        assert_eq!(
+            guard(one, one + SIZE),
+            Some(expected_pinned),
+            "blocks straddling shard boundary stay open while pinned"
+        );
+
+        // `try_arm_lazy_under_guards` across multiple shards must refuse if ANY
+        // block in ANY shard is pinned, leaving unpinned blocks untouched.
+        let unpinned_idx = (boundary + 2).min(BLOCKS - 1);
+        assert!(DIR.is_guard_protected(b_one + unpinned_idx));
+        let mut arm_ran = false;
+        assert!(!try_arm_lazy_under_guards(
+            &[b_one + unpinned_idx, b_one + pin_lo, b_two + pin_hi - 1],
+            |_| {
+                arm_ran = true;
+                true
+            },
+        ));
+        assert!(!arm_ran, "arm must not run when a cross-shard block is pinned");
+        assert!(DIR.is_guard_protected(b_one + unpinned_idx));
+
+        // Clearing pins allows immediate clean re-guarding across the boundary.
+        clear_all_pins();
+        assert_eq!(
+            guard(one, one + SIZE),
+            Some((pin_lo..pin_hi).map(|i| b_one + i).collect())
+        );
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+
+        // 2. Cross-shard alias CPU fault + `VICTORY_GUARD_REST` semantics.
+        REST_IN_TEST.set(std::time::Duration::from_secs(3600));
+        // SAFETY: `two` is our committed view; VEH `on_write` opens `two` and
+        // marks `one` unclean across shards.
+        unsafe { ((two + boundary * BLOCK + 16) as *mut u8).write_volatile(0x5a) };
+        for _ in 0..2 {
+            assert_eq!(guard(one, one + SIZE), Some(vec![b_one + boundary]));
+            assert!(writable(two + boundary * BLOCK));
+            assert!(!clean(b_one + boundary));
+        }
+        REST_IN_TEST.set(std::time::Duration::ZERO);
+        assert_eq!(guard(one, one + SIZE), Some(vec![b_one + boundary]));
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+
+        // 3. Concurrent multi-threaded stress across overlapping & disjoint
+        //    shards (guard in opposing alias directions, VEH faults,
+        //    kernel_writing across boundaries, try_arm_lazy_under_guards).
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        // Thread 1: guard `one` and `three` across shard boundaries.
+        {
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    assert!(guard(one, one + SIZE).is_some());
+                    assert!(guard(three, three + SIZE).is_some());
+                }
+            }));
+        }
+        // Thread 2: guard `two` and `four` (opposing alias order vs Thread 1).
+        {
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    assert!(guard(two, two + SIZE).is_some());
+                    assert!(guard(four, four + SIZE).is_some());
+                }
+            }));
+        }
+        // Thread 3: trigger VEH `on_write` faults across shard boundaries on all 4 views.
+        {
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut v = 0u8;
+                while !stop.load(Ordering::Relaxed) {
+                    for &base in &[one, two, three, four] {
+                        for idx in [0, boundary - 1, boundary, BLOCKS - 1] {
+                            // SAFETY: mapped committed views; VEH restores RW on fault.
+                            unsafe { ((base + idx * BLOCK + 8) as *mut u8).write_volatile(v) };
+                        }
+                    }
+                    v = v.wrapping_add(1);
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        // Thread 4: `kernel_writing` straddling shard boundaries + pin cleanup.
+        {
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut iter = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    kernel_writing(one + (boundary - 1) * BLOCK, 3 * BLOCK);
+                    writing(three + (boundary - 1) * BLOCK, 3 * BLOCK);
+                    iter += 1;
+                    if iter.is_multiple_of(8) {
+                        clear_all_pins();
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        // Thread 5: `try_arm_lazy_under_guards` across multiple shards in unsorted order.
+        {
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || {
+                let slice_a = [b_two + boundary, b_one + boundary - 1, b_one + boundary];
+                let slice_b = [b_three + BLOCKS - 1, b_three, b_three + boundary];
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = try_arm_lazy_under_guards(&slice_a, |_| {
+                        for &b in &slice_a {
+                            assert!(!DIR.is_guard_protected(b));
+                            assert!(!DIR.is_guard_clean(b));
+                            assert!(!DIR.is_cold_ro(b));
+                        }
+                        false
+                    });
+                    let _ = try_arm_lazy_under_guards(&slice_b, |_| {
+                        for &b in &slice_b {
+                            assert!(!DIR.is_guard_protected(b));
+                            assert!(!DIR.is_guard_clean(b));
+                            assert!(!DIR.is_cold_ro(b));
+                        }
+                        false
+                    });
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        stop.store(true, Ordering::SeqCst);
+        for h in handles {
+            h.join().expect("worker thread must not panic or deadlock");
+        }
+
+        // Post-stress cleanup & sanity: clearing pins lets every view re-guard cleanly.
+        clear_all_pins();
+        assert!(guard(one, one + SIZE).is_some());
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        assert!(guard(three, three + SIZE).is_some());
+        assert_eq!(guard(three, three + SIZE), Some(Vec::new()));
+
+        drop_views(sec_a, &[one, two], SIZE);
+        drop_views(sec_b, &[three, four], SIZE);
     }
 }
 
